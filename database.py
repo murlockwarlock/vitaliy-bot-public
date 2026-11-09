@@ -2456,7 +2456,7 @@ async def run_data_migrations(session: AsyncSession):
                 if not configured_ready:
                     existing_cfg.pre_dialogue_test_enabled = False
 
-    funnel_topic = await session.get(Topic, "funnel_demo")
+    funnel_topic = await session.scalar(select(Topic).where(Topic.slug == "funnel_demo"))
     if funnel_topic and funnel_topic.system_prompt and "show_offer" not in funnel_topic.system_prompt:
         funnel_topic.system_prompt += (
             "\n\nВозвращай только JSON-объект без пояснений. Поля: "

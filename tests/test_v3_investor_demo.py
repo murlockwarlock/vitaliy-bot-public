@@ -164,7 +164,7 @@ async def test_funnel_prompt_variables_preserve_json_examples():
     user_id = 94000130
     await _prepare_user(user_id)
     async with async_session_maker() as session:
-        topic = await session.get(Topic, "funnel_demo")
+        topic = await session.scalar(select(Topic).where(Topic.slug == "funnel_demo"))
         original_prompt = topic.system_prompt
         topic.system_prompt = (
             'Разбери практику «{practice_name}» и ответ пользователя «{user_input}». '
@@ -208,7 +208,7 @@ async def test_funnel_prompt_variables_preserve_json_examples():
         assert '{"mode":"normal","reply":"текст"}' in system_prompt
     finally:
         async with async_session_maker() as session:
-            topic = await session.get(Topic, "funnel_demo")
+            topic = await session.scalar(select(Topic).where(Topic.slug == "funnel_demo"))
             topic.system_prompt = original_prompt
             await session.commit()
 @pytest.mark.asyncio
