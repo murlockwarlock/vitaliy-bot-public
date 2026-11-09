@@ -347,8 +347,20 @@ async def test_guided_editors_reject_stale_question_callbacks(tmp_path):
             ))
             session.add(TestSet(id=104, title="Редактор", slug="stale_editor"))
             session.add_all([
-                TestQuestion(id=1041, test_set_id=104, text="Первый", order_num=1),
-                TestQuestion(id=1042, test_set_id=104, text="Второй", order_num=2),
+                TestQuestion(
+                    id=1041,
+                    test_set_id=104,
+                    text="Первый",
+                    order_num=1,
+                    question_type=QUESTION_TYPE_TEXT,
+                ),
+                TestQuestion(
+                    id=1042,
+                    test_set_id=104,
+                    text="Второй",
+                    order_num=2,
+                    question_type=QUESTION_TYPE_TEXT,
+                ),
             ])
             session.add_all([
                 JournalQuestion(id=1041, text="Дневник первый", order_num=1, is_active=True),
