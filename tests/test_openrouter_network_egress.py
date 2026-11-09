@@ -47,7 +47,7 @@ def test_build_openrouter_client_proxied(monkeypatch):
     pool = getattr(transport, "_pool", None)
     proxy_url = getattr(pool, "_proxy_url", None)
     assert proxy_url is not None
-    assert "proxy.example.com" in str(proxy_url)
+    assert "example.invalid" in str(proxy_url)
     assert "3128" in str(proxy_url)
 
 

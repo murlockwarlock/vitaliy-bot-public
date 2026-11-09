@@ -230,7 +230,7 @@ class MutationAndInvariantTests(unittest.IsolatedAsyncioTestCase):
         secrets_dict = {
             "openai": "sk-proj-1234567890abcdef1234",
             "bearer": "Bearer my_super_secret_bearer_token_12345",
-            "gemini": "TEST_GEMINI_KEY",
+            "gemini": "AIzaSyTESTGEMINIKEY123456789",
             "telegram": "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11",
             "password": "password: super_secret_pass_12345",
             "api_key": "api_key='custom_secret_api_key_67890'",

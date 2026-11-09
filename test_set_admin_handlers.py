@@ -6,6 +6,8 @@ import json
 import logging
 import math
 import re
+from types import SimpleNamespace
+from typing import Any
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
@@ -55,6 +57,36 @@ class TestSetAdminStates(StatesGroup):
     waiting_questions_file = State()
     waiting_formulas_file = State()
     waiting_question_edit = State()
+    waiting_guided_question_text = State()
+    waiting_guided_question_options = State()
+
+
+async def _testset_guided_context(
+    state: FSMContext,
+    ts_id: int,
+    question_id: int,
+    *,
+    stage: str | None = None,
+) -> dict[str, Any] | None:
+    data = await state.get_data()
+    current_state = await state.get_state()
+    if current_state == TestSetAdminStates.waiting_question_edit.state:
+        expected_ts_id = data.get("target_ts_id")
+        expected_question_id = data.get("target_question_id")
+    elif current_state == TestSetAdminStates.waiting_guided_question_options.state:
+        expected_ts_id = data.get("guided_ts_id")
+        expected_question_id = data.get("guided_question_id")
+    else:
+        return None
+    if expected_ts_id != ts_id or (expected_question_id or None) != (question_id or None):
+        return None
+    if stage is not None and data.get("guided_stage") != stage:
+        return None
+    return data
+
+
+async def _reject_stale_testset_callback(callback: CallbackQuery) -> None:
+    await callback.answer("Кнопка устарела. Откройте вопрос заново.", show_alert=True)
 
 
 async def _is_admin(user_id: int) -> bool:
@@ -74,6 +106,56 @@ def _cancel_kb(callback_data: str = "admin_test_sets_list") -> InlineKeyboardMar
     builder.button(text="❌ Отмена", callback_data=callback_data)
     builder.adjust(1)
     return builder.as_markup()
+
+
+def _question_type_keyboard(prefix: str, *, include_cancel: str | None = None) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✍️ Текстовый ответ", callback_data=f"{prefix}_text")
+    builder.button(text="🔢 Шкала 1–10", callback_data=f"{prefix}_scale")
+    builder.button(text="🔘 Варианты ответа", callback_data=f"{prefix}_choice")
+    if include_cancel:
+        builder.button(text="❌ Отмена", callback_data=include_cancel)
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def _custom_answer_keyboard(prefix: str, cancel_callback: str) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ Разрешить свой ответ", callback_data=f"{prefix}_yes")
+    builder.button(text="🚫 Только варианты", callback_data=f"{prefix}_no")
+    builder.button(text="❌ Отмена", callback_data=cancel_callback)
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def _normalize_formulas_for_validation(formulas):
+    if formulas is None:
+        return []
+    if not isinstance(formulas, list):
+        raise ValueError("Правила расчёта должны быть списком.")
+    normalized = []
+    for index, formula in enumerate(formulas, start=1):
+        if not isinstance(formula, dict):
+            raise ValueError(f"Формула {index} должна быть объектом.")
+        item = dict(formula)
+        if not item.get("formula") and item.get("expression"):
+            item["formula"] = item["expression"]
+        normalized.append(item)
+    return normalized
+
+
+def _validate_import_definition(questions, formulas):
+    errors = validate_test_definition(questions, _normalize_formulas_for_validation(formulas))
+    if not questions:
+        # Keep the established setup order where formulas may be loaded before
+        # their question variables exist. Syntax and duplicate-result errors
+        # still block the import; question-variable binding is checked when
+        # questions are imported.
+        errors = [
+            error for error in errors
+            if "нельзя использовать переменные без строгих числовых ответов" not in error
+        ]
+    return errors
 
 
 def _slugify(text: str) -> str:
@@ -379,6 +461,7 @@ async def render_test_set_details(event, test_set_id: int):
     builder.button(text="✏️ Системные правила", callback_data=f"ts_edit_sys_{ts.id}")
 
     builder.button(text=f"📥 Загрузить вопросы ({q_count})", callback_data=f"ts_upload_q_{ts.id}")
+    builder.button(text="➕ Добавить вопрос", callback_data=f"ts_q_add_{ts.id}")
     builder.button(text=f"👁 Просмотр вопросов ({q_count})", callback_data=f"ts_view_q_{ts.id}")
     builder.button(text="📥 Загрузить правила расчёта", callback_data=f"ts_upload_f_{ts.id}")
 
@@ -658,6 +741,263 @@ async def confirmed_delete_or_archive_test_set(callback: CallbackQuery, state: F
     await _execute_test_set_delete(callback, state, ts_id)
 
 
+async def _save_guided_question(
+    ts_id: int,
+    question_id: int | None,
+    text_value: str,
+    question_type: str,
+    options: list[dict] | None = None,
+    allow_custom_answer: bool = False,
+) -> int:
+    async with async_session_maker() as session:
+        ts = await session.get(TestSet, ts_id)
+        if not ts:
+            raise ValueError("Набор тестов не найден.")
+        if question_id:
+            question = await session.scalar(
+                select(TestQuestion).where(
+                    TestQuestion.id == question_id,
+                    TestQuestion.test_set_id == ts_id,
+                )
+            )
+            if not question:
+                raise ValueError("Вопрос не найден в выбранном наборе.")
+        else:
+            max_order = await session.scalar(
+                select(func.coalesce(func.max(TestQuestion.order_num), 0)).where(
+                    TestQuestion.test_set_id == ts_id
+                )
+            ) or 0
+            question = TestQuestion(test_set_id=ts_id, order_num=max_order + 1)
+            session.add(question)
+
+        question.text = text_value.strip()
+        question.question_type = question_type
+        question.allow_custom_answer = bool(allow_custom_answer and question_type == QUESTION_TYPE_CHOICE)
+        question.answer_options_json = json_dumps(options or []) if question_type == QUESTION_TYPE_CHOICE else None
+        await session.flush()
+        questions = list((await session.scalars(
+            select(TestQuestion)
+            .where(TestQuestion.test_set_id == ts_id)
+            .order_by(TestQuestion.order_num.asc(), TestQuestion.id.asc())
+        )).all())
+        formulas = []
+        if ts.formulas_json:
+            try:
+                loaded = json.loads(ts.formulas_json)
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise ValueError("Действующие правила расчёта повреждены; изменение отменено.") from exc
+            formulas = _normalize_formulas_for_validation(loaded)
+        errors = validate_test_definition(questions, formulas)
+        if errors:
+            raise ValueError("\n".join(errors[:12]))
+        await session.commit()
+        return question.id
+
+
+def _guided_type_callback(ts_id: int, question_id: int, question_type: str) -> str:
+    return f"ts_q_type_{ts_id}_{question_id}_{question_type}"
+
+
+@router.callback_query(F.data.startswith("ts_q_add_"))
+async def start_guided_question_add(callback: CallbackQuery, state: FSMContext):
+    if not await _is_admin(_extract_user_id(callback)):
+        await callback.answer("Доступ запрещен.", show_alert=True)
+        return
+    ts_id = int(callback.data.split("ts_q_add_")[1])
+    await state.clear()
+    await state.set_state(TestSetAdminStates.waiting_guided_question_text)
+    await state.update_data(guided_ts_id=ts_id, guided_question_id=None, guided_stage="text")
+    await callback.message.edit_text(
+        "➕ <b>Новый вопрос</b>\n\n"
+        "Шаг 1 из 2. Отправьте текст вопроса.",
+        reply_markup=_cancel_kb(f"edit_testset_{ts_id}"),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@router.message(TestSetAdminStates.waiting_guided_question_text, F.text, ~F.text.startswith("/"))
+async def receive_guided_question_text(message: Message, state: FSMContext):
+    if not await _is_admin(_extract_user_id(message)):
+        return
+    text_value = (message.text or "").strip()
+    if not text_value:
+        await message.answer("⚠️ Текст вопроса не может быть пустым.")
+        return
+    data = await state.get_data()
+    ts_id = data.get("guided_ts_id")
+    question_id = data.get("guided_question_id")
+    if (
+        await state.get_state() != TestSetAdminStates.waiting_guided_question_text.state
+        or not ts_id
+        or data.get("guided_stage") != "text"
+    ):
+        await message.answer("⚠️ Сессия настройки устарела. Откройте вопрос заново.")
+        return
+    await state.update_data(guided_text=text_value, guided_stage="type")
+    await state.set_state(TestSetAdminStates.waiting_guided_question_options)
+    prefix = f"ts_q_type_{ts_id}_{question_id or 0}"
+    await message.answer(
+        "Шаг 2 из 2. Выберите тип ответа:",
+        reply_markup=_question_type_keyboard(prefix, include_cancel=f"edit_testset_{ts_id}"),
+    )
+
+
+@router.callback_query(F.data.startswith("ts_q_type_"))
+async def guided_question_type(callback: CallbackQuery, state: FSMContext):
+    if not await _is_admin(_extract_user_id(callback)):
+        await callback.answer("Доступ запрещен.", show_alert=True)
+        return
+    parts = callback.data.split("_")
+    if len(parts) == 5:
+        ts_id, question_id = int(parts[3]), int(parts[4])
+        context = await _testset_guided_context(state, ts_id, question_id, stage="type")
+        if context is None:
+            await _reject_stale_testset_callback(callback)
+            return
+        async with async_session_maker() as session:
+            question = await session.scalar(select(TestQuestion).where(
+                TestQuestion.id == question_id,
+                TestQuestion.test_set_id == ts_id,
+            ))
+        if not question:
+            await callback.answer("Вопрос не найден.", show_alert=True)
+            return
+        await state.set_state(TestSetAdminStates.waiting_guided_question_options)
+        await state.update_data(
+            guided_ts_id=ts_id,
+            guided_question_id=question_id,
+            guided_text=question.text,
+            guided_stage="type",
+        )
+        await callback.message.edit_text(
+            "Выберите тип ответа для вопроса:",
+            reply_markup=_question_type_keyboard(
+                f"ts_q_type_{ts_id}_{question_id}",
+                include_cancel=f"edit_testset_{ts_id}",
+            ),
+        )
+        await callback.answer()
+        return
+    if len(parts) < 6:
+        await callback.answer("Ошибка параметров.", show_alert=True)
+        return
+    ts_id, question_id, question_type = int(parts[3]), int(parts[4]), parts[5]
+    context = await _testset_guided_context(state, ts_id, question_id, stage="type")
+    if context is None:
+        await _reject_stale_testset_callback(callback)
+        return
+    data = context
+    text_value = data.get("guided_text")
+    if not text_value:
+        async with async_session_maker() as session:
+            question = await session.scalar(select(TestQuestion).where(
+                TestQuestion.id == question_id,
+                TestQuestion.test_set_id == ts_id,
+            ))
+            text_value = question.text if question else None
+    if not text_value:
+        await callback.answer("Сначала укажите текст вопроса.", show_alert=True)
+        return
+    if question_type == QUESTION_TYPE_CHOICE:
+        await state.set_state(TestSetAdminStates.waiting_guided_question_options)
+        await state.update_data(
+            guided_ts_id=ts_id,
+            guided_question_id=question_id or None,
+            guided_text=text_value,
+            guided_type=question_type,
+            guided_stage="options",
+        )
+        await callback.message.edit_text(
+            "Введите варианты ответа, каждый с новой строки.\n"
+            "После этого выберете, разрешать ли свой ответ.",
+            reply_markup=_cancel_kb(f"edit_testset_{ts_id}"),
+        )
+        await callback.answer()
+        return
+    try:
+        await _save_guided_question(ts_id, question_id or None, text_value, question_type)
+    except ValueError as exc:
+        await callback.answer(str(exc)[:180], show_alert=True)
+        return
+    await state.clear()
+    await callback.answer("Вопрос сохранён")
+    await callback.message.edit_text("✅ Вопрос сохранён.")
+    await render_test_set_details(callback, ts_id)
+
+
+@router.message(TestSetAdminStates.waiting_guided_question_options, F.text, ~F.text.startswith("/"))
+async def receive_guided_question_options(message: Message, state: FSMContext):
+    if not await _is_admin(_extract_user_id(message)):
+        return
+    options = [line.strip(" •-\t") for line in (message.text or "").splitlines() if line.strip()]
+    if not options:
+        await message.answer("⚠️ Добавьте хотя бы один вариант, каждый с новой строки.")
+        return
+    if len({item.casefold() for item in options}) != len(options):
+        await message.answer("⚠️ Варианты должны быть уникальными.")
+        return
+    data = await state.get_data()
+    ts_id = data.get("guided_ts_id")
+    question_id = data.get("guided_question_id")
+    text_value = data.get("guided_text")
+    context = await _testset_guided_context(state, ts_id, question_id or 0, stage="options")
+    if context is None or context.get("guided_type") != QUESTION_TYPE_CHOICE:
+        await message.answer("⚠️ Сессия настройки устарела. Откройте вопрос заново.")
+        return
+    data = context
+    ts_id = data.get("guided_ts_id")
+    question_id = data.get("guided_question_id")
+    text_value = data.get("guided_text")
+    await state.update_data(
+        guided_options=[{"text": option, "value": None} for option in options],
+        guided_stage="custom",
+    )
+    await state.set_state(TestSetAdminStates.waiting_guided_question_options)
+    await message.answer(
+        "Разрешить пользователю написать свой ответ?",
+        reply_markup=_custom_answer_keyboard(
+            f"ts_q_custom_{ts_id}_{question_id or 0}",
+            f"edit_testset_{ts_id}",
+        ),
+    )
+
+
+@router.callback_query(F.data.startswith("ts_q_custom_"))
+async def save_guided_question_custom_answer(callback: CallbackQuery, state: FSMContext):
+    if not await _is_admin(_extract_user_id(callback)):
+        await callback.answer("Доступ запрещен.", show_alert=True)
+        return
+    parts = callback.data.split("_")
+    if len(parts) < 6:
+        await callback.answer("Ошибка параметров.", show_alert=True)
+        return
+    ts_id, question_id = int(parts[3]), int(parts[4])
+    allow_custom = parts[5] == "yes"
+    context = await _testset_guided_context(state, ts_id, question_id, stage="custom")
+    if context is None:
+        await _reject_stale_testset_callback(callback)
+        return
+    data = context
+    try:
+        await _save_guided_question(
+            ts_id,
+            question_id or None,
+            data.get("guided_text", ""),
+            QUESTION_TYPE_CHOICE,
+            data.get("guided_options", []),
+            allow_custom,
+        )
+    except ValueError as exc:
+        await callback.answer(str(exc)[:180], show_alert=True)
+        return
+    await state.clear()
+    await callback.answer("Вопрос сохранён")
+    await callback.message.edit_text("✅ Вопрос сохранён.")
+    await render_test_set_details(callback, ts_id)
+
+
 @router.callback_query(F.data.startswith("ts_view_q_"))
 async def view_test_set_questions(callback: CallbackQuery, state: FSMContext | None = None):
     if not await _is_admin(_extract_user_id(callback)):
@@ -722,19 +1062,27 @@ async def start_question_edit(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Вопрос не найден.", show_alert=True)
         return
 
+    await state.clear()
     await state.set_state(TestSetAdminStates.waiting_question_edit)
-    await state.update_data(target_ts_id=ts_id, target_question_id=question_id)
+    await state.update_data(
+        target_ts_id=ts_id,
+        target_question_id=question_id,
+        guided_stage="type",
+    )
     options = json.loads(question.answer_options_json or "[]")
     type_label = _question_type_label(get_question_type(question))
     options_label = ", ".join(str(item.get("text", "")) for item in options if isinstance(item, dict)) or "не заданы"
     await callback.message.edit_text(
         "✏️ <b>Редактирование вопроса</b>\n\n"
         "Отправь новый текст, чтобы изменить формулировку вопроса.\n"
-        "Тип ответа, варианты и порядок можно изменить через расширенный импорт.\n\n"
+        "Тип ответа и варианты можно настроить кнопками ниже.\n\n"
         f"Текущий текст:\n<i>{html.escape(question.text)}</i>\n"
         f"Тип ответа: <b>{html.escape(type_label)}</b>\n"
         f"Варианты: <i>{html.escape(options_label)}</i>",
-        reply_markup=_cancel_kb(f"edit_testset_{ts_id}"),
+        reply_markup=_question_type_keyboard(
+            f"ts_q_type_{ts_id}_{question_id}",
+            include_cancel=f"edit_testset_{ts_id}",
+        ),
         parse_mode="HTML",
     )
     await callback.answer()
@@ -898,9 +1246,12 @@ async def handle_questions_upload(message: Message, state: FSMContext, bot: Bot)
         return
 
     # Persist scoped strictly to ts_id. The old set remains intact if the new
-    # payload cannot be normalized or committed.
+    # payload cannot be normalized, validated, or committed.
     try:
         async with async_session_maker() as session:
+            ts = await session.get(TestSet, ts_id)
+            if not ts:
+                raise ValueError("Набор тестов не найден.")
             valid_cols = {
                 "text", "category", "is_reverse", "comment", "variable_name",
                 "allow_custom_answer", "buttons_layout", "answer_options_json", "question_type", "is_active",
@@ -941,17 +1292,32 @@ async def handle_questions_upload(message: Message, state: FSMContext, bot: Bot)
                     filtered["order_num"] = index
                 prepared.append(filtered)
 
+            candidate_questions = [
+                SimpleNamespace(**item)
+                for item in sorted(prepared, key=lambda item: item["order_num"])
+            ]
+            current_formulas = []
+            if ts.formulas_json:
+                try:
+                    loaded_formulas = json.loads(ts.formulas_json)
+                except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                    raise ValueError("Действующие правила расчёта повреждены; импорт отменён.") from exc
+                if isinstance(loaded_formulas, list):
+                    current_formulas = loaded_formulas
+            candidate_formulas = parsed_formulas or current_formulas
+            validation_errors = _validate_import_definition(candidate_questions, candidate_formulas)
+            if validation_errors:
+                raise ValueError("\n".join(validation_errors[:12]))
+
             await session.execute(delete(TestQuestion).where(TestQuestion.test_set_id == ts_id))
             for index, filtered in enumerate(sorted(prepared, key=lambda item: item["order_num"]), start=1):
                 filtered["order_num"] = index
                 session.add(TestQuestion(test_set_id=ts_id, **filtered))
 
             if parsed_formulas:
-                ts = await session.get(TestSet, ts_id)
-                if ts:
-                    ts.formulas_json = json.dumps(parsed_formulas, ensure_ascii=False)
-                    ts.formulas_enabled = True
-                    ts.calculation_enabled = True
+                ts.formulas_json = json.dumps(parsed_formulas, ensure_ascii=False)
+                ts.formulas_enabled = True
+                ts.calculation_enabled = True
 
             await session.commit()
     except (TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -1030,13 +1396,29 @@ async def handle_formulas_upload(message: Message, state: FSMContext, bot: Bot):
         await message.answer("❌ Ошибка парсинга формул. Проверьте формат и попробуйте снова:", reply_markup=_cancel_kb(f"edit_testset_{ts_id}"))
         return
 
-    async with async_session_maker() as session:
-        ts = await session.get(TestSet, ts_id)
-        if ts:
+    try:
+        async with async_session_maker() as session:
+            ts = await session.get(TestSet, ts_id)
+            if not ts:
+                raise ValueError("Набор тестов не найден.")
+            questions = list((await session.scalars(
+                select(TestQuestion)
+                .where(TestQuestion.test_set_id == ts_id)
+                .order_by(TestQuestion.order_num.asc(), TestQuestion.id.asc())
+            )).all())
+            validation_errors = _validate_import_definition(questions, parsed_formulas)
+            if validation_errors:
+                raise ValueError("\n".join(validation_errors[:12]))
             ts.formulas_json = json.dumps(parsed_formulas, ensure_ascii=False)
             ts.calculation_enabled = True
             ts.formulas_enabled = True
             await session.commit()
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        await message.answer(
+            f"❌ Правила расчёта не сохранены:\n{html.escape(str(exc))}",
+            reply_markup=_cancel_kb(f"edit_testset_{ts_id}"),
+        )
+        return
 
     await state.clear()
     await message.answer(f"✅ Успешно загружено <b>{len(parsed_formulas)}</b> правил расчёта в набор!", parse_mode="HTML")

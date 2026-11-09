@@ -29,11 +29,29 @@ from journal_handlers import JournalStates, _persist_journal_answer, cb_journal_
 from journal_keyboards import journal_question_keyboard
 from journal_service import build_journal_daily_summary_context, build_questions_snapshot
 from keyboards import universal_test_question_keyboard
-from journal_admin_handlers import reorder_questions as reorder_journal_questions
+from journal_admin_handlers import (
+    JournalAdminStates,
+    admin_journal_q_custom_answer_handler,
+    admin_journal_q_guided_options_submit,
+    admin_journal_q_set_type_handler,
+    admin_journal_q_type_handler,
+    reorder_questions as reorder_journal_questions,
+)
 from topic_admin_handlers import set_test_set_selection, toggle_pre_test
-from test_set_admin_handlers import _question_edit_payload
+from test_set_admin_handlers import (
+    TestSetAdminStates,
+    _question_edit_payload,
+    guided_question_type,
+    handle_questions_upload,
+    open_test_set_details,
+    receive_guided_question_options,
+    receive_guided_question_text,
+    save_guided_question_custom_answer,
+    start_guided_question_add,
+    start_question_edit,
+)
 from test_set_admin_handlers import reorder_questions as reorder_testset_questions
-from test_system_handlers import _finish_test, _questions, exit_universal_test, start_universal_test
+from test_system_handlers import _finish_test, _questions, _send_question, exit_universal_test, start_universal_test
 from universal_tests import (
     QUESTION_TYPE_CHOICE,
     QUESTION_TYPE_SCALE,
@@ -116,6 +134,286 @@ def _raises_value_error(function, *args):
     except ValueError as exc:
         return exc
     raise AssertionError("ValueError was not raised")
+
+
+def _admin_callback(data: str, user_id: int):
+    bot = AsyncMock()
+    message = SimpleNamespace(
+        edit_text=AsyncMock(),
+        answer=AsyncMock(),
+        chat=SimpleNamespace(id=user_id),
+        message_id=1,
+        bot=bot,
+    )
+    return SimpleNamespace(
+        data=data,
+        from_user=SimpleNamespace(id=user_id),
+        message=message,
+        bot=bot,
+        answer=AsyncMock(),
+    )
+
+
+def _admin_message(text: str, user_id: int):
+    return SimpleNamespace(
+        text=text,
+        from_user=SimpleNamespace(id=user_id),
+        answer=AsyncMock(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_testset_attempt_keeps_question_and_interpretation_snapshot_after_admin_edit(tmp_path):
+    local_engine, local_session_maker = await _local_database(tmp_path)
+    user_id = 992001
+    try:
+        async with local_session_maker() as session:
+            session.add(User(id=user_id, first_name="Тест"))
+            test_set = TestSet(
+                id=101,
+                title="Профиль",
+                slug="profile_snapshot",
+                show_progress=True,
+                calculation_enabled=True,
+                formulas_json=json.dumps([{"name": "score", "formula": "answer_01"}]),
+                separate_interpretation_prompt=True,
+                interpretation_prompt="Старый промпт",
+                interpretation_input_mode="all",
+            )
+            session.add(test_set)
+            session.add_all([
+                TestQuestion(
+                    test_set_id=test_set.id,
+                    text="Старый вопрос 1",
+                    question_type=QUESTION_TYPE_SCALE,
+                    order_num=1,
+                ),
+                TestQuestion(
+                    test_set_id=test_set.id,
+                    text="Старый вопрос 2",
+                    question_type=QUESTION_TYPE_TEXT,
+                    order_num=2,
+                ),
+            ])
+            await session.commit()
+
+        bot = AsyncMock()
+        state = AsyncMock()
+        with patch("database.async_session_maker", local_session_maker), \
+             patch("test_system_handlers.async_session_maker", local_session_maker):
+            assert await start_universal_test(bot, user_id, state, test_set_id=test_set.id)
+
+            async with local_session_maker() as session:
+                attempt = await session.scalar(select(TestAttempt).where(TestAttempt.user_id == user_id))
+                assert attempt.configuration_snapshot_json
+                test_set_db = await session.get(TestSet, test_set.id)
+                test_set_db.show_progress = False
+                test_set_db.interpretation_prompt = "Новый промпт"
+                test_set_db.formulas_json = json.dumps([{"name": "score", "formula": "answer_02"}])
+                questions = list((await session.scalars(
+                    select(TestQuestion).where(TestQuestion.test_set_id == test_set.id)
+                )).all())
+                questions[0].text = "Новый вопрос 1"
+                questions[1].text = "Новый вопрос 2"
+                await session.commit()
+
+            await _send_question(bot, user_id, 1, state=state)
+
+        assert "Старый вопрос 2" in bot.send_message.await_args_list[-1].args[1]
+        assert "Новый вопрос 2" not in bot.send_message.await_args_list[-1].args[1]
+    finally:
+        await local_engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_testset_import_rejects_invalid_future_definition_without_replacing_questions(tmp_path):
+    local_engine, local_session_maker = await _local_database(tmp_path)
+    admin_id = 992002
+    try:
+        async with local_session_maker() as session:
+            session.add(User(id=admin_id, first_name="Админ", is_admin=True, admin_role="content_editor"))
+            test_set = TestSet(
+                id=102,
+                title="Импорт",
+                slug="import_validation",
+                formulas_json=json.dumps([{"name": "broken", "formula": "missing_score + 1"}]),
+            )
+            session.add(test_set)
+            session.add(TestQuestion(test_set_id=test_set.id, text="Старый вопрос", order_num=1))
+            await session.commit()
+
+        payload = json.dumps({"questions": [{"text": "Новый вопрос", "type": "text"}]})
+        state = AsyncMock()
+        state.get_data = AsyncMock(return_value={"target_ts_id": 102})
+        message = _admin_message("", admin_id)
+        message.document = SimpleNamespace(file_name="questions.json")
+        bot = AsyncMock()
+        bot.download = AsyncMock(side_effect=lambda document, destination: destination.write(payload.encode()))
+        with patch("database.async_session_maker", local_session_maker), \
+             patch("test_set_admin_handlers.async_session_maker", local_session_maker), \
+             patch("test_set_admin_handlers.render_test_set_details", new=AsyncMock()):
+            await handle_questions_upload(message, state, bot)
+
+        assert any("не сохранены" in str(call.args[0]).lower() for call in message.answer.await_args_list)
+        async with local_session_maker() as session:
+            question = await session.scalar(select(TestQuestion).where(TestQuestion.test_set_id == 102))
+            test_set = await session.get(TestSet, 102)
+            assert question.text == "Старый вопрос"
+            assert json.loads(test_set.formulas_json)[0]["name"] == "broken"
+    finally:
+        await local_engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_guided_testset_and_journal_question_editors_save_types_options_and_cancel(tmp_path):
+    local_engine, local_session_maker = await _local_database(tmp_path)
+    admin_id = 992003
+    try:
+        async with local_session_maker() as session:
+            session.add(User(id=admin_id, first_name="Админ", is_admin=True, admin_role="content_editor"))
+            session.add(TestSet(id=103, title="Редактор", slug="guided_editor"))
+            session.add(JournalQuestion(id=1031, text="Как сегодня?", order_num=1, is_active=True))
+            await session.commit()
+
+        storage = MemoryStorage()
+        state = FSMContext(storage=storage, key=StorageKey(bot_id=1, chat_id=admin_id, user_id=admin_id))
+        patches = [
+            patch("database.async_session_maker", local_session_maker),
+            patch("test_set_admin_handlers.async_session_maker", local_session_maker),
+            patch("journal_admin_handlers.async_session_maker", local_session_maker),
+            patch("test_system_handlers.async_session_maker", local_session_maker),
+        ]
+        for item in patches:
+            item.start()
+        try:
+            ts_callback = _admin_callback("ts_q_add_103", admin_id)
+            await start_guided_question_add(ts_callback, state)
+            await receive_guided_question_text(_admin_message("Выбери состояние", admin_id), state)
+            await guided_question_type(_admin_callback("ts_q_type_103_0_choice", admin_id), state)
+            await receive_guided_question_options(_admin_message("Спокойно\nТревожно", admin_id), state)
+            await save_guided_question_custom_answer(_admin_callback("ts_q_custom_103_0_yes", admin_id), state)
+
+            async with local_session_maker() as session:
+                question = await session.scalar(select(TestQuestion).where(
+                    TestQuestion.test_set_id == 103,
+                    TestQuestion.text == "Выбери состояние",
+                ))
+                assert question.question_type == QUESTION_TYPE_CHOICE
+                assert question.allow_custom_answer is True
+                assert [item["text"] for item in json.loads(question.answer_options_json)] == ["Спокойно", "Тревожно"]
+
+            await admin_journal_q_type_handler(_admin_callback("j_adm_q_type:1031:0", admin_id), state)
+            await admin_journal_q_set_type_handler(_admin_callback("j_adm_q_settype:1031:0:choice", admin_id), state)
+            await admin_journal_q_guided_options_submit(_admin_message("Да\nНет", admin_id), state)
+            await admin_journal_q_custom_answer_handler(_admin_callback("j_adm_q_custom:1031:0:no", admin_id), state)
+
+            async with local_session_maker() as session:
+                journal_question = await session.get(JournalQuestion, 1031)
+                assert journal_question.question_type == QUESTION_TYPE_CHOICE
+                assert journal_question.allow_custom_answer is False
+                assert json.loads(journal_question.answer_options_json)[0]["text"] == "Да"
+
+            await start_guided_question_add(_admin_callback("ts_q_add_103", admin_id), state)
+            await receive_guided_question_text(_admin_message("Отменяемый вопрос", admin_id), state)
+            await open_test_set_details(_admin_callback("edit_testset_103", admin_id), state)
+            async with local_session_maker() as session:
+                cancelled = await session.scalar(select(TestQuestion).where(
+                    TestQuestion.test_set_id == 103,
+                    TestQuestion.text == "Отменяемый вопрос",
+                ))
+                assert cancelled is None
+
+            bot = AsyncMock()
+            await start_universal_test(bot, admin_id, state, test_set_id=103)
+            assert "Выбери состояние" in bot.send_message.await_args.args[1]
+        finally:
+            for item in reversed(patches):
+                item.stop()
+    finally:
+        await local_engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_guided_editors_reject_stale_question_callbacks(tmp_path):
+    local_engine, local_session_maker = await _local_database(tmp_path)
+    admin_id = 992004
+    try:
+        async with local_session_maker() as session:
+            session.add(User(
+                id=admin_id,
+                first_name="Админ",
+                is_admin=True,
+                admin_role="content_editor",
+            ))
+            session.add(TestSet(id=104, title="Редактор", slug="stale_editor"))
+            session.add_all([
+                TestQuestion(
+                    id=1041,
+                    test_set_id=104,
+                    text="Первый",
+                    order_num=1,
+                    question_type=QUESTION_TYPE_TEXT,
+                ),
+                TestQuestion(
+                    id=1042,
+                    test_set_id=104,
+                    text="Второй",
+                    order_num=2,
+                    question_type=QUESTION_TYPE_TEXT,
+                ),
+            ])
+            session.add_all([
+                JournalQuestion(id=1041, text="Дневник первый", order_num=1, is_active=True),
+                JournalQuestion(id=1042, text="Дневник второй", order_num=2, is_active=True),
+            ])
+            await session.commit()
+
+        state = FSMContext(
+            storage=MemoryStorage(),
+            key=StorageKey(bot_id=1, chat_id=admin_id, user_id=admin_id),
+        )
+        patches = [
+            patch("database.async_session_maker", local_session_maker),
+            patch("test_set_admin_handlers.async_session_maker", local_session_maker),
+            patch("journal_admin_handlers.async_session_maker", local_session_maker),
+        ]
+        for item in patches:
+            item.start()
+        try:
+            await start_question_edit(_admin_callback("ts_q_edit_104_1041", admin_id), state)
+            stale_testset = _admin_callback("ts_q_type_104_1042_choice", admin_id)
+            await guided_question_type(stale_testset, state)
+            assert stale_testset.answer.await_args.kwargs["show_alert"] is True
+            assert "устарела" in stale_testset.answer.await_args.args[0]
+            assert await state.get_data() == {
+                "target_ts_id": 104,
+                "target_question_id": 1041,
+                "guided_stage": "type",
+            }
+            async with local_session_maker() as session:
+                stale_question = await session.get(TestQuestion, 1042)
+                assert stale_question.question_type == QUESTION_TYPE_TEXT
+
+            await state.clear()
+            await admin_journal_q_type_handler(
+                _admin_callback("j_adm_q_type:1041:0", admin_id),
+                state,
+            )
+            stale_journal = _admin_callback("j_adm_q_settype:1042:0:choice", admin_id)
+            await admin_journal_q_set_type_handler(stale_journal, state)
+            assert stale_journal.answer.await_args.kwargs["show_alert"] is True
+            assert "устарела" in stale_journal.answer.await_args.args[0]
+            data = await state.get_data()
+            assert data["guided_question_id"] == 1041
+            assert data["guided_stage"] == "type"
+            async with local_session_maker() as session:
+                stale_question = await session.get(JournalQuestion, 1042)
+                assert stale_question.question_type == QUESTION_TYPE_TEXT
+        finally:
+            for item in reversed(patches):
+                item.stop()
+    finally:
+        await local_engine.dispose()
 
 
 def test_diagnostic_and_profile_sets_require_their_full_active_question_count():

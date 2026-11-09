@@ -2743,7 +2743,7 @@ class TestJournalUserAcceptanceMatrix(JournalFeatureBaseTest):
         msg_q = make_message("Новый проверочный вопрос?", admin.id, bot=self.bot)
         with patch("journal_admin_handlers.send_smart_content", new_callable=AsyncMock):
             await admin_journal_q_add_submit(msg_q, state)
-        self.assertIsNone(await state.get_state())
+        self.assertEqual(await state.get_state(), JournalAdminStates.guided_question_type)
 
         async with async_session_maker() as session:
             new_q = (await session.execute(

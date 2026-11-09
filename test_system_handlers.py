@@ -39,6 +39,7 @@ from file_parser import parse_formulas_file, parse_questions_file
 from time_utils import msk_now
 from universal_tests import (
     build_prompt_payload,
+    build_test_attempt_snapshot,
     build_question_text,
     build_result_handoff_prompt,
     calculate_formulas,
@@ -53,6 +54,9 @@ from universal_tests import (
     expected_test_set_question_count,
     is_esoteric_question,
     is_test_set_ready,
+    load_test_attempt_snapshot,
+    snapshot_questions,
+    snapshot_test_set,
     validate_test_definition,
 )
 
@@ -174,27 +178,37 @@ async def _send_question(
         tsess = await session.get(TestSession, chat_id)
         if test_set_id is None and tsess and tsess.test_set_id:
             test_set_id = tsess.test_set_id
-        test_set = await _get_test_set(session, test_set_id)
-        if not test_set:
-            logger.warning("TestSet not found in _send_question for chat_id=%s test_set_id=%s", chat_id, test_set_id)
-            await send_test_setup_unavailable(bot, chat_id, state)
-            return
         attempt = None
         topic_slug = None
         if tsess and tsess.attempt_id:
             attempt = await session.get(TestAttempt, tsess.attempt_id)
             topic_slug = attempt.topic_slug if attempt else None
-        questions = await _questions(session, test_set.id, topic_slug=topic_slug)
-        if not is_test_set_ready(test_set, len(questions), topic_slug):
-            await send_test_setup_unavailable(
-                bot,
-                chat_id,
-                state,
-                active_count=len(questions),
-                expected_count=expected_test_set_question_count(test_set, topic_slug),
-            )
-            return
-        show_progress = test_set.show_progress
+
+        live_test_set = await _get_test_set(session, test_set_id)
+        snapshot = load_test_attempt_snapshot(
+            attempt.configuration_snapshot_json if attempt else None
+        )
+        if snapshot:
+            test_set = snapshot_test_set(snapshot, live_test_set)
+            questions = snapshot_questions(snapshot)
+            show_progress = bool(snapshot["test_set"].get("show_progress", True))
+        else:
+            test_set = live_test_set
+            if not test_set:
+                logger.warning("TestSet not found in _send_question for chat_id=%s test_set_id=%s", chat_id, test_set_id)
+                await send_test_setup_unavailable(bot, chat_id, state)
+                return
+            questions = await _questions(session, test_set.id, topic_slug=topic_slug)
+            if not is_test_set_ready(test_set, len(questions), topic_slug):
+                await send_test_setup_unavailable(
+                    bot,
+                    chat_id,
+                    state,
+                    active_count=len(questions),
+                    expected_count=expected_test_set_question_count(test_set, topic_slug),
+                )
+                return
+            show_progress = test_set.show_progress
 
         if attempt:
             if attempt and attempt.purpose == "pre_dialogue" and attempt.status == "in_progress":
@@ -268,6 +282,11 @@ async def start_universal_test(
             await bot.send_message(user_id, "Тест пока недоступен: администратор ещё не загрузил вопросы.")
             return False
 
+        # Materialize the snapshot before acquiring the pre-test claim.  A
+        # failed claim insert rolls back this session and expires ORM objects;
+        # the retry path must still use the exact configuration selected here.
+        configuration_snapshot_json = build_test_attempt_snapshot(test_set, questions)
+
         effective_topic_slug = topic_slug or (user.current_topic_slug if user else None)
         effective_dialogue_id = dialogue_id or (user.current_dialogue_id if user else 1)
 
@@ -312,6 +331,7 @@ async def start_universal_test(
             answers="[]",
             status="in_progress",
             started_at=msk_now(),
+            configuration_snapshot_json=configuration_snapshot_json,
         )
         session.add(attempt)
         await session.flush()
@@ -385,11 +405,18 @@ async def _save_answer(user_id: int, payload: str, *, is_text: bool) -> tuple[in
         test_session = await session.get(TestSession, user_id, with_for_update=True)
         if not test_session or test_session.is_finished:
             raise ValueError("Эта сессия уже завершена. Запустите тест заново.")
-        questions = await _questions(
-            session,
-            test_session.test_set_id,
-            topic_slug=test_session.invocation_topic_slug,
+        attempt = await session.get(TestAttempt, test_session.attempt_id) if test_session.attempt_id else None
+        snapshot = load_test_attempt_snapshot(
+            attempt.configuration_snapshot_json if attempt else None
         )
+        if snapshot:
+            questions = snapshot_questions(snapshot)
+        else:
+            questions = await _questions(
+                session,
+                test_session.test_set_id,
+                topic_slug=test_session.invocation_topic_slug,
+            )
         index = test_session.current_question_index
         if index >= len(questions):
             raise ValueError("Этот вопрос уже закрыт.")
@@ -405,7 +432,6 @@ async def _save_answer(user_id: int, payload: str, *, is_text: bool) -> tuple[in
         test_session.current_question_index += 1
 
         if test_session.attempt_id:
-            attempt = await session.get(TestAttempt, test_session.attempt_id)
             if attempt and attempt.purpose == "pre_dialogue" and attempt.status == "in_progress":
                 await renew_pre_test_claim_lease(
                     session,
@@ -474,7 +500,21 @@ async def _finish_test(bot: Bot, user_id: int, state: FSMContext, answers: list[
     async with async_session_maker() as session:
         user = await session.get(User, user_id)
         test_session = await session.get(TestSession, user_id, with_for_update=True)
-        test_set = await _get_test_set(session, test_session.test_set_id if test_session else None)
+        attempt = await session.get(TestAttempt, test_session.attempt_id) if test_session and test_session.attempt_id else None
+        live_test_set = await _get_test_set(session, test_session.test_set_id if test_session else None)
+        snapshot = load_test_attempt_snapshot(
+            attempt.configuration_snapshot_json if attempt else None
+        )
+        if snapshot:
+            test_set = snapshot_test_set(snapshot, live_test_set)
+            questions = snapshot_questions(snapshot)
+        else:
+            test_set = live_test_set
+            questions = await _questions(
+                session,
+                test_session.test_set_id if test_session else None,
+                topic_slug=test_session.invocation_topic_slug if test_session else None,
+            )
         if not test_set:
             logger.warning("TestSet not found in _finish_test for user_id=%s, failing safely", user_id)
             await bot.send_message(user_id, "Ошибка: конфигурация теста не найдена.")
@@ -482,8 +522,7 @@ async def _finish_test(bot: Bot, user_id: int, state: FSMContext, answers: list[
 
         topic_slug = test_session.invocation_topic_slug if test_session else (user.current_topic_slug if user else None)
         dialogue_id = test_session.invocation_dialogue_id if test_session else (user.current_dialogue_id if user else None)
-        questions = await _questions(session, test_set.id, topic_slug=topic_slug)
-        if topic_slug in {"diagnostics", "express"} and not is_test_set_ready(test_set, len(questions), topic_slug):
+        if not snapshot and topic_slug in {"diagnostics", "express"} and not is_test_set_ready(test_set, len(questions), topic_slug):
             try:
                 await loading.delete()
             except TelegramBadRequest:
@@ -525,7 +564,6 @@ async def _finish_test(bot: Bot, user_id: int, state: FSMContext, answers: list[
         attempt_id = test_session.attempt_id if test_session else None
         attempt_purpose = None
         if attempt_id:
-            attempt = await session.get(TestAttempt, attempt_id)
             if attempt:
                 attempt_purpose = attempt.purpose
                 attempt.answers = serialize_answers(answers)

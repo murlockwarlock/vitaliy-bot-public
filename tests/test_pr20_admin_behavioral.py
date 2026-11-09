@@ -50,6 +50,7 @@ def _callback(user_id: int, data: str, *, chat_id: int | None = None, message_id
     callback.message.edit_text = AsyncMock()
     callback.message.answer = AsyncMock()
     callback.message.delete = AsyncMock()
+    callback.message.edit_reply_markup = AsyncMock()
     callback.answer = AsyncMock()
     return callback
 
