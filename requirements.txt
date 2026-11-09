@@ -1,0 +1,13 @@
+aiogram>=3.0.0
+aiohttp
+aiohttp-socks>=0.10.1,<0.11
+sqlalchemy[asyncio]>=2.0.0
+greenlet>=3.0.0
+aiosqlite
+python-dotenv
+openai
+pypdf
+python-docx
+openpyxl
+chromadb
+tiktoken
