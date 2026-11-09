@@ -99,6 +99,20 @@ def _custom_answer_keyboard(prefix: str, cancel_callback: str) -> InlineKeyboard
     return builder.as_markup()
 
 
+def _validate_import_definition(questions, formulas):
+    errors = validate_test_definition(questions, formulas)
+    if not questions:
+        # Keep the established setup order where formulas may be loaded before
+        # their question variables exist. Syntax and duplicate-result errors
+        # still block the import; question-variable binding is checked when
+        # questions are imported.
+        errors = [
+            error for error in errors
+            if "нельзя использовать переменные без строгих числовых ответов" not in error
+        ]
+    return errors
+
+
 def _slugify(text: str) -> str:
     cleaned = re.sub(r"[^\w\s-]", "", text.strip().lower())
     return re.sub(r"[\s_-]+", "_", cleaned)[:50]
@@ -1210,7 +1224,7 @@ async def handle_questions_upload(message: Message, state: FSMContext, bot: Bot)
                 if isinstance(loaded_formulas, list):
                     current_formulas = loaded_formulas
             candidate_formulas = parsed_formulas or current_formulas
-            validation_errors = validate_test_definition(candidate_questions, candidate_formulas)
+            validation_errors = _validate_import_definition(candidate_questions, candidate_formulas)
             if validation_errors:
                 raise ValueError("\n".join(validation_errors[:12]))
 
@@ -1311,7 +1325,7 @@ async def handle_formulas_upload(message: Message, state: FSMContext, bot: Bot):
                 .where(TestQuestion.test_set_id == ts_id)
                 .order_by(TestQuestion.order_num.asc(), TestQuestion.id.asc())
             )).all())
-            validation_errors = validate_test_definition(questions, parsed_formulas)
+            validation_errors = _validate_import_definition(questions, parsed_formulas)
             if validation_errors:
                 raise ValueError("\n".join(validation_errors[:12]))
             ts.formulas_json = json.dumps(parsed_formulas, ensure_ascii=False)

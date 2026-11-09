@@ -282,6 +282,11 @@ async def start_universal_test(
             await bot.send_message(user_id, "Тест пока недоступен: администратор ещё не загрузил вопросы.")
             return False
 
+        # Materialize the snapshot before acquiring the pre-test claim.  A
+        # failed claim insert rolls back this session and expires ORM objects;
+        # the retry path must still use the exact configuration selected here.
+        configuration_snapshot_json = build_test_attempt_snapshot(test_set, questions)
+
         effective_topic_slug = topic_slug or (user.current_topic_slug if user else None)
         effective_dialogue_id = dialogue_id or (user.current_dialogue_id if user else 1)
 
@@ -326,7 +331,7 @@ async def start_universal_test(
             answers="[]",
             status="in_progress",
             started_at=msk_now(),
-            configuration_snapshot_json=build_test_attempt_snapshot(test_set, questions),
+            configuration_snapshot_json=configuration_snapshot_json,
         )
         session.add(attempt)
         await session.flush()

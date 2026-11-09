@@ -136,16 +136,19 @@ def _raises_value_error(function, *args):
 
 
 def _admin_callback(data: str, user_id: int):
+    bot = AsyncMock()
     message = SimpleNamespace(
         edit_text=AsyncMock(),
         answer=AsyncMock(),
         chat=SimpleNamespace(id=user_id),
         message_id=1,
+        bot=bot,
     )
     return SimpleNamespace(
         data=data,
         from_user=SimpleNamespace(id=user_id),
         message=message,
+        bot=bot,
         answer=AsyncMock(),
     )
 
