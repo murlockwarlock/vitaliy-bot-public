@@ -113,6 +113,38 @@ async def test_crisis_marker_matcher_uses_phrases_context_and_negation():
     assert find_crisis_marker("Не вижу смысла продолжать разговор о проекте") is None
     assert find_crisis_marker("Не вижу смысла продолжать разговор. Сил больше нет") is None
     assert find_crisis_marker("Сил больше нет после тренировки") is None
+    assert find_crisis_marker(
+        "В книге герой сказал: «Не вижу смысла продолжать. Сил больше нет»",
+        ["другой маркер"],
+    ) is None
+    assert find_crisis_marker(
+        "«Не вижу смысла продолжать. Сил больше нет»",
+        ["другой маркер"],
+    ) == "не вижу смысла продолжать сил больше нет"
+
+
+@pytest.mark.asyncio
+async def test_scenario_4_citation_does_not_set_flag_but_direct_crisis_does():
+    await init_db()
+    quoted_user_id = 98261020
+    direct_user_id = 98261021
+    await _ensure_user(quoted_user_id, crisis_detected_at=None)
+    await _ensure_user(direct_user_id, crisis_detected_at=None)
+    await _set_marker_config(True, ["другой маркер"])
+
+    quoted_text = "В книге герой сказал: «Не вижу смысла продолжать. Сил больше нет»"
+    direct_text = "Не вижу смысла продолжать. Сил больше нет"
+    async with async_session_maker() as session:
+        assert await check_crisis_markers(session, quoted_user_id, quoted_text) is None
+        quoted_user = await session.get(User, quoted_user_id)
+        assert quoted_user.crisis_detected_at is None
+
+        assert await check_crisis_markers(session, direct_user_id, direct_text) == (
+            "не вижу смысла продолжать сил больше нет"
+        )
+        await session.commit()
+        direct_user = await session.get(User, direct_user_id)
+        assert direct_user.crisis_detected_at is not None
 
 
 @pytest.mark.asyncio

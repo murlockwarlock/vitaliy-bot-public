@@ -1134,38 +1134,33 @@ async def configured_subscription_info_keyboard(sub_info=None, referral_info=Non
 
     desired_toggle = None
     if sub_info and sub_info.get("allow_auto_renewal", True):
-        desired_toggle = (
-            "❌ Отменить автопродление"
-            if sub_info.get("auto_renewal")
-            else "✅ Включить автопродление"
-        )
+        desired_toggle = "❌ Отменить автопродление" if sub_info.get("auto_renewal") else "✅ Включить автопродление"
     toggle_candidates = [
         button for button in buttons
-        if (button.action_value or button.legacy_callback) == "sub_toggle_renewal"
+        if (button.legacy_callback or button.action_value) == "sub_toggle_renewal"
     ]
-    selected_toggle = next(
-        (button for button in toggle_candidates if button.label == desired_toggle),
-        next((button for button in toggle_candidates if button.label_override), None),
-    )
-    if desired_toggle is not None and selected_toggle is None and toggle_candidates:
-        selected_toggle = toggle_candidates[0]
-
+    selected_toggle = None
+    if desired_toggle is not None:
+        selected_toggle = next(
+            (button for button in toggle_candidates if not button.label_override and button.label == desired_toggle),
+            next((button for button in toggle_candidates if button.label_override), None),
+        )
+        if selected_toggle is None and toggle_candidates:
+            selected_toggle = toggle_candidates[0]
     rows = []
     for button in buttons:
-        action = button.action_value or button.legacy_callback
-        if action == "sub_toggle_renewal":
+        slot_action = button.legacy_callback or button.action_value
+        if slot_action == "sub_toggle_renewal":
             if selected_toggle is None or button is not selected_toggle:
                 continue
-        elif action == "menu_referral" and not (referral_info and referral_info.get("enabled")):
-            continue
-        elif action not in {
-            "sub_select_plan",
-            "sub_enter_promo",
-            "menu_referral",
-            "back_to_main_menu_text",
-        }:
-            continue
-        rows.append([button_to_telegram(button)])
+            label = None if button.label_override else desired_toggle
+        elif slot_action == "menu_referral":
+            if not (referral_info and referral_info.get("enabled")):
+                continue
+            label = button.label if button.label_override else referral_info.get("sub_btn_name", button.label)
+        else:
+            label = None
+        rows.append([button_to_telegram(button, label=label)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 

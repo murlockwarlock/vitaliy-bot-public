@@ -228,6 +228,8 @@ async def configured_internal_menu_markup(
     dynamic_labels: dict[str, str] | None = None,
 ) -> InlineKeyboardMarkup:
     """Render an admin-managed keyboard for a non-root user screen."""
+    if section_key == "funnel_crisis":
+        return await _configured_crisis_menu_markup(fallback)
     section, buttons = await load_menu_buttons(section_key)
     if section is None:
         return fallback
@@ -249,6 +251,25 @@ async def configured_internal_menu_markup(
             label = dynamic_labels.get(action_value)
         rows.append([button_to_telegram(button, action_value=action_value, label=label)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _configured_crisis_menu_markup(fallback: InlineKeyboardMarkup) -> InlineKeyboardMarkup:
+    async with async_session_maker() as session:
+        button = await session.scalar(
+            select(MenuButton)
+            .where(MenuButton.section_key == "funnel_crisis")
+            .order_by(MenuButton.order_num.asc(), MenuButton.id.asc())
+        )
+        if not button:
+            return fallback
+        label = button.label or fallback.inline_keyboard[0][0].text
+        if button.content_key and not button.label_override:
+            content = await session.get(Content, button.content_key)
+            if content and content.button_text:
+                label = content.button_text
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text=label, callback_data="funnel_to_main")]]
+    )
 
 
 async def dynamic_menu_markup(section_key: str) -> InlineKeyboardMarkup | None:
