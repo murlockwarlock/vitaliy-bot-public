@@ -758,7 +758,7 @@ async def _save_guided_question(
                 loaded = json.loads(ts.formulas_json)
             except (TypeError, ValueError, json.JSONDecodeError) as exc:
                 raise ValueError("Действующие правила расчёта повреждены; изменение отменено.") from exc
-            formulas = loaded if isinstance(loaded, list) else []
+            formulas = _normalize_formulas_for_validation(loaded)
         errors = validate_test_definition(questions, formulas)
         if errors:
             raise ValueError("\n".join(errors[:12]))
