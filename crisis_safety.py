@@ -140,18 +140,13 @@ def _is_explicitly_negated(tokens: list[str], start: int, marker_tokens: list[st
 
 
 def _matches_scenario_4(tokens: list[str]) -> bool:
-    """Match the mandatory acceptance phrase across normal punctuation only."""
-    prefix_width = len(_SCENARIO_4_PREFIX)
-    suffix_width = len(_SCENARIO_4_SUFFIX)
-    for start in range(len(tokens) - prefix_width + 1):
-        if tuple(tokens[start:start + prefix_width]) != _SCENARIO_4_PREFIX:
-            continue
-        suffix_start = start + prefix_width
-        suffix_limit = min(len(tokens) - suffix_width + 1, suffix_start + 6)
-        for candidate in range(suffix_start, suffix_limit):
-            if tuple(tokens[candidate:candidate + suffix_width]) == _SCENARIO_4_SUFFIX:
-                return True
-    return False
+    """Match the mandatory acceptance phrase after punctuation normalization."""
+    scenario_tokens = _SCENARIO_4_PREFIX + _SCENARIO_4_SUFFIX
+    width = len(scenario_tokens)
+    return any(
+        tuple(tokens[start:start + width]) == scenario_tokens
+        for start in range(len(tokens) - width + 1)
+    )
 
 
 def find_crisis_marker(text: str | None, markers: object = None) -> str | None:

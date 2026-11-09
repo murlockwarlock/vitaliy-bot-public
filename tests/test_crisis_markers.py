@@ -111,6 +111,7 @@ async def test_crisis_marker_matcher_uses_phrases_context_and_negation():
         "не вижу смысла продолжать сил больше нет"
     )
     assert find_crisis_marker("Не вижу смысла продолжать разговор о проекте") is None
+    assert find_crisis_marker("Не вижу смысла продолжать разговор. Сил больше нет") is None
     assert find_crisis_marker("Сил больше нет после тренировки") is None
 
 
