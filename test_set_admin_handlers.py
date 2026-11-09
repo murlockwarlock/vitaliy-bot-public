@@ -99,8 +99,24 @@ def _custom_answer_keyboard(prefix: str, cancel_callback: str) -> InlineKeyboard
     return builder.as_markup()
 
 
+def _normalize_formulas_for_validation(formulas):
+    if formulas is None:
+        return []
+    if not isinstance(formulas, list):
+        raise ValueError("Правила расчёта должны быть списком.")
+    normalized = []
+    for index, formula in enumerate(formulas, start=1):
+        if not isinstance(formula, dict):
+            raise ValueError(f"Формула {index} должна быть объектом.")
+        item = dict(formula)
+        if not item.get("formula") and item.get("expression"):
+            item["formula"] = item["expression"]
+        normalized.append(item)
+    return normalized
+
+
 def _validate_import_definition(questions, formulas):
-    errors = validate_test_definition(questions, formulas)
+    errors = validate_test_definition(questions, _normalize_formulas_for_validation(formulas))
     if not questions:
         # Keep the established setup order where formulas may be loaded before
         # their question variables exist. Syntax and duplicate-result errors
