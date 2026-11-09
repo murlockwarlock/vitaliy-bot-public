@@ -37,9 +37,14 @@ DEFAULT_CRISIS_MARKERS = (
     "сделать себе больно",
     "не хочу жить",
     "не вижу смысла жить",
+    "не вижу смысла продолжать сил больше нет",
     "лучше бы меня не было",
     "хочу умереть",
 )
+
+_SCENARIO_4_PREFIX = ("не", "вижу", "смысла", "продолжать")
+_SCENARIO_4_SUFFIX = ("сил", "больше", "нет")
+SCENARIO_4_CRISIS_MARKER = "не вижу смысла продолжать сил больше нет"
 
 _CRISIS_CONTEXT_WORDS = {
     "больно",
@@ -134,10 +139,27 @@ def _is_explicitly_negated(tokens: list[str], start: int, marker_tokens: list[st
     return False
 
 
+def _matches_scenario_4(tokens: list[str]) -> bool:
+    """Match the mandatory acceptance phrase across normal punctuation only."""
+    prefix_width = len(_SCENARIO_4_PREFIX)
+    suffix_width = len(_SCENARIO_4_SUFFIX)
+    for start in range(len(tokens) - prefix_width + 1):
+        if tuple(tokens[start:start + prefix_width]) != _SCENARIO_4_PREFIX:
+            continue
+        suffix_start = start + prefix_width
+        suffix_limit = min(len(tokens) - suffix_width + 1, suffix_start + 6)
+        for candidate in range(suffix_start, suffix_limit):
+            if tuple(tokens[candidate:candidate + suffix_width]) == _SCENARIO_4_SUFFIX:
+                return True
+    return False
+
+
 def find_crisis_marker(text: str | None, markers: object = None) -> str | None:
     tokens = _normalize_crisis_text(text).split()
     if not tokens:
         return None
+    if _matches_scenario_4(tokens):
+        return SCENARIO_4_CRISIS_MARKER
     configured = list(DEFAULT_CRISIS_MARKERS) if markers is None else parse_crisis_markers(markers)
     configured = sorted(enumerate(configured), key=lambda item: (-len(item[1].split()), item[0]))
     for _, marker in configured:
@@ -256,6 +278,7 @@ async def get_crisis_contacts_text(session: "AsyncSession | None" = None) -> str
 
 async def send_crisis_contacts_if_active(bot, user_id: int, chat_id: int | None = None) -> bool:
     from database import User, async_session_maker
+    from menu_service import configured_internal_menu_markup
 
     async with async_session_maker() as session:
         user = await session.get(User, user_id)
@@ -267,7 +290,10 @@ async def send_crisis_contacts_if_active(bot, user_id: int, chat_id: int | None 
         await bot.send_message(
             chat_id if chat_id is not None else user_id,
             contacts_text,
-            reply_markup=crisis_contacts_keyboard(),
+            reply_markup=await configured_internal_menu_markup(
+                "funnel_crisis",
+                crisis_contacts_keyboard(),
+            ),
         )
     except Exception as exc:
         logger.error("crisis_contacts_delivery_failed user_id=%s error=%s", user_id, exc)

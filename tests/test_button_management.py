@@ -16,6 +16,7 @@ from sqlalchemy.orm import sessionmaker
 
 import content_service
 import database as database_module
+import funnel
 import handlers
 import keyboards
 import menu_service
@@ -278,6 +279,35 @@ class ButtonManagementTests(unittest.IsolatedAsyncioTestCase):
                         expected_label = content.button_text
                 self.assertIn(expected_label, rendered_labels)
 
+    async def test_internal_funnel_screen_button_changes_are_visible_without_restart(self):
+        button = await self._button("funnel_strategy_offer", 0)
+        original = (button.label, button.enabled, button.label_override)
+        state = await self._state(self.admin_id)
+        await state.update_data(menu_button_id=button.id)
+        message = SimpleNamespace(
+            from_user=SimpleNamespace(id=self.admin_id),
+            text="Записаться на разбор",
+            answer=AsyncMock(),
+            bot=SimpleNamespace(),
+        )
+        try:
+            await handlers.admin_menu_button_label_save(message, state)
+            markup = await funnel.configured_strategy_offer_keyboard()
+            labels = [item.text for row in markup.inline_keyboard for item in row]
+            self.assertIn("Записаться на разбор", labels)
+
+            await handlers.admin_menu_button_toggle(
+                FakeCallback(self.admin_id, f"admin_menu_button_toggle:{button.id}")
+            )
+            hidden = await funnel.configured_strategy_offer_keyboard()
+            hidden_labels = [item.text for row in hidden.inline_keyboard for item in row]
+            self.assertNotIn("Записаться на разбор", hidden_labels)
+        finally:
+            async with async_session_maker() as session:
+                current = await session.get(MenuButton, button.id)
+                current.label, current.enabled, current.label_override = original
+                await session.commit()
+
     async def test_non_admin_cannot_change_button(self):
         button = await self._button("main", 0)
         callback = FakeCallback(self.ordinary_id, f"admin_menu_button_toggle:{button.id}")
@@ -495,10 +525,11 @@ class ButtonManagementTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(f"admin_menu_button_toggle:{button.id}", callbacks)
         self.assertIn(f"admin_menu_button_move:{button.id}:up", callbacks)
         self.assertIn(f"admin_menu_button_move:{button.id}:down", callbacks)
+        self.assertIn(f"admin_menu_button_order:{button.id}", callbacks)
         self.assertIn(f"admin_menu_section:{button.section_key}", callbacks)
         self.assertIn("⬆️ Выше", labels)
         self.assertIn("⬇️ Ниже", labels)
-        self.assertNotIn("Изменить порядок", labels)
+        self.assertIn("🔢 Изменить порядок", labels)
         self.assertIn("Позиция:", message_text)
         self.assertIn("Видна клиенту", message_text)
 

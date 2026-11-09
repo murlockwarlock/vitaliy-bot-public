@@ -3,6 +3,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from database import JournalEntry, JournalQuestion
 from keyboards import standard_pagination_row
 from universal_tests import get_answer_options, get_question_type
+from menu_service import configured_internal_menu_markup
 
 
 def journal_question_keyboard(entry_id: int, position: int, question: dict) -> InlineKeyboardMarkup:
@@ -20,6 +21,26 @@ def journal_question_keyboard(entry_id: int, position: int, question: dict) -> I
     return builder.as_markup()
 
 
+async def configured_journal_question_keyboard(
+    entry_id: int,
+    position: int,
+    question: dict,
+) -> InlineKeyboardMarkup:
+    fallback = journal_question_keyboard(entry_id, position, question)
+    configured = await configured_internal_menu_markup(
+        "journal_question",
+        fallback,
+        substitutions={"entry_id": entry_id, "position": position},
+    )
+    if configured is fallback:
+        return fallback
+    option_rows = [
+        row for row in fallback.inline_keyboard
+        if any((button.callback_data or "").startswith("j_opt:") for button in row)
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=option_rows + configured.inline_keyboard)
+
+
 def journal_entry_keyboard() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.button(text="📊 Открыть дневник", callback_data="journal_open_stats")
@@ -28,6 +49,10 @@ def journal_entry_keyboard() -> InlineKeyboardMarkup:
     builder.button(text="⬅️ Главное меню", callback_data="back_to_main_menu_text")
     builder.adjust(1)
     return builder.as_markup()
+
+
+async def configured_journal_entry_keyboard() -> InlineKeyboardMarkup:
+    return await configured_internal_menu_markup("journal_entry", journal_entry_keyboard())
 
 
 def journal_menu_keyboard(
@@ -64,6 +89,44 @@ def journal_menu_keyboard(
     builder.adjust(*row_widths)
 
     return builder.as_markup()
+
+
+async def configured_journal_menu_keyboard(
+    has_in_progress: bool = False,
+    in_progress_id: int | None = None,
+    is_today_completed: bool = False,
+    completed_id: int | None = None,
+    has_video: bool = False,
+) -> InlineKeyboardMarkup:
+    fallback = journal_menu_keyboard(
+        has_in_progress=has_in_progress,
+        in_progress_id=in_progress_id,
+        is_today_completed=is_today_completed,
+        completed_id=completed_id,
+        has_video=has_video,
+    )
+    allowed_actions = {
+        "j_time_menu",
+        "quick_notes",
+        "j_h_p:0",
+        "j_dyn_menu",
+        "mode_habits",
+        "back_to_main_menu_text",
+    }
+    if has_in_progress and in_progress_id:
+        allowed_actions.update({f"j_res:{in_progress_id}", f"j_rst:{in_progress_id}"})
+    elif is_today_completed and completed_id:
+        allowed_actions.add(f"j_h_v:{completed_id}")
+    else:
+        allowed_actions.add("j_start")
+    if has_video:
+        allowed_actions.add("j_video")
+    return await configured_internal_menu_markup(
+        "journal_menu",
+        fallback,
+        substitutions={"entry_id": in_progress_id, "completed_id": completed_id},
+        allowed_actions=allowed_actions,
+    )
 
 
 def quick_notes_keyboard(page: int = 0, total_pages: int = 1, notes=None) -> InlineKeyboardMarkup:

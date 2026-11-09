@@ -1916,7 +1916,7 @@ async def _send_subscription_info(user_id: int, chat_id: int, bot: Bot):
         else:
             text = base_text
 
-    reply_markup = kb.subscription_info_keyboard(sub_info, referral_info=referral_info)
+    reply_markup = await kb.configured_subscription_info_keyboard(sub_info, referral_info=referral_info)
     if subscription_media and len(text) <= 1024:
         media = subscription_media[0]
         if media.file_type == "photo":
@@ -2600,7 +2600,7 @@ async def _ai_session_completed_payload(topic_slug: str, dialogue_id: int):
     )
     if summary_enabled:
         text += "\n\nМожно сформировать итог сессии или продолжить диалог."
-    markup = kb.topic_finish_actions_keyboard(topic_slug, dialogue_id, has_summary=summary_enabled)
+    markup = await kb.configured_topic_finish_actions_keyboard(topic_slug, dialogue_id, has_summary=summary_enabled)
     return text, markup
 
 
@@ -2701,7 +2701,7 @@ async def cb_ai_gen_summary(callback: CallbackQuery, state: FSMContext, bot: Bot
             except Exception:
                 pass
 
-        markup = kb.topic_summary_result_keyboard(topic_slug, dialogue_id)
+        markup = await kb.configured_topic_summary_result_keyboard(topic_slug, dialogue_id)
         safe_summary = html.escape(summary_text)
         await callback.message.answer(f"📝 <b>Итог сессии:</b>\n\n{safe_summary}", reply_markup=markup, parse_mode="HTML")
 
@@ -2737,7 +2737,7 @@ async def cb_ai_regen_summary(callback: CallbackQuery, state: FSMContext, bot: B
             except Exception:
                 pass
 
-        markup = kb.topic_summary_result_keyboard(topic_slug, dialogue_id)
+        markup = await kb.configured_topic_summary_result_keyboard(topic_slug, dialogue_id)
         safe_summary = html.escape(summary_text)
         await callback.message.answer(
             f"📝 <b>Обновлённый итог сессии{ver_text}:</b>\n\n{safe_summary}",
@@ -2809,28 +2809,20 @@ async def mode_habits(callback: CallbackQuery, bot: Bot, state: FSMContext | Non
         intro_text = content_obj.text_content if content_obj else "Раздел формирования привычек."
         media = content_obj.media if content_obj else None
 
-    builder = InlineKeyboardBuilder()
-
     if mode == 'catalog':
         intro_text += "\n\n📚 <b>Режим библиотеки:</b> Выбери полезную привычку из списка ниже, чтобы начать."
-        builder.button(text="📂 Выбрать из каталога", callback_data="habit_open_catalog")
-
     elif mode == 'custom':
         intro_text += "\n\n🛠 <b>Конструктор:</b> Создай свою собственную привычку и поставь таймер."
-        builder.button(text="➕ Создать привычку", callback_data="habit_create_new")
-
     elif mode == 'hybrid':
         intro_text += "\n\n🚀 <b>Трекер привычек:</b> Выбери готовую или создай свою."
-        builder.button(text="📂 Выбрать из каталога", callback_data="habit_open_catalog")
-        builder.button(text="➕ Создать свою", callback_data="habit_create_new")
 
-    builder.button(text="📋 Мои привычки", callback_data="habit_my_list")
-    builder.button(text="🌍 Часовой пояс", callback_data="habit_timezone")
-    builder.button(text="📔 Дневник саморефлексии", callback_data="mode_journal")
-    builder.button(text="⬅️ В главное меню", callback_data="back_to_main_menu_text")
-    builder.adjust(1)
-
-    await send_smart_content(callback, intro_text, media, builder.as_markup(), bot)
+    await send_smart_content(
+        callback,
+        intro_text,
+        media,
+        await kb.configured_habits_entry_keyboard(mode),
+        bot,
+    )
     await callback.answer()
 
 
@@ -4539,6 +4531,7 @@ def _menu_button_editor_keyboard(view: dict):
     builder = kb.InlineKeyboardBuilder()
     builder.button(text="✏️ Переименовать", callback_data=f"admin_menu_button_label:{view['id']}")
     builder.button(text="🔗 Изменить ссылку или действие", callback_data=f"admin_menu_button_action:{view['id']}")
+    builder.button(text="🔢 Изменить порядок", callback_data=f"admin_menu_button_order:{view['id']}")
     toggle_text = "🙈 Скрыть" if view["enabled"] else "👁 Показать"
     builder.button(text=toggle_text, callback_data=f"admin_menu_button_toggle:{view['id']}")
     builder.button(text="⬆️ Выше", callback_data=f"admin_menu_button_move:{view['id']}:up")
@@ -8067,8 +8060,13 @@ async def open_payment_menu(callback: CallbackQuery, bot: Bot):
             f"Стоимость 1 сообщения: {conf.cost_per_message} токенов."
         )
     # ВАЖНО: Передаем media в функцию отправки
-    await send_smart_content(callback, text, media, kb.payment_main_keyboard(mode, user.balance, user.subscription_end),
-                             bot)
+    await send_smart_content(
+        callback,
+        text,
+        media,
+        await kb.configured_payment_main_keyboard(mode, user.balance, user.subscription_end),
+        bot,
+    )
 
 
 @router.callback_query(F.data == "show_subscription_info")

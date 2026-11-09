@@ -107,6 +107,11 @@ async def test_crisis_marker_matcher_uses_phrases_context_and_negation():
     assert find_crisis_marker("Я не хочу покончить с собой", ["хочу покончить с собой"]) is None
     assert find_crisis_marker("В статье обсуждается суицидальный риск", ["суицид"]) is None
     assert find_crisis_marker("Я планирую суицид", ["суицид"]) == "суицид"
+    assert find_crisis_marker("Не вижу смысла продолжать. Сил больше нет", ["другой маркер"]) == (
+        "не вижу смысла продолжать сил больше нет"
+    )
+    assert find_crisis_marker("Не вижу смысла продолжать разговор о проекте") is None
+    assert find_crisis_marker("Сил больше нет после тренировки") is None
 
 
 @pytest.mark.asyncio

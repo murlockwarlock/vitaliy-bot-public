@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 import funnel
 import handlers
+import ai_integration
 from database import (
     Content,
     ContentMedia,
@@ -19,7 +20,9 @@ from database import (
     FunnelConfig,
     FunnelLanding,
     FunnelState,
+    AIConfig,
     Message as DBMessage,
+    Topic,
     MenuButton,
     User,
     _ensure_sqlite_compat_schema,
@@ -156,6 +159,58 @@ async def test_funnel_render_never_exposes_json_and_uses_bridge_actions():
         assert state.next_followup_at is not None
 
 
+@pytest.mark.asyncio
+async def test_funnel_prompt_variables_preserve_json_examples():
+    user_id = 94000130
+    await _prepare_user(user_id)
+    async with async_session_maker() as session:
+        topic = await session.get(Topic, "funnel_demo")
+        original_prompt = topic.system_prompt
+        topic.system_prompt = (
+            'Разбери практику «{practice_name}» и ответ пользователя «{user_input}». '
+            'Формат ответа: {"mode":"normal","reply":"текст"}'
+        )
+        ai_config = await session.get(AIConfig, 1)
+        await session.commit()
+
+    captured = {}
+
+    async def fake_prepare_clients(session):
+        return ai_config, None, object(), "prompt-test-model", None
+
+    async def fake_generate_chat_response(*args):
+        captured["messages"] = args[-1]
+        return ai_integration.StructuredAIResponse(
+            text="Готово",
+            raw_payload={},
+            http_status=None,
+            finish_reason="stop",
+        )
+
+    try:
+        with patch("ai_integration._prepare_clients", new=AsyncMock(side_effect=fake_prepare_clients)), \
+             patch("ai_integration._generate_chat_response", new=AsyncMock(side_effect=fake_generate_chat_response)):
+            await ai_integration.get_ai_response_for_topic(
+                user_id,
+                "Опыт пользователя",
+                "Demo",
+                topic_slug="funnel_demo",
+                dialogue_id=1,
+                prompt_variables={
+                    "practice_name": "Тихий лес",
+                    "user_input": "Сначала напряжение, потом тепло",
+                },
+            )
+
+        system_prompt = captured["messages"][0]["content"]
+        assert "Тихий лес" in system_prompt
+        assert "Сначала напряжение, потом тепло" in system_prompt
+        assert '{"mode":"normal","reply":"текст"}' in system_prompt
+    finally:
+        async with async_session_maker() as session:
+            topic = await session.get(Topic, "funnel_demo")
+            topic.system_prompt = original_prompt
+            await session.commit()
 @pytest.mark.asyncio
 async def test_malformed_funnel_response_uses_fallback_and_records_event():
     user_id = 94000102

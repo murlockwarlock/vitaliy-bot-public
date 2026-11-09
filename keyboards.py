@@ -14,7 +14,12 @@ from database import (
     Message as DBMessage,
     sync_book_menu_buttons,
 )
-from menu_service import is_menu_section_enabled, load_menu_buttons, button_to_telegram
+from menu_service import (
+    configured_internal_menu_markup,
+    is_menu_section_enabled,
+    load_menu_buttons,
+    button_to_telegram,
+)
 from content_service import get_button as cs_get_button, get_content as cs_get_content
 from admin_roles import AdminRole, permission_for_callback, role_has_permission
 
@@ -151,6 +156,30 @@ def topic_finish_actions_keyboard(topic_slug: str, dialogue_id: int, summary_ena
     return builder.as_markup()
 
 
+async def configured_topic_finish_actions_keyboard(
+    topic_slug: str,
+    dialogue_id: int,
+    summary_enabled: bool = False,
+    has_summary: bool = None,
+) -> InlineKeyboardMarkup:
+    fallback = topic_finish_actions_keyboard(topic_slug, dialogue_id, summary_enabled, has_summary)
+    allowed_actions = {
+        f"ai_new_dialogue:{topic_slug}",
+        "funnel_open_landing",
+        "main_menu_action",
+    }
+    if has_summary is not None:
+        summary_enabled = has_summary
+    if summary_enabled:
+        allowed_actions.add(f"ai_gen_summary:{topic_slug}:{dialogue_id}")
+    return await configured_internal_menu_markup(
+        "ai_completed",
+        fallback,
+        substitutions={"topic_slug": topic_slug, "dialogue_id": dialogue_id},
+        allowed_actions=allowed_actions,
+    )
+
+
 def topic_summary_result_keyboard(topic_slug: str, dialogue_id: int) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.button(text="▶️ Продолжить диалог", callback_data=f"ai_continue_dialogue:{topic_slug}:{dialogue_id}")
@@ -160,6 +189,23 @@ def topic_summary_result_keyboard(topic_slug: str, dialogue_id: int) -> InlineKe
     builder.button(text="🏠 Главное меню", callback_data="main_menu_action")
     builder.adjust(1)
     return builder.as_markup()
+
+
+async def configured_topic_summary_result_keyboard(topic_slug: str, dialogue_id: int) -> InlineKeyboardMarkup:
+    fallback = topic_summary_result_keyboard(topic_slug, dialogue_id)
+    allowed_actions = {
+        f"ai_continue_dialogue:{topic_slug}:{dialogue_id}",
+        f"ai_regen_summary:{topic_slug}:{dialogue_id}",
+        "mode_journal",
+        "funnel_open_landing",
+        "main_menu_action",
+    }
+    return await configured_internal_menu_markup(
+        "ai_completed",
+        fallback,
+        substitutions={"topic_slug": topic_slug, "dialogue_id": dialogue_id},
+        allowed_actions=allowed_actions,
+    )
 
 
 def topic_start_dialogue_keyboard(topic_slug: str, dialogue_id: int, button_text: str = "Начать диалог") -> InlineKeyboardMarkup:
@@ -622,6 +668,19 @@ def payment_main_keyboard(mode, balance, sub_end):
     return builder.as_markup()
 
 
+async def configured_payment_main_keyboard(mode, balance, sub_end):
+    allowed_actions = {"open_extended_menu"}
+    if mode == "token":
+        allowed_actions.add("pay_topup_balance")
+    elif mode == "subscription":
+        allowed_actions.add("show_subscription_info")
+    return await configured_internal_menu_markup(
+        "subscription_main",
+        payment_main_keyboard(mode, balance, sub_end),
+        allowed_actions=allowed_actions,
+    )
+
+
 async def payment_providers_keyboard(is_subscription=False, plan_id=None):
     async with async_session_maker() as session:
         providers = await session.execute(select(PaymentProvider).where(PaymentProvider.is_active == True))
@@ -758,6 +817,44 @@ async def admin_habit_keyboard():
     builder.button(text="⬅️ Назад", callback_data="admin_section_content")
     builder.adjust(1)
     return builder.as_markup()
+
+
+def habits_entry_keyboard(mode):
+    builder = InlineKeyboardBuilder()
+    if mode == "catalog":
+        builder.button(text="📂 Выбрать из каталога", callback_data="habit_open_catalog")
+    elif mode == "custom":
+        builder.button(text="➕ Создать привычку", callback_data="habit_create_new")
+    elif mode == "hybrid":
+        builder.button(text="📂 Выбрать из каталога", callback_data="habit_open_catalog")
+        builder.button(text="➕ Создать свою", callback_data="habit_create_new")
+    builder.button(text="📋 Мои привычки", callback_data="habit_my_list")
+    builder.button(text="🌍 Часовой пояс", callback_data="habit_timezone")
+    builder.button(text="📔 Дневник саморефлексии", callback_data="mode_journal")
+    builder.button(text="⬅️ В главное меню", callback_data="back_to_main_menu_text")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+async def configured_habits_entry_keyboard(mode):
+    allowed_actions = {
+        "habit_my_list",
+        "habit_timezone",
+        "mode_journal",
+        "back_to_main_menu_text",
+    }
+    if mode in {"catalog", "hybrid"}:
+        allowed_actions.add("habit_open_catalog")
+    if mode in {"custom", "hybrid"}:
+        allowed_actions.add("habit_create_new")
+    return await configured_internal_menu_markup(
+        "habits_entry",
+        habits_entry_keyboard(mode),
+        allowed_actions=allowed_actions,
+        dynamic_labels={
+            "habit_create_new": "➕ Создать свою" if mode == "hybrid" else "➕ Создать привычку",
+        },
+    )
 
 
 AUDIENCE_LABELS = {
@@ -1025,6 +1122,51 @@ def subscription_info_keyboard(sub_info=None, referral_info=None):
     builder.button(text="⬅️ Главное меню", callback_data="back_to_main_menu_text")
     builder.adjust(1)
     return builder.as_markup()
+
+
+async def configured_subscription_info_keyboard(sub_info=None, referral_info=None):
+    fallback = subscription_info_keyboard(sub_info, referral_info=referral_info)
+    section, buttons = await load_menu_buttons("subscription_info")
+    if section is None:
+        return fallback
+    if not section.enabled:
+        return InlineKeyboardMarkup(inline_keyboard=[])
+
+    desired_toggle = None
+    if sub_info and sub_info.get("allow_auto_renewal", True):
+        desired_toggle = (
+            "❌ Отменить автопродление"
+            if sub_info.get("auto_renewal")
+            else "✅ Включить автопродление"
+        )
+    toggle_candidates = [
+        button for button in buttons
+        if (button.action_value or button.legacy_callback) == "sub_toggle_renewal"
+    ]
+    selected_toggle = next(
+        (button for button in toggle_candidates if button.label == desired_toggle),
+        next((button for button in toggle_candidates if button.label_override), None),
+    )
+    if desired_toggle is not None and selected_toggle is None and toggle_candidates:
+        selected_toggle = toggle_candidates[0]
+
+    rows = []
+    for button in buttons:
+        action = button.action_value or button.legacy_callback
+        if action == "sub_toggle_renewal":
+            if selected_toggle is None or button is not selected_toggle:
+                continue
+        elif action == "menu_referral" and not (referral_info and referral_info.get("enabled")):
+            continue
+        elif action not in {
+            "sub_select_plan",
+            "sub_enter_promo",
+            "menu_referral",
+            "back_to_main_menu_text",
+        }:
+            continue
+        rows.append([button_to_telegram(button)])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def admin_referral_settings_keyboard(ref_config, sub_config):
