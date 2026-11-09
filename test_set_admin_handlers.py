@@ -943,10 +943,6 @@ async def view_test_set_questions(callback: CallbackQuery, state: FSMContext | N
             InlineKeyboardButton(text="⬆️", callback_data=f"ts_q_up_{ts_id}_{q.id}"),
             InlineKeyboardButton(text="⬇️", callback_data=f"ts_q_down_{ts_id}_{q.id}"),
         )
-        builder.row(InlineKeyboardButton(
-            text="⚙️ Настроить тип ответа",
-            callback_data=f"ts_q_type_{ts_id}_{q.id}",
-        ))
 
     if len(questions) > 30:
         lines.append(f"\n<i>... и еще {len(questions) - 30} вопросов</i>")
@@ -984,11 +980,14 @@ async def start_question_edit(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_text(
         "✏️ <b>Редактирование вопроса</b>\n\n"
         "Отправь новый текст, чтобы изменить формулировку вопроса.\n"
-        "Тип ответа, варианты и порядок можно изменить через расширенный импорт.\n\n"
+        "Тип ответа и варианты можно настроить кнопками ниже.\n\n"
         f"Текущий текст:\n<i>{html.escape(question.text)}</i>\n"
         f"Тип ответа: <b>{html.escape(type_label)}</b>\n"
         f"Варианты: <i>{html.escape(options_label)}</i>",
-        reply_markup=_cancel_kb(f"edit_testset_{ts_id}"),
+        reply_markup=_question_type_keyboard(
+            f"ts_q_type_{ts_id}_{question_id}",
+            include_cancel=f"edit_testset_{ts_id}",
+        ),
         parse_mode="HTML",
     )
     await callback.answer()
