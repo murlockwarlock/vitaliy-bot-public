@@ -39,6 +39,7 @@ class JournalAdminStates(StatesGroup):
     new_question_text = State()
     edit_question_text = State()
     edit_points = State()
+    guided_question_type = State()
     guided_question_options = State()
 
 
@@ -76,6 +77,37 @@ def _journal_question_page(data: str) -> int:
         return max(0, int(parts[2]))
     except (TypeError, ValueError):
         return 0
+
+
+async def _journal_guided_context(
+    state: FSMContext,
+    question_id: int,
+    page: int,
+    *,
+    stage: str,
+) -> dict | None:
+    data = await state.get_data()
+    expected_state = (
+        JournalAdminStates.guided_question_type.state
+        if stage == "type"
+        else JournalAdminStates.guided_question_options.state
+    )
+    if await state.get_state() != expected_state:
+        return None
+    try:
+        expected_page = int(data.get("journal_questions_page", 0))
+        actual_page = int(page)
+    except (TypeError, ValueError):
+        return None
+    if data.get("guided_question_id") != question_id or expected_page != actual_page:
+        return None
+    if data.get("guided_stage") != stage:
+        return None
+    return data
+
+
+async def _reject_stale_journal_callback(callback: CallbackQuery) -> None:
+    await callback.answer("Кнопка устарела. Откройте вопрос заново.", show_alert=True)
 
 
 async def _journal_question_page_data(page: int) -> tuple[list[JournalQuestion], int, int]:
@@ -307,7 +339,12 @@ async def admin_journal_q_add_submit(message: Message, state: FSMContext):
             q.order_num = idx
         await session.commit()
 
-    await state.clear()
+    await state.set_state(JournalAdminStates.guided_question_type)
+    await state.update_data(
+        guided_question_id=new_q.id,
+        journal_questions_page=page,
+        guided_stage="type",
+    )
     await message.answer("✅ Вопрос успешно добавлен!")
     await message.answer(
         "При необходимости выберите тип ответа и настройте варианты:",
@@ -325,13 +362,23 @@ async def admin_journal_q_type_handler(callback: CallbackQuery, state: FSMContex
         await callback.answer("Ошибка параметров.", show_alert=True)
         return
     qid, page = int(parts[1]), int(parts[2])
+    current_state = await state.get_state()
+    if current_state is not None:
+        context = await _journal_guided_context(state, qid, page, stage="type")
+        if context is None:
+            await _reject_stale_journal_callback(callback)
+            return
     async with async_session_maker() as session:
         question = await session.get(JournalQuestion, qid)
     if not question:
         await callback.answer("Вопрос не найден.", show_alert=True)
         return
-    await state.set_state(JournalAdminStates.guided_question_options)
-    await state.update_data(guided_question_id=qid, journal_questions_page=page)
+    await state.set_state(JournalAdminStates.guided_question_type)
+    await state.update_data(
+        guided_question_id=qid,
+        journal_questions_page=page,
+        guided_stage="type",
+    )
     await callback.message.edit_text(
         f"⚙️ <b>Тип ответа для вопроса #{question.order_num}</b>\n\n"
         f"<i>{html.escape(question.text)}</i>\n\n"
@@ -354,12 +401,17 @@ async def admin_journal_q_set_type_handler(callback: CallbackQuery, state: FSMCo
     if question_type not in {QUESTION_TYPE_TEXT, QUESTION_TYPE_SCALE, QUESTION_TYPE_CHOICE}:
         await callback.answer("Неизвестный тип ответа.", show_alert=True)
         return
+    context = await _journal_guided_context(state, qid, page, stage="type")
+    if context is None:
+        await _reject_stale_journal_callback(callback)
+        return
     if question_type == QUESTION_TYPE_CHOICE:
         await state.set_state(JournalAdminStates.guided_question_options)
         await state.update_data(
             guided_question_id=qid,
             journal_questions_page=page,
             guided_question_type=question_type,
+            guided_stage="options",
         )
         await callback.message.edit_text(
             "Введите варианты ответа, каждый с новой строки.\n"
@@ -389,7 +441,11 @@ async def admin_journal_q_guided_options_submit(message: Message, state: FSMCont
     if not await _ensure_admin(message):
         return
     data = await state.get_data()
-    if data.get("guided_question_type") != QUESTION_TYPE_CHOICE:
+    qid = data.get("guided_question_id")
+    page = data.get("journal_questions_page", 0)
+    context = await _journal_guided_context(state, qid, page, stage="options")
+    if context is None or data.get("guided_question_type") != QUESTION_TYPE_CHOICE:
+        await message.answer("⚠️ Сессия настройки устарела. Откройте вопрос заново.")
         return
     options = [line.strip(" •-\t") for line in (message.text or "").splitlines() if line.strip()]
     if not options:
@@ -398,9 +454,10 @@ async def admin_journal_q_guided_options_submit(message: Message, state: FSMCont
     if len({item.casefold() for item in options}) != len(options):
         await message.answer("⚠️ Варианты должны быть уникальными.")
         return
-    qid = data.get("guided_question_id")
-    page = data.get("journal_questions_page", 0)
-    await state.update_data(guided_options=[{"text": item, "value": None} for item in options])
+    await state.update_data(
+        guided_options=[{"text": item, "value": None} for item in options],
+        guided_stage="custom",
+    )
     await message.answer(
         "Разрешить пользователю написать свой ответ?",
         reply_markup=_journal_custom_keyboard(qid, page),
@@ -416,7 +473,11 @@ async def admin_journal_q_custom_answer_handler(callback: CallbackQuery, state: 
         await callback.answer("Ошибка параметров.", show_alert=True)
         return
     qid, page, flag = int(parts[1]), int(parts[2]), parts[3]
-    data = await state.get_data()
+    context = await _journal_guided_context(state, qid, page, stage="custom")
+    if context is None:
+        await _reject_stale_journal_callback(callback)
+        return
+    data = context
     options = data.get("guided_options") or []
     if not options:
         await callback.answer("Варианты не найдены. Начните настройку заново.", show_alert=True)

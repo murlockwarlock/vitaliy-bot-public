@@ -7,6 +7,7 @@ import logging
 import math
 import re
 from types import SimpleNamespace
+from typing import Any
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
@@ -58,6 +59,34 @@ class TestSetAdminStates(StatesGroup):
     waiting_question_edit = State()
     waiting_guided_question_text = State()
     waiting_guided_question_options = State()
+
+
+async def _testset_guided_context(
+    state: FSMContext,
+    ts_id: int,
+    question_id: int,
+    *,
+    stage: str | None = None,
+) -> dict[str, Any] | None:
+    data = await state.get_data()
+    current_state = await state.get_state()
+    if current_state == TestSetAdminStates.waiting_question_edit.state:
+        expected_ts_id = data.get("target_ts_id")
+        expected_question_id = data.get("target_question_id")
+    elif current_state == TestSetAdminStates.waiting_guided_question_options.state:
+        expected_ts_id = data.get("guided_ts_id")
+        expected_question_id = data.get("guided_question_id")
+    else:
+        return None
+    if expected_ts_id != ts_id or (expected_question_id or None) != (question_id or None):
+        return None
+    if stage is not None and data.get("guided_stage") != stage:
+        return None
+    return data
+
+
+async def _reject_stale_testset_callback(callback: CallbackQuery) -> None:
+    await callback.answer("Кнопка устарела. Откройте вопрос заново.", show_alert=True)
 
 
 async def _is_admin(user_id: int) -> bool:
@@ -776,8 +805,9 @@ async def start_guided_question_add(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Доступ запрещен.", show_alert=True)
         return
     ts_id = int(callback.data.split("ts_q_add_")[1])
+    await state.clear()
     await state.set_state(TestSetAdminStates.waiting_guided_question_text)
-    await state.update_data(guided_ts_id=ts_id, guided_question_id=None)
+    await state.update_data(guided_ts_id=ts_id, guided_question_id=None, guided_stage="text")
     await callback.message.edit_text(
         "➕ <b>Новый вопрос</b>\n\n"
         "Шаг 1 из 2. Отправьте текст вопроса.",
@@ -798,7 +828,14 @@ async def receive_guided_question_text(message: Message, state: FSMContext):
     data = await state.get_data()
     ts_id = data.get("guided_ts_id")
     question_id = data.get("guided_question_id")
-    await state.update_data(guided_text=text_value)
+    if (
+        await state.get_state() != TestSetAdminStates.waiting_guided_question_text.state
+        or not ts_id
+        or data.get("guided_stage") != "text"
+    ):
+        await message.answer("⚠️ Сессия настройки устарела. Откройте вопрос заново.")
+        return
+    await state.update_data(guided_text=text_value, guided_stage="type")
     await state.set_state(TestSetAdminStates.waiting_guided_question_options)
     prefix = f"ts_q_type_{ts_id}_{question_id or 0}"
     await message.answer(
@@ -815,6 +852,10 @@ async def guided_question_type(callback: CallbackQuery, state: FSMContext):
     parts = callback.data.split("_")
     if len(parts) == 5:
         ts_id, question_id = int(parts[3]), int(parts[4])
+        context = await _testset_guided_context(state, ts_id, question_id, stage="type")
+        if context is None:
+            await _reject_stale_testset_callback(callback)
+            return
         async with async_session_maker() as session:
             question = await session.scalar(select(TestQuestion).where(
                 TestQuestion.id == question_id,
@@ -828,6 +869,7 @@ async def guided_question_type(callback: CallbackQuery, state: FSMContext):
             guided_ts_id=ts_id,
             guided_question_id=question_id,
             guided_text=question.text,
+            guided_stage="type",
         )
         await callback.message.edit_text(
             "Выберите тип ответа для вопроса:",
@@ -842,7 +884,11 @@ async def guided_question_type(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Ошибка параметров.", show_alert=True)
         return
     ts_id, question_id, question_type = int(parts[3]), int(parts[4]), parts[5]
-    data = await state.get_data()
+    context = await _testset_guided_context(state, ts_id, question_id, stage="type")
+    if context is None:
+        await _reject_stale_testset_callback(callback)
+        return
+    data = context
     text_value = data.get("guided_text")
     if not text_value:
         async with async_session_maker() as session:
@@ -861,6 +907,7 @@ async def guided_question_type(callback: CallbackQuery, state: FSMContext):
             guided_question_id=question_id or None,
             guided_text=text_value,
             guided_type=question_type,
+            guided_stage="options",
         )
         await callback.message.edit_text(
             "Введите варианты ответа, каждый с новой строки.\n"
@@ -895,8 +942,17 @@ async def receive_guided_question_options(message: Message, state: FSMContext):
     ts_id = data.get("guided_ts_id")
     question_id = data.get("guided_question_id")
     text_value = data.get("guided_text")
+    context = await _testset_guided_context(state, ts_id, question_id or 0, stage="options")
+    if context is None or context.get("guided_type") != QUESTION_TYPE_CHOICE:
+        await message.answer("⚠️ Сессия настройки устарела. Откройте вопрос заново.")
+        return
+    data = context
+    ts_id = data.get("guided_ts_id")
+    question_id = data.get("guided_question_id")
+    text_value = data.get("guided_text")
     await state.update_data(
         guided_options=[{"text": option, "value": None} for option in options],
+        guided_stage="custom",
     )
     await state.set_state(TestSetAdminStates.waiting_guided_question_options)
     await message.answer(
@@ -919,7 +975,11 @@ async def save_guided_question_custom_answer(callback: CallbackQuery, state: FSM
         return
     ts_id, question_id = int(parts[3]), int(parts[4])
     allow_custom = parts[5] == "yes"
-    data = await state.get_data()
+    context = await _testset_guided_context(state, ts_id, question_id, stage="custom")
+    if context is None:
+        await _reject_stale_testset_callback(callback)
+        return
+    data = context
     try:
         await _save_guided_question(
             ts_id,
@@ -1002,8 +1062,13 @@ async def start_question_edit(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Вопрос не найден.", show_alert=True)
         return
 
+    await state.clear()
     await state.set_state(TestSetAdminStates.waiting_question_edit)
-    await state.update_data(target_ts_id=ts_id, target_question_id=question_id)
+    await state.update_data(
+        target_ts_id=ts_id,
+        target_question_id=question_id,
+        guided_stage="type",
+    )
     options = json.loads(question.answer_options_json or "[]")
     type_label = _question_type_label(get_question_type(question))
     options_label = ", ".join(str(item.get("text", "")) for item in options if isinstance(item, dict)) or "не заданы"

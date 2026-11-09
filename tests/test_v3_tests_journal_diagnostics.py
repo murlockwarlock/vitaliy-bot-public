@@ -48,6 +48,7 @@ from test_set_admin_handlers import (
     receive_guided_question_text,
     save_guided_question_custom_answer,
     start_guided_question_add,
+    start_question_edit,
 )
 from test_set_admin_handlers import reorder_questions as reorder_testset_questions
 from test_system_handlers import _finish_test, _questions, _send_question, exit_universal_test, start_universal_test
@@ -325,6 +326,77 @@ async def test_guided_testset_and_journal_question_editors_save_types_options_an
             bot = AsyncMock()
             await start_universal_test(bot, admin_id, state, test_set_id=103)
             assert "Выбери состояние" in bot.send_message.await_args.args[1]
+        finally:
+            for item in reversed(patches):
+                item.stop()
+    finally:
+        await local_engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_guided_editors_reject_stale_question_callbacks(tmp_path):
+    local_engine, local_session_maker = await _local_database(tmp_path)
+    admin_id = 992004
+    try:
+        async with local_session_maker() as session:
+            session.add(User(
+                id=admin_id,
+                first_name="Админ",
+                is_admin=True,
+                admin_role="content_editor",
+            ))
+            session.add(TestSet(id=104, title="Редактор", slug="stale_editor"))
+            session.add_all([
+                TestQuestion(id=1041, test_set_id=104, text="Первый", order_num=1),
+                TestQuestion(id=1042, test_set_id=104, text="Второй", order_num=2),
+            ])
+            session.add_all([
+                JournalQuestion(id=1041, text="Дневник первый", order_num=1, is_active=True),
+                JournalQuestion(id=1042, text="Дневник второй", order_num=2, is_active=True),
+            ])
+            await session.commit()
+
+        state = FSMContext(
+            storage=MemoryStorage(),
+            key=StorageKey(bot_id=1, chat_id=admin_id, user_id=admin_id),
+        )
+        patches = [
+            patch("database.async_session_maker", local_session_maker),
+            patch("test_set_admin_handlers.async_session_maker", local_session_maker),
+            patch("journal_admin_handlers.async_session_maker", local_session_maker),
+        ]
+        for item in patches:
+            item.start()
+        try:
+            await start_question_edit(_admin_callback("ts_q_edit_104_1041", admin_id), state)
+            stale_testset = _admin_callback("ts_q_type_104_1042_choice", admin_id)
+            await guided_question_type(stale_testset, state)
+            assert stale_testset.answer.await_args.kwargs["show_alert"] is True
+            assert "устарела" in stale_testset.answer.await_args.args[0]
+            assert await state.get_data() == {
+                "target_ts_id": 104,
+                "target_question_id": 1041,
+                "guided_stage": "type",
+            }
+            async with local_session_maker() as session:
+                stale_question = await session.get(TestQuestion, 1042)
+                assert stale_question.question_type == QUESTION_TYPE_TEXT
+
+            await state.clear()
+            await admin_journal_q_type_handler(
+                _admin_callback("j_adm_q_type:1041:0", admin_id),
+                state,
+            )
+            stale_journal = _admin_callback("j_adm_q_settype:1042:0:choice", admin_id)
+            await admin_journal_q_set_type_handler(stale_journal, state)
+            assert stale_journal.answer.await_args.kwargs["show_alert"] is True
+            assert "устарела" in stale_journal.answer.await_args.args[0]
+            data = await state.get_data()
+            assert data["guided_question_id"] == 1041
+            assert data["guided_stage"] == "type"
+            async with local_session_maker() as session:
+                stale_question = await session.get(JournalQuestion, 1042)
+                assert stale_question.question_type == QUESTION_TYPE_TEXT
         finally:
             for item in reversed(patches):
                 item.stop()
