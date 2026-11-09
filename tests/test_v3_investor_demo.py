@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 import funnel
 import handlers
+import ai_integration
 from database import (
     Content,
     ContentMedia,
@@ -19,7 +20,9 @@ from database import (
     FunnelConfig,
     FunnelLanding,
     FunnelState,
+    AIConfig,
     Message as DBMessage,
+    Topic,
     MenuButton,
     User,
     _ensure_sqlite_compat_schema,
@@ -154,6 +157,102 @@ async def test_funnel_render_never_exposes_json_and_uses_bridge_actions():
     async with async_session_maker() as session:
         state = await session.get(FunnelState, user_id)
         assert state.next_followup_at is not None
+
+
+@pytest.mark.asyncio
+async def test_funnel_prompt_variables_preserve_json_examples():
+    user_id = 94000130
+    await _prepare_user(user_id)
+    async with async_session_maker() as session:
+        topic = await session.scalar(select(Topic).where(Topic.slug == "funnel_demo"))
+        original_prompt = topic.system_prompt
+        topic.system_prompt = (
+            'Разбери практику «{practice_name}» и ответ пользователя «{user_input}». '
+            'Формат ответа: {"mode":"normal","reply":"текст"}'
+        )
+        ai_config = await session.get(AIConfig, 1)
+        await session.commit()
+
+    captured = {}
+
+    async def fake_prepare_clients(session):
+        return ai_config, None, object(), "prompt-test-model", None
+
+    async def fake_generate_chat_response(*args):
+        captured["messages"] = args[-1]
+        return ai_integration.StructuredAIResponse(
+            text="Готово",
+            raw_payload={},
+            http_status=None,
+            finish_reason="stop",
+        )
+
+    try:
+        with patch("ai_integration._prepare_clients", new=AsyncMock(side_effect=fake_prepare_clients)), \
+             patch("ai_integration._generate_chat_response", new=AsyncMock(side_effect=fake_generate_chat_response)):
+            await ai_integration.get_ai_response_for_topic(
+                user_id,
+                "Опыт пользователя",
+                "Demo",
+                topic_slug="funnel_demo",
+                dialogue_id=1,
+                prompt_variables={
+                    "practice_name": "Тихий лес",
+                    "user_input": "Сначала напряжение, потом тепло",
+                },
+            )
+
+        system_prompt = captured["messages"][0]["content"]
+        assert "Тихий лес" in system_prompt
+        assert "Сначала напряжение, потом тепло" in system_prompt
+        assert '{"mode":"normal","reply":"текст"}' in system_prompt
+    finally:
+        async with async_session_maker() as session:
+            topic = await session.scalar(select(Topic).where(Topic.slug == "funnel_demo"))
+            topic.system_prompt = original_prompt
+            await session.commit()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("reflection_text", "flag", "user_id"),
+    [
+        ("Не знаю", "is_empty", 94000131),
+        ("Похоже на развод", "is_skeptic", 94000132),
+    ],
+)
+async def test_funnel_empty_or_skeptic_response_has_no_bridge_or_offer(reflection_text, flag, user_id):
+    await _prepare_user(user_id)
+    bot = CaptureBot()
+    flags = {
+        "has_experience": False,
+        "has_question": False,
+        "is_skeptic": flag == "is_skeptic",
+        "is_empty": flag == "is_empty",
+        "show_offer": True,
+    }
+    raw = (
+        '{"mode":"normal",'
+        + ",".join(f'"{key}":{str(value).lower()}' for key, value in flags.items())
+        + ',"reply":"Спасибо, что поделился(ась).","bridge":"Разберёмся глубже"}'
+    )
+
+    await funnel.render_funnel_analysis(
+        bot=bot,
+        user_id=user_id,
+        chat_id=user_id,
+        raw_response=raw,
+        reflection_text=reflection_text,
+        meditation_id=None,
+    )
+
+    assert len(bot.sent) == 1
+    assert "Разберёмся глубже" not in [item.text for item in bot.sent]
+    assert all(
+        button.callback_data != "funnel_offer_requested"
+        for row in (bot.sent[0].reply_markup.inline_keyboard if bot.sent[0].reply_markup else [])
+        for button in row
+    )
 
 
 @pytest.mark.asyncio

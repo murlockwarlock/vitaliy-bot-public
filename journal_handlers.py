@@ -41,6 +41,9 @@ from journal_keyboards import (
     quick_note_detail_keyboard,
     quick_note_input_keyboard,
     quick_notes_keyboard,
+    configured_journal_entry_keyboard,
+    configured_journal_menu_keyboard,
+    configured_journal_question_keyboard,
 )
 from journal_service import (
     build_questions_snapshot,
@@ -95,7 +98,7 @@ async def _send_journal_question(
     await state.set_state(JournalStates.answering_question)
     await state.update_data(entry_id=entry_id, position=position, total=total)
     text_msg = _journal_question_text(question, position, total)
-    markup = journal_question_keyboard(entry_id, position, question)
+    markup = await configured_journal_question_keyboard(entry_id, position, question)
     if edit_message is not None:
         await edit_message.edit_text(text_msg, parse_mode="HTML", reply_markup=markup)
     else:
@@ -228,7 +231,7 @@ async def show_journal_menu(
                     event,
                     intro_text or "📔 Дневник саморефлексии",
                     intro_media,
-                    reply_markup=journal_entry_keyboard(),
+                    reply_markup=await configured_journal_entry_keyboard(),
                     bot=bot,
                 )
                 return
@@ -277,7 +280,7 @@ async def show_journal_menu(
             f"{day_status_line}"
         )
 
-        kb = journal_menu_keyboard(
+        kb = await configured_journal_menu_keyboard(
             has_in_progress=has_in_progress,
             in_progress_id=in_progress_id,
             is_today_completed=is_today_completed,
@@ -943,7 +946,7 @@ async def msg_answer_question(message: Message, state: FSMContext, bot: Bot) -> 
                 await message.answer(
                     _journal_question_text(next_q, next_pos, total),
                     parse_mode="HTML",
-                    reply_markup=journal_question_keyboard(entry_id, next_pos, next_q),
+                    reply_markup=await configured_journal_question_keyboard(entry_id, next_pos, next_q),
                 )
             return
 
@@ -1156,7 +1159,7 @@ async def cb_journal_history_page(callback: CallbackQuery, bot: Bot) -> None:
 
         if not entries:
             text_msg = "📖 У тебя пока нет сохранённых записей рефлексии."
-            kb = journal_menu_keyboard()
+            kb = await configured_journal_menu_keyboard()
         else:
             text_msg = f"📖 <b>Твои прошлые записи (страница {page + 1} из {total_pages})</b>:"
             kb = journal_history_list_keyboard(page, total_pages, entries)

@@ -30,6 +30,34 @@ _MENU_CALLBACK_ACTIONS = {
     "funnel_start_objections",
     "funnel_to_main",
     "funnel_vitaly_method",
+    "funnel_intro_start",
+    "funnel_about_method",
+    "funnel_resume_choice",
+    "funnel_resume_sales",
+    "funnel_resume_materials",
+    "funnel_resume_strategy",
+    "funnel_heard",
+    "funnel_interest_yes",
+    "funnel_interest_no",
+    "j_start",
+    "j_exit",
+    "journal_open_stats",
+    "j_time_menu",
+    "j_video",
+    "quick_notes",
+    "j_h_p:0",
+    "j_dyn_menu",
+    "mode_journal",
+    "habit_open_catalog",
+    "habit_create_new",
+    "habit_my_list",
+    "habit_timezone",
+    "back_to_main_menu_text",
+    "sub_select_plan",
+    "sub_toggle_renewal",
+    "sub_enter_promo",
+    "show_subscription_info",
+    "pay_topup_balance",
     "main_menu_action",
     "menu_books",
     "menu_closed_club",
@@ -59,6 +87,17 @@ _MENU_CALLBACK_ACTIONS = {
 _MENU_CALLBACK_PATTERNS = (
     re.compile(r"^funnel_(?:card|choice|listen)_\d+(?:_\d+)?$"),
     re.compile(r"^ref_view_list_\d+$"),
+    re.compile(r"^funnel_(?:card|listen)_\{(?:meditation_id|page)\}(?:_\{page\})?$"),
+    re.compile(r"^funnel_choice_\{page\}$"),
+    re.compile(r"^j_(?:res|rst|h_v):\{(?:entry_id|completed_id)\}$"),
+    re.compile(r"^j_skip:\{entry_id\}:\{position\}$"),
+    re.compile(r"^ai_(?:gen_summary|continue_dialogue):\{(?:topic_slug|dialogue_id)\}(?::\{dialogue_id\})?$"),
+    re.compile(r"^ai_new_dialogue:\{topic_slug\}$"),
+    re.compile(r"^j_(?:res|rst|h_v):\d+$"),
+    re.compile(r"^j_skip:\d+:\d+$"),
+    re.compile(r"^ai_finish_dialogue:[\w-]+:\d+$"),
+    re.compile(r"^ai_(?:gen_summary|continue_dialogue|regen_summary):[\w-]+:\d+$"),
+    re.compile(r"^ai_new_dialogue:[\w-]+$"),
 )
 
 
@@ -89,6 +128,16 @@ def classify_menu_action(value: str) -> tuple[str, str]:
     if len(normalized.encode("utf-8")) > 64 or not _is_allowed_menu_callback(normalized):
         raise ValueError("Неизвестное действие кнопки. Выбери действие из доступных разделов.")
     return "callback", normalized
+
+
+def _resolve_menu_action(value: str | None, substitutions: dict[str, object] | None = None) -> str:
+    resolved = value or ""
+    for name, replacement in (substitutions or {}).items():
+        resolved = resolved.replace(
+            "{" + str(name) + "}",
+            "" if replacement is None else str(replacement),
+        )
+    return resolved
 
 
 async def is_menu_section_enabled(section_key: str) -> bool:
@@ -150,18 +199,76 @@ async def load_menu_buttons(section_key: str) -> tuple[MenuSection | None, list[
         return section, visible
 
 
-def button_to_telegram(button: MenuButton) -> InlineKeyboardButton:
-    action_value = getattr(button, "_resolved_action_value", None) or button.action_value
+def button_to_telegram(
+    button: MenuButton,
+    *,
+    action_value: str | None = None,
+    label: str | None = None,
+) -> InlineKeyboardButton:
+    action_value = action_value or getattr(button, "_resolved_action_value", None) or button.action_value
     if button.action_type == "url":
-        return InlineKeyboardButton(text=button.label, url=action_value or "https://example.invalid")
+        return InlineKeyboardButton(text=label or button.label, url=action_value or "https://example.invalid")
     if button.action_type == "web_app":
         return InlineKeyboardButton(
-            text=button.label,
+            text=label or button.label,
             web_app=WebAppInfo(url=action_value or "https://example.invalid"),
         )
     return InlineKeyboardButton(
-        text=button.label,
+        text=label or button.label,
         callback_data=action_value or button.legacy_callback or "back_to_main_menu",
+    )
+
+
+async def configured_internal_menu_markup(
+    section_key: str,
+    fallback: InlineKeyboardMarkup,
+    *,
+    substitutions: dict[str, object] | None = None,
+    allowed_actions: set[str] | None = None,
+    dynamic_labels: dict[str, str] | None = None,
+) -> InlineKeyboardMarkup:
+    """Render an admin-managed keyboard for a non-root user screen."""
+    if section_key == "funnel_crisis":
+        return await _configured_crisis_menu_markup(fallback)
+    section, buttons = await load_menu_buttons(section_key)
+    if section is None:
+        return fallback
+    if not section.enabled:
+        return InlineKeyboardMarkup(inline_keyboard=[])
+
+    rows = []
+    for button in buttons:
+        resolved_action_value = getattr(button, "_resolved_action_value", None) or button.action_value or button.legacy_callback
+        action_value = _resolve_menu_action(resolved_action_value, substitutions)
+        if (
+            allowed_actions is not None
+            and action_value not in allowed_actions
+            and resolved_action_value == button.legacy_callback
+        ):
+            continue
+        label = None
+        if dynamic_labels and not button.label_override:
+            label = dynamic_labels.get(action_value)
+        rows.append([button_to_telegram(button, action_value=action_value, label=label)])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _configured_crisis_menu_markup(fallback: InlineKeyboardMarkup) -> InlineKeyboardMarkup:
+    async with async_session_maker() as session:
+        button = await session.scalar(
+            select(MenuButton)
+            .where(MenuButton.section_key == "funnel_crisis")
+            .order_by(MenuButton.order_num.asc(), MenuButton.id.asc())
+        )
+        if not button:
+            return fallback
+        label = button.label or fallback.inline_keyboard[0][0].text
+        if button.content_key and not button.label_override:
+            content = await session.get(Content, button.content_key)
+            if content and content.button_text:
+                label = content.button_text
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text=label, callback_data="funnel_to_main")]]
     )
 
 

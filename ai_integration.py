@@ -563,6 +563,7 @@ async def get_ai_response_for_topic(
         chat_id: Optional[int] = None,
         alert_user_text: str | None = None,
         alert_metadata: Optional[Dict[str, Any]] = None,
+        prompt_variables: Optional[Dict[str, Any]] = None,
 ) -> str:
     effective_chat_id = chat_id if chat_id is not None else user_id
     async with ai_typing_action(bot, effective_chat_id):
@@ -605,6 +606,14 @@ async def get_ai_response_for_topic(
                     )
 
             system_prompt_text = topic.system_prompt if topic and topic.system_prompt else "Ты полезный помощник."
+            if topic_slug == "funnel_demo" and prompt_variables:
+                for variable_name, variable_value in prompt_variables.items():
+                    placeholder = "{" + str(variable_name) + "}"
+                    if placeholder in system_prompt_text:
+                        system_prompt_text = system_prompt_text.replace(
+                            placeholder,
+                            "" if variable_value is None else str(variable_value),
+                        )
 
             docs_ids = [f.id for f in topic.knowledge_base_files] if topic else []
 

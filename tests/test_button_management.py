@@ -16,7 +16,9 @@ from sqlalchemy.orm import sessionmaker
 
 import content_service
 import database as database_module
+import funnel
 import handlers
+import journal_keyboards
 import keyboards
 import menu_service
 from database import (
@@ -278,6 +280,244 @@ class ButtonManagementTests(unittest.IsolatedAsyncioTestCase):
                         expected_label = content.button_text
                 self.assertIn(expected_label, rendered_labels)
 
+    async def test_internal_funnel_screen_button_changes_are_visible_without_restart(self):
+        button = await self._button("funnel_strategy_offer", 0)
+        original = (button.label, button.enabled, button.label_override)
+        state = await self._state(self.admin_id)
+        await state.update_data(menu_button_id=button.id)
+        message = SimpleNamespace(
+            from_user=SimpleNamespace(id=self.admin_id),
+            text="Записаться на разбор",
+            answer=AsyncMock(),
+            bot=SimpleNamespace(),
+        )
+        try:
+            await handlers.admin_menu_button_label_save(message, state)
+            markup = await funnel.configured_strategy_offer_keyboard()
+            labels = [item.text for row in markup.inline_keyboard for item in row]
+            self.assertIn("Записаться на разбор", labels)
+
+            await handlers.admin_menu_button_toggle(
+                FakeCallback(self.admin_id, f"admin_menu_button_toggle:{button.id}")
+            )
+            hidden = await funnel.configured_strategy_offer_keyboard()
+            hidden_labels = [item.text for row in hidden.inline_keyboard for item in row]
+            self.assertNotIn("Записаться на разбор", hidden_labels)
+        finally:
+            async with async_session_maker() as session:
+                current = await session.get(MenuButton, button.id)
+                current.label, current.enabled, current.label_override = original
+                await session.commit()
+
+    async def test_internal_dynamic_screen_keeps_manager_action_override(self):
+        button = await self._button("journal_menu", 1)
+        original = (button.action_type, button.action_value)
+        state = await self._state(self.admin_id)
+        await state.update_data(menu_button_id=button.id)
+        await state.set_state(handlers.AdminStates.menu_button_action)
+        message = SimpleNamespace(
+            from_user=SimpleNamespace(id=self.admin_id),
+            text="menu_books",
+            answer=AsyncMock(),
+        )
+        try:
+            await handlers.admin_menu_button_action_save(message, state)
+            markup = await journal_keyboards.configured_journal_menu_keyboard()
+            actions = [item.callback_data for row in markup.inline_keyboard for item in row]
+            self.assertIn("menu_books", actions)
+        finally:
+            async with async_session_maker() as session:
+                current = await session.get(MenuButton, button.id)
+                current.action_type, current.action_value = original
+                await session.commit()
+
+    async def test_crisis_screen_keeps_one_safe_button_and_locks_access_settings(self):
+        button = await self._button("funnel_crisis", 0)
+        async with async_session_maker() as session:
+            section = await session.get(MenuSection, "funnel_crisis")
+            original_button = (
+                button.label,
+                button.enabled,
+                button.order_num,
+                button.action_type,
+                button.action_value,
+                button.legacy_callback,
+                button.label_override,
+            )
+            original_section = (section.enabled, section.order_num)
+
+        try:
+            rename_state = await self._state(self.admin_id)
+            await rename_state.update_data(menu_button_id=button.id)
+            rename_message = SimpleNamespace(
+                from_user=SimpleNamespace(id=self.admin_id),
+                text="Вернуться в безопасное меню",
+                answer=AsyncMock(),
+            )
+            await handlers.admin_menu_button_label_save(rename_message, rename_state)
+
+            markup = await funnel.configured_funnel_crisis_keyboard()
+            rendered = [item for row in markup.inline_keyboard for item in row]
+            self.assertEqual(len(rendered), 1)
+            self.assertEqual(rendered[0].text, "Вернуться в безопасное меню")
+            self.assertEqual(rendered[0].callback_data, "funnel_to_main")
+
+            hide_button = FakeCallback(self.admin_id, f"admin_menu_button_toggle:{button.id}")
+            await handlers.admin_menu_button_toggle(hide_button)
+            hide_button.answer.assert_awaited_once_with("Кнопку возврата нельзя скрыть.", show_alert=True)
+
+            hide_section = FakeCallback(self.admin_id, "admin_menu_section_toggle:funnel_crisis")
+            await handlers.admin_menu_section_toggle(hide_section)
+            hide_section.answer.assert_awaited_once_with("Экран помощи нельзя отключить.", show_alert=True)
+
+            section_screen = FakeCallback(self.admin_id, "admin_menu_section:funnel_crisis")
+            await handlers.admin_menu_section(section_screen)
+            section_callbacks = [
+                item.callback_data
+                for row in section_screen.bot.send_message.await_args.kwargs["reply_markup"].inline_keyboard
+                for item in row
+                if item.callback_data
+            ]
+            self.assertFalse(any(
+                callback.startswith("admin_menu_section_toggle:")
+                for callback in section_callbacks
+            ))
+
+            view = await handlers._get_menu_button_view(button.id)
+            editor_callbacks = [
+                item.callback_data
+                for row in handlers._menu_button_editor_keyboard(view).inline_keyboard
+                for item in row
+                if item.callback_data
+            ]
+            self.assertIn(f"admin_menu_button_label:{button.id}", editor_callbacks)
+            self.assertNotIn(f"admin_menu_button_toggle:{button.id}", editor_callbacks)
+            self.assertNotIn(f"admin_menu_button_action:{button.id}", editor_callbacks)
+
+            async with async_session_maker() as session:
+                current_button = await session.get(MenuButton, button.id)
+                current_section = await session.get(MenuSection, "funnel_crisis")
+                current_button.enabled = False
+                current_button.action_type = "callback"
+                current_button.action_value = "funnel_open_landing"
+                current_button.legacy_callback = "funnel_open_landing"
+                current_section.enabled = False
+                await session.commit()
+
+            stale_markup = await funnel.configured_funnel_crisis_keyboard()
+            stale_rendered = [item for row in stale_markup.inline_keyboard for item in row]
+            self.assertEqual(len(stale_rendered), 1)
+            self.assertEqual(stale_rendered[0].callback_data, "funnel_to_main")
+
+            action_state = await self._state(self.admin_id)
+            await action_state.update_data(menu_button_id=button.id)
+            await action_state.set_state(handlers.AdminStates.menu_button_action)
+            action_message = SimpleNamespace(
+                from_user=SimpleNamespace(id=self.admin_id),
+                text="funnel_open_landing",
+                answer=AsyncMock(),
+            )
+            await handlers.admin_menu_button_action_save(action_message, action_state)
+            async with async_session_maker() as session:
+                current_button = await session.get(MenuButton, button.id)
+                self.assertEqual(current_button.action_type, "callback")
+                self.assertEqual(current_button.action_value, "funnel_to_main")
+                self.assertEqual(current_button.legacy_callback, "funnel_to_main")
+        finally:
+            async with async_session_maker() as session:
+                current_button = await session.get(MenuButton, button.id)
+                (
+                    current_button.label,
+                    current_button.enabled,
+                    current_button.order_num,
+                    current_button.action_type,
+                    current_button.action_value,
+                    current_button.legacy_callback,
+                    current_button.label_override,
+                ) = original_button
+                current_section = await session.get(MenuSection, "funnel_crisis")
+                current_section.enabled, current_section.order_num = original_section
+                await session.commit()
+
+    async def test_subscription_button_edits_keep_actions_labels_and_visibility_rules(self):
+        legacy_callbacks = ("sub_select_plan", "sub_toggle_renewal", "menu_referral")
+        async with async_session_maker() as session:
+            buttons = {
+                legacy_callback: await session.scalar(select(MenuButton).where(
+                    MenuButton.section_key == "subscription_info",
+                    MenuButton.legacy_callback == legacy_callback,
+                ))
+                for legacy_callback in legacy_callbacks
+            }
+            original = {
+                legacy_callback: (
+                    button.label,
+                    button.action_type,
+                    button.action_value,
+                    button.label_override,
+                )
+                for legacy_callback, button in buttons.items()
+            }
+
+        async def edit_button(button_id: int, label: str, action: str):
+            label_state = await self._state(self.admin_id)
+            await label_state.update_data(menu_button_id=button_id)
+            await handlers.admin_menu_button_label_save(SimpleNamespace(
+                from_user=SimpleNamespace(id=self.admin_id),
+                text=label,
+                answer=AsyncMock(),
+            ), label_state)
+            action_state = await self._state(self.admin_id)
+            await action_state.update_data(menu_button_id=button_id)
+            await action_state.set_state(handlers.AdminStates.menu_button_action)
+            await handlers.admin_menu_button_action_save(SimpleNamespace(
+                from_user=SimpleNamespace(id=self.admin_id),
+                text=action,
+                answer=AsyncMock(),
+            ), action_state)
+
+        try:
+            await edit_button(buttons["sub_select_plan"].id, "Мой доступ", "menu_closed_club")
+            await edit_button(buttons["sub_toggle_renewal"].id, "Моя настройка", "menu_books")
+            await edit_button(buttons["menu_referral"].id, "Моя команда", "menu_vitaly")
+
+            markup = await keyboards.configured_subscription_info_keyboard(
+                {"allow_auto_renewal": True, "auto_renewal": False},
+                {"enabled": True, "sub_btn_name": "Динамическая рефералка"},
+            )
+            rendered = [item for row in markup.inline_keyboard for item in row]
+            rendered_by_action = {item.callback_data: item for item in rendered}
+            self.assertEqual(rendered_by_action["menu_closed_club"].text, "Мой доступ")
+            self.assertEqual(rendered_by_action["menu_books"].text, "Моя настройка")
+            self.assertEqual(rendered_by_action["menu_vitaly"].text, "Моя команда")
+
+            restricted = await keyboards.configured_subscription_info_keyboard(
+                {"allow_auto_renewal": False},
+                {"enabled": False, "sub_btn_name": "Динамическая рефералка"},
+            )
+            restricted_actions = [
+                item.callback_data
+                for row in restricted.inline_keyboard
+                for item in row
+            ]
+            self.assertIn("menu_closed_club", restricted_actions)
+            self.assertNotIn("menu_books", restricted_actions)
+            self.assertNotIn("menu_vitaly", restricted_actions)
+        finally:
+            async with async_session_maker() as session:
+                for legacy_callback, values in original.items():
+                    button = await session.scalar(select(MenuButton).where(
+                        MenuButton.section_key == "subscription_info",
+                        MenuButton.legacy_callback == legacy_callback,
+                    ))
+                    (
+                        button.label,
+                        button.action_type,
+                        button.action_value,
+                        button.label_override,
+                    ) = values
+                await session.commit()
+
     async def test_non_admin_cannot_change_button(self):
         button = await self._button("main", 0)
         callback = FakeCallback(self.ordinary_id, f"admin_menu_button_toggle:{button.id}")
@@ -495,10 +735,11 @@ class ButtonManagementTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(f"admin_menu_button_toggle:{button.id}", callbacks)
         self.assertIn(f"admin_menu_button_move:{button.id}:up", callbacks)
         self.assertIn(f"admin_menu_button_move:{button.id}:down", callbacks)
+        self.assertIn(f"admin_menu_button_order:{button.id}", callbacks)
         self.assertIn(f"admin_menu_section:{button.section_key}", callbacks)
         self.assertIn("⬆️ Выше", labels)
         self.assertIn("⬇️ Ниже", labels)
-        self.assertNotIn("Изменить порядок", labels)
+        self.assertIn("🔢 Изменить порядок", labels)
         self.assertIn("Позиция:", message_text)
         self.assertIn("Видна клиенту", message_text)
 

@@ -37,8 +37,27 @@ DEFAULT_CRISIS_MARKERS = (
     "сделать себе больно",
     "не хочу жить",
     "не вижу смысла жить",
+    "не вижу смысла продолжать сил больше нет",
     "лучше бы меня не было",
     "хочу умереть",
+)
+
+_SCENARIO_4_PREFIX = ("не", "вижу", "смысла", "продолжать")
+_SCENARIO_4_SUFFIX = ("сил", "больше", "нет")
+SCENARIO_4_CRISIS_MARKER = "не вижу смысла продолжать сил больше нет"
+_SCENARIO_4_QUOTE_ATTRIBUTIONS = (
+    ("в", "книге", "герой", "сказал"),
+    ("в", "романе", "герой", "сказал"),
+    ("в", "фильме", "герой", "сказал"),
+    ("в", "сериале", "герой", "сказал"),
+    ("герой", "сказал"),
+    ("героиня", "сказала"),
+    ("персонаж", "сказал"),
+    ("персонаж", "сказала"),
+    ("автор", "написал"),
+    ("автор", "написала"),
+    ("цитирую",),
+    ("цитата",),
 )
 
 _CRISIS_CONTEXT_WORDS = {
@@ -134,10 +153,48 @@ def _is_explicitly_negated(tokens: list[str], start: int, marker_tokens: list[st
     return False
 
 
+def _scenario_4_starts(tokens: list[str]) -> list[int]:
+    scenario_tokens = _SCENARIO_4_PREFIX + _SCENARIO_4_SUFFIX
+    width = len(scenario_tokens)
+    return [
+        start
+        for start in range(len(tokens) - width + 1)
+        if tuple(tokens[start:start + width]) == scenario_tokens
+    ]
+
+
+def _contains_token_phrase(tokens: list[str], phrase: tuple[str, ...]) -> bool:
+    width = len(phrase)
+    return any(
+        tuple(tokens[start:start + width]) == phrase
+        for start in range(len(tokens) - width + 1)
+    )
+
+
+def _scenario_4_quoted_starts(tokens: list[str], starts: list[int]) -> set[int]:
+    quoted_starts = set()
+    for start in starts:
+        context = tokens[max(0, start - 10):start]
+        if any(_contains_token_phrase(context, phrase) for phrase in _SCENARIO_4_QUOTE_ATTRIBUTIONS):
+            quoted_starts.add(start)
+    return quoted_starts
+
+
+def _matches_scenario_4(tokens: list[str]) -> bool:
+    """Match the acceptance phrase unless an explicit external attribution quotes it."""
+    starts = _scenario_4_starts(tokens)
+    quoted_starts = _scenario_4_quoted_starts(tokens, starts)
+    return any(start not in quoted_starts for start in starts)
+
+
 def find_crisis_marker(text: str | None, markers: object = None) -> str | None:
     tokens = _normalize_crisis_text(text).split()
     if not tokens:
         return None
+    scenario_4_starts = _scenario_4_starts(tokens)
+    quoted_scenario_4_starts = _scenario_4_quoted_starts(tokens, scenario_4_starts)
+    if any(start not in quoted_scenario_4_starts for start in scenario_4_starts):
+        return SCENARIO_4_CRISIS_MARKER
     configured = list(DEFAULT_CRISIS_MARKERS) if markers is None else parse_crisis_markers(markers)
     configured = sorted(enumerate(configured), key=lambda item: (-len(item[1].split()), item[0]))
     for _, marker in configured:
@@ -145,6 +202,8 @@ def find_crisis_marker(text: str | None, markers: object = None) -> str | None:
         width = len(marker_tokens)
         for start in range(len(tokens) - width + 1):
             if tokens[start:start + width] != marker_tokens:
+                continue
+            if marker == SCENARIO_4_CRISIS_MARKER and start in quoted_scenario_4_starts:
                 continue
             if _is_explicitly_negated(tokens, start, marker_tokens):
                 continue
@@ -256,6 +315,7 @@ async def get_crisis_contacts_text(session: "AsyncSession | None" = None) -> str
 
 async def send_crisis_contacts_if_active(bot, user_id: int, chat_id: int | None = None) -> bool:
     from database import User, async_session_maker
+    from menu_service import configured_internal_menu_markup
 
     async with async_session_maker() as session:
         user = await session.get(User, user_id)
@@ -267,7 +327,10 @@ async def send_crisis_contacts_if_active(bot, user_id: int, chat_id: int | None 
         await bot.send_message(
             chat_id if chat_id is not None else user_id,
             contacts_text,
-            reply_markup=crisis_contacts_keyboard(),
+            reply_markup=await configured_internal_menu_markup(
+                "funnel_crisis",
+                crisis_contacts_keyboard(),
+            ),
         )
     except Exception as exc:
         logger.error("crisis_contacts_delivery_failed user_id=%s error=%s", user_id, exc)

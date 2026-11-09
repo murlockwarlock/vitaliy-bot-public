@@ -1831,6 +1831,26 @@ async def _seed_menu_configuration(session: AsyncSession) -> None:
         "books": ("Библиотека книг", 40),
         "club": ("Закрытый клуб", 50),
         "referral": ("Реферальная программа", 60),
+        "funnel_intro": ("Гипномедитации: вход", 70),
+        "funnel_resume": ("Гипномедитации: возврат", 71),
+        "funnel_reminder": ("Гипномедитации: напоминания", 72),
+        "funnel_card": ("Гипномедитации: карточка практики", 73),
+        "funnel_listening": ("Гипномедитации: прослушивание", 74),
+        "funnel_analysis": ("Гипномедитации: навигация разбора", 75),
+        "funnel_bridge": ("Гипномедитации: мостик", 76),
+        "funnel_crisis": ("Гипномедитации: контакты помощи", 77),
+        "funnel_strategy_offer": ("Стратегическая сессия: оффер", 78),
+        "funnel_vitaly_method": ("Стратегическая сессия: Виталий", 79),
+        "funnel_objection": ("Стратегическая сессия: сомнения", 80),
+        "funnel_faq": ("Стратегическая сессия: вопросы", 81),
+        "funnel_no_strategy": ("Стратегическая сессия: отказ", 82),
+        "journal_entry": ("Дневник: вход", 90),
+        "journal_menu": ("Дневник: меню", 91),
+        "journal_question": ("Дневник: вопрос", 92),
+        "habits_entry": ("Привычки: вход", 100),
+        "subscription_main": ("Подписка: вход", 110),
+        "subscription_info": ("Подписка: доступ", 111),
+        "ai_completed": ("ИИ-сессии: завершение", 120),
     }
     for key, (title, order_num) in sections.items():
         if not await session.get(MenuSection, key):
@@ -1890,6 +1910,124 @@ async def _seed_menu_configuration(session: AsyncSession) -> None:
             ("🔍 Узнать своего реферера", "callback", "ref_who_invited", None),
             ("💰 Посмотреть баллы", "callback", "ref_balance", None),
             ("⬅️ Назад", "callback", "open_extended_menu", None),
+        ],
+        "funnel_intro": [
+            ("Да, начнём", "callback", "funnel_intro_start", None),
+            ("Узнать подробнее о методе", "callback", "funnel_about_method", None),
+            ("Главное меню", "callback", "funnel_to_main", None),
+        ],
+        "funnel_resume": [
+            ("🧘 Попробовать другую практику", "callback", "funnel_resume_choice", None),
+            ("🎯 Узнать о стратегической сессии", "callback", "funnel_resume_sales", None),
+            ("📚 Полезные материалы от Виталия", "callback", "funnel_resume_materials", None),
+        ],
+        "funnel_reminder": [
+            ("Пройти практику", "callback", "menu_funnel_start", None),
+            ("Узнать о стратегической сессии", "callback", "funnel_resume_strategy", None),
+            ("Изучить все возможности бота", "callback", "funnel_to_main", None),
+        ],
+        "funnel_card": [
+            ("Начать прослушивание", "callback", "funnel_listen_{meditation_id}", None),
+            ("Вернуться к выбору", "callback", "funnel_choice_{page}", None),
+            ("Главное меню", "callback", "funnel_to_main", None),
+        ],
+        "funnel_listening": [
+            ("Я прослушал(а), готов(а) продолжить", "callback", "funnel_heard", None),
+            ("Выбрать другую практику", "callback", "menu_funnel_start", None),
+        ],
+        "funnel_analysis": [
+            ("Выбрать другую практику", "callback", "menu_funnel_start", None),
+            ("Главное меню", "callback", "funnel_to_main", None),
+        ],
+        "funnel_bridge": [
+            ("Разобраться глубже", "callback", "funnel_offer_requested", None),
+            ("Побуду с этим", "callback", "funnel_no_strategy_selected", None),
+        ],
+        "funnel_crisis": [
+            ("Главное меню", "callback", "funnel_to_main", None),
+        ],
+        "funnel_strategy_offer": [
+            ("Записаться на сессию", "callback", "funnel_open_landing", None),
+            ("У меня вопросы", "callback", "funnel_show_faq", None),
+            ("Хочу, но что-то останавливает", "callback", "funnel_start_objections", None),
+            ("Подробнее о Виталии", "callback", "funnel_vitaly_method", None),
+            ("Выбрать другую практику", "callback", "menu_funnel_start", None),
+            ("Главное меню", "callback", "funnel_to_main", None),
+        ],
+        "funnel_vitaly_method": [
+            ("🔎 Узнать подробнее", "callback", "funnel_show_sales", None),
+            ("Пока нет, спасибо", "callback", "funnel_interest_no", None),
+            ("Главное меню", "callback", "funnel_to_main", None),
+        ],
+        "funnel_objection": [
+            ("🎯 Записаться на сессию", "callback", "funnel_open_landing", None),
+            ("⬅️ Вернуться назад", "callback", "funnel_show_sales", None),
+            ("Главное меню", "callback", "funnel_to_main", None),
+        ],
+        "funnel_faq": [
+            ("Да, записываюсь на сессию", "callback", "funnel_open_landing", None),
+            ("Задать свой вопрос Виталию", "url", None, "btn_vitaly_questions"),
+            ("Хочу понять, что меня останавливает", "callback", "funnel_start_objections", None),
+            ("⬅️ Вернуться назад", "callback", "funnel_show_sales", None),
+            ("Главное меню", "callback", "funnel_to_main", None),
+        ],
+        "funnel_no_strategy": [
+            ("📢 Подписаться на канал", "url", None, "btn_vitaly_channel"),
+            ("Выбрать другую практику", "callback", "menu_funnel_start", None),
+            ("Главное меню", "callback", "funnel_to_main", None),
+        ],
+        "journal_entry": [
+            ("📊 Открыть дневник", "callback", "journal_open_stats", None),
+            ("▶️ Начать рефлексию", "callback", "j_start", None),
+            ("📝 Оперативные записи", "callback", "quick_notes", None),
+            ("⬅️ Главное меню", "callback", "back_to_main_menu_text", None),
+        ],
+        "journal_menu": [
+            ("▶️ Пройти рефлексию сегодня", "callback", "j_start", None),
+            ("▶️ Продолжить", "callback", "j_res:{entry_id}", None),
+            ("🔄 Начать заново", "callback", "j_rst:{entry_id}", None),
+            ("👁 Посмотреть запись за сегодня", "callback", "j_h_v:{completed_id}", None),
+            ("🎬 Видеоинструкция", "callback", "j_video", None),
+            ("⏰ Время напоминания", "callback", "j_time_menu", None),
+            ("📝 Оперативные записи", "callback", "quick_notes", None),
+            ("📖 Мои прошлые записи", "callback", "j_h_p:0", None),
+            ("📈 Моя динамика", "callback", "j_dyn_menu", None),
+            ("🧘 Формирование привычек", "callback", "mode_habits", None),
+            ("⬅️ Главное меню", "callback", "back_to_main_menu_text", None),
+        ],
+        "journal_question": [
+            ("⏭ Пропустить", "callback", "j_skip:{entry_id}:{position}", None),
+            ("❌ Выйти", "callback", "j_exit", None),
+        ],
+        "habits_entry": [
+            ("📂 Выбрать из каталога", "callback", "habit_open_catalog", None),
+            ("➕ Создать привычку", "callback", "habit_create_new", None),
+            ("📋 Мои привычки", "callback", "habit_my_list", None),
+            ("🌍 Часовой пояс", "callback", "habit_timezone", None),
+            ("📔 Дневник саморефлексии", "callback", "mode_journal", None),
+            ("⬅️ В главное меню", "callback", "back_to_main_menu_text", None),
+        ],
+        "subscription_main": [
+            ("💰 Пополнить баланс", "callback", "pay_topup_balance", None),
+            ("💳 Оформить доступ к программе", "callback", "show_subscription_info", None),
+            ("⬅️ Назад", "callback", "open_extended_menu", None),
+        ],
+        "subscription_info": [
+            ("💳 Оформить / Продлить доступ", "callback", "sub_select_plan", None),
+            ("✅ Включить автопродление", "callback", "sub_toggle_renewal", None),
+            ("❌ Отменить автопродление", "callback", "sub_toggle_renewal", None),
+            ("🎁 Ввести промокод", "callback", "sub_enter_promo", None),
+            ("🤝 Бонус за приглашение", "callback", "menu_referral", None),
+            ("⬅️ Главное меню", "callback", "back_to_main_menu_text", None),
+        ],
+        "ai_completed": [
+            ("📝 Выводы по сессии", "callback", "ai_gen_summary:{topic_slug}:{dialogue_id}", None),
+            ("▶️ Продолжить диалог", "callback", "ai_continue_dialogue:{topic_slug}:{dialogue_id}", None),
+            ("🔄 Сформировать заново", "callback", "ai_regen_summary:{topic_slug}:{dialogue_id}", None),
+            ("🔄 Новый разговор", "callback", "ai_new_dialogue:{topic_slug}", None),
+            ("📔 Дневник саморефлексии", "callback", "mode_journal", None),
+            ("🎯 Записаться на сессию", "callback", "funnel_open_landing", None),
+            ("🏠 Главное меню", "callback", "main_menu_action", None),
         ],
     }
     for section_key, entries in buttons.items():
@@ -2318,7 +2456,7 @@ async def run_data_migrations(session: AsyncSession):
                 if not configured_ready:
                     existing_cfg.pre_dialogue_test_enabled = False
 
-    funnel_topic = await session.get(Topic, "funnel_demo")
+    funnel_topic = await session.scalar(select(Topic).where(Topic.slug == "funnel_demo"))
     if funnel_topic and funnel_topic.system_prompt and "show_offer" not in funnel_topic.system_prompt:
         funnel_topic.system_prompt += (
             "\n\nВозвращай только JSON-объект без пояснений. Поля: "

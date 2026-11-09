@@ -44,6 +44,7 @@ from crisis_safety import (
     mark_crisis_detected,
     send_crisis_contacts_if_active,
 )
+from menu_service import configured_internal_menu_markup
 from funnel_response import FunnelParseError, parse_funnel_analysis, render_funnel_fallback_text
 from content_service import (
     get_content as cs_get_content,
@@ -556,7 +557,7 @@ async def _guard_crisis_commercial_path(target, bot=None, state: FSMContext | No
             chat_id,
             contacts_text,
             current_bot,
-            safety_crisis_contacts_keyboard(),
+            await configured_funnel_crisis_keyboard(),
         )
     return True
 
@@ -710,6 +711,10 @@ def funnel_entry_keyboard():
     return builder.as_markup()
 
 
+async def configured_funnel_entry_keyboard():
+    return await configured_internal_menu_markup("funnel_intro", funnel_entry_keyboard())
+
+
 def resume_keyboard():
     builder = InlineKeyboardBuilder()
     builder.button(text="🧘 Попробовать другую практику", callback_data="funnel_resume_choice")
@@ -717,6 +722,10 @@ def resume_keyboard():
     builder.button(text="📚 Полезные материалы от Виталия", callback_data="funnel_resume_materials")
     builder.adjust(1)
     return builder.as_markup()
+
+
+async def configured_resume_keyboard():
+    return await configured_internal_menu_markup("funnel_resume", resume_keyboard())
 
 
 def reminder_keyboard():
@@ -728,6 +737,10 @@ def reminder_keyboard():
     return builder.as_markup()
 
 
+async def configured_reminder_keyboard():
+    return await configured_internal_menu_markup("funnel_reminder", reminder_keyboard())
+
+
 def meditation_card_keyboard(meditation_id: int, page: int):
     builder = InlineKeyboardBuilder()
     builder.button(text="Начать прослушивание", callback_data=f"funnel_listen_{meditation_id}")
@@ -735,6 +748,14 @@ def meditation_card_keyboard(meditation_id: int, page: int):
     builder.button(text="Главное меню", callback_data="funnel_to_main")
     builder.adjust(1)
     return builder.as_markup()
+
+
+async def configured_meditation_card_keyboard(meditation_id: int, page: int):
+    return await configured_internal_menu_markup(
+        "funnel_card",
+        meditation_card_keyboard(meditation_id, page),
+        substitutions={"meditation_id": meditation_id, "page": page},
+    )
 
 
 def meditation_listen_keyboard():
@@ -745,12 +766,20 @@ def meditation_listen_keyboard():
     return builder.as_markup()
 
 
+async def configured_meditation_listen_keyboard():
+    return await configured_internal_menu_markup("funnel_listening", meditation_listen_keyboard())
+
+
 def analysis_keyboard():
     builder = InlineKeyboardBuilder()
     builder.button(text="Выбрать другую практику", callback_data="menu_funnel_start")
     builder.button(text="Главное меню", callback_data="funnel_to_main")
     builder.adjust(1)
     return builder.as_markup()
+
+
+async def configured_analysis_keyboard():
+    return await configured_internal_menu_markup("funnel_analysis", analysis_keyboard())
 
 
 def analysis_bridge_keyboard():
@@ -761,11 +790,19 @@ def analysis_bridge_keyboard():
     return builder.as_markup()
 
 
+async def configured_analysis_bridge_keyboard():
+    return await configured_internal_menu_markup("funnel_bridge", analysis_bridge_keyboard())
+
+
 def crisis_contacts_keyboard():
     builder = InlineKeyboardBuilder()
     builder.button(text="Главное меню", callback_data="funnel_to_main")
     builder.adjust(1)
     return builder.as_markup()
+
+
+async def configured_funnel_crisis_keyboard():
+    return await configured_internal_menu_markup("funnel_crisis", crisis_contacts_keyboard())
 
 
 def build_post_analysis_keyboard():
@@ -785,6 +822,10 @@ def build_vitaly_method_keyboard():
     return builder.as_markup()
 
 
+async def configured_vitaly_method_keyboard():
+    return await configured_internal_menu_markup("funnel_vitaly_method", build_vitaly_method_keyboard())
+
+
 def build_strategy_offer_keyboard():
     builder = InlineKeyboardBuilder()
     builder.button(text="Записаться на сессию", callback_data="funnel_open_landing")
@@ -797,6 +838,10 @@ def build_strategy_offer_keyboard():
     return builder.as_markup()
 
 
+async def configured_strategy_offer_keyboard():
+    return await configured_internal_menu_markup("funnel_strategy_offer", build_strategy_offer_keyboard())
+
+
 def objection_response_keyboard():
     builder = InlineKeyboardBuilder()
     builder.button(text="🎯 Записаться на сессию", callback_data="funnel_open_landing")
@@ -804,6 +849,10 @@ def objection_response_keyboard():
     builder.button(text="Главное меню", callback_data="funnel_to_main")
     builder.adjust(1)
     return builder.as_markup()
+
+
+async def configured_objection_response_keyboard():
+    return await configured_internal_menu_markup("funnel_objection", objection_response_keyboard())
 
 
 async def build_faq_keyboard():
@@ -818,6 +867,10 @@ async def build_faq_keyboard():
     return builder.as_markup()
 
 
+async def configured_faq_keyboard():
+    return await configured_internal_menu_markup("funnel_faq", await build_faq_keyboard())
+
+
 async def build_no_strategy_keyboard():
     channel_text, channel_url = await get_button_content("btn_vitaly_channel", "📢 Подписаться на канал", "https://t.me/lifeuspeh")
     builder = InlineKeyboardBuilder()
@@ -826,6 +879,10 @@ async def build_no_strategy_keyboard():
     builder.button(text="Главное меню", callback_data="funnel_to_main")
     builder.adjust(1)
     return builder.as_markup()
+
+
+async def configured_no_strategy_keyboard():
+    return await configured_internal_menu_markup("funnel_no_strategy", await build_no_strategy_keyboard())
 
 
 async def build_landing_keyboard():
@@ -925,7 +982,7 @@ async def _send_funnel_followup_message_locked(session, bot: Bot, state: FunnelS
         await bot.send_message(
             state.user_id,
             text,
-            reply_markup=reminder_keyboard(),
+            reply_markup=await configured_reminder_keyboard(),
             parse_mode="HTML",
             link_preview_options=LinkPreviewOptions(is_disabled=True),
         )
@@ -933,7 +990,7 @@ async def _send_funnel_followup_message_locked(session, bot: Bot, state: FunnelS
         await bot.send_message(
             state.user_id,
             text,
-            reply_markup=reminder_keyboard(),
+            reply_markup=await configured_reminder_keyboard(),
             link_preview_options=LinkPreviewOptions(is_disabled=True),
         )
     await register_event(
@@ -1002,7 +1059,7 @@ async def continue_active_funnel(target, state: FSMContext, bot=None):
             target,
             "Продолжаем диалог по стратегической сессии. Напиши сообщение, и я подхвачу контекст дальше.",
             None,
-            build_strategy_offer_keyboard(),
+            await configured_strategy_offer_keyboard(),
             bot,
         )
         return
@@ -1012,7 +1069,7 @@ async def continue_active_funnel(target, state: FSMContext, bot=None):
             target,
             "Продолжаем разбирать, что тебя останавливает. Напиши сообщение, и продолжим.",
             None,
-            build_strategy_offer_keyboard(),
+            await configured_strategy_offer_keyboard(),
             bot,
         )
         return
@@ -1080,7 +1137,7 @@ async def show_resume_menu(target, bot=None):
         "Что бы ты хотел(а) сделать сейчас?"
     )
     text = content.text_content if content and content.text_content else default_text
-    await send_content(target, text, content.media if content else None, resume_keyboard(), bot)
+    await send_content(target, text, content.media if content else None, await configured_resume_keyboard(), bot)
 
 
 async def start_funnel_intro(target, bot=None):
@@ -1093,7 +1150,7 @@ async def start_funnel_intro(target, bot=None):
 
     content = await get_content("funnel_intro")
     text = content.text_content if content else "Готов(а) начать?"
-    await send_content(target, text, content.media if content else None, funnel_entry_keyboard(), bot)
+    await send_content(target, text, content.media if content else None, await configured_funnel_entry_keyboard(), bot)
 
 
 async def build_objection_context(user_id: int) -> str:
@@ -1139,7 +1196,7 @@ async def show_vitaly_method(target, bot=None):
         await session.commit()
 
     content = await get_content("funnel_vitaly_method")
-    await send_content(target, content.text_content if content else "Информация о Виталии и методе.", content.media if content else None, build_vitaly_method_keyboard(), bot)
+    await send_content(target, content.text_content if content else "Информация о Виталии и методе.", content.media if content else None, await configured_vitaly_method_keyboard(), bot)
 
 
 async def show_strategy_sales(target, bot=None):
@@ -1152,7 +1209,7 @@ async def show_strategy_sales(target, bot=None):
         await session.commit()
 
     content = await get_content("funnel_strategy_sales")
-    await send_content(target, content.text_content if content else "Подробности о стратегической сессии.", content.media if content else None, build_strategy_offer_keyboard(), bot)
+    await send_content(target, content.text_content if content else "Подробности о стратегической сессии.", content.media if content else None, await configured_strategy_offer_keyboard(), bot)
 
 
 async def show_strategy_faq(target, bot=None):
@@ -1163,7 +1220,7 @@ async def show_strategy_faq(target, bot=None):
         await session.commit()
 
     content = await get_content("funnel_strategy_faq")
-    await send_content(target, content.text_content if content else "Частые вопросы.", content.media if content else None, await build_faq_keyboard(), bot)
+    await send_content(target, content.text_content if content else "Частые вопросы.", content.media if content else None, await configured_faq_keyboard(), bot)
 
 
 async def show_no_strategy_options(target, bot=None):
@@ -1190,7 +1247,7 @@ async def show_no_strategy_options(target, bot=None):
         await session.commit()
 
     content = await get_content("funnel_no_strategy")
-    await send_content(target, content.text_content if content else "Понимаю, возможно, сейчас не время.", content.media if content else None, await build_no_strategy_keyboard(), bot)
+    await send_content(target, content.text_content if content else "Понимаю, возможно, сейчас не время.", content.media if content else None, await configured_no_strategy_keyboard(), bot)
 
 
 async def show_meditation_choices(target, page: int = 0, bot=None, *, start_new_journey: bool = False):
@@ -1273,7 +1330,7 @@ async def show_meditation_card(target, meditation_id: int, page: int = 0, bot=No
         f"Длительность: {meditation.duration_minutes} мин\n\n"
         f"{html.escape(meditation.full_description or meditation.short_description or '')}"
     )
-    await send_content(target, text, None, meditation_card_keyboard(meditation_id, page), bot)
+    await send_content(target, text, None, await configured_meditation_card_keyboard(meditation_id, page), bot)
 
 
 async def send_meditation(target, meditation_id: int, bot=None):
@@ -1306,20 +1363,22 @@ async def send_meditation(target, meditation_id: int, bot=None):
     if meditation.file_type == "audio" and meditation.file_id:
         caption += "\n\n<i>Нажми на аудио выше, чтобы начать прослушивание. После окончания нажми кнопку ниже.</i>"
 
+    listen_markup = await configured_meditation_listen_keyboard()
+
     if meditation.file_type == "audio" and meditation.file_id:
         if len(caption) <= 1024:
-            await bot.send_audio(chat_id, meditation.file_id, caption=caption, parse_mode="HTML", reply_markup=meditation_listen_keyboard())
+            await bot.send_audio(chat_id, meditation.file_id, caption=caption, parse_mode="HTML", reply_markup=listen_markup)
         else:
             await bot.send_audio(chat_id, meditation.file_id)
-            await bot.send_message(chat_id, caption, parse_mode="HTML", reply_markup=meditation_listen_keyboard())
+            await bot.send_message(chat_id, caption, parse_mode="HTML", reply_markup=listen_markup)
     elif meditation.file_type == "video" and meditation.file_id:
         if len(caption) <= 1024:
-            await bot.send_video(chat_id, meditation.file_id, caption=caption, parse_mode="HTML", reply_markup=meditation_listen_keyboard())
+            await bot.send_video(chat_id, meditation.file_id, caption=caption, parse_mode="HTML", reply_markup=listen_markup)
         else:
             await bot.send_video(chat_id, meditation.file_id)
-            await bot.send_message(chat_id, caption, parse_mode="HTML", reply_markup=meditation_listen_keyboard())
+            await bot.send_message(chat_id, caption, parse_mode="HTML", reply_markup=listen_markup)
     else:
-        await bot.send_message(chat_id, caption, parse_mode="HTML", reply_markup=meditation_listen_keyboard())
+        await bot.send_message(chat_id, caption, parse_mode="HTML", reply_markup=listen_markup)
 
 
 async def request_reflection(target, state: FSMContext, bot=None):
@@ -1388,6 +1447,10 @@ async def deliver_analysis_core(
         chat_id=chat_id,
         alert_user_text=reflection_text,
         alert_metadata={"practice": meditation.title if meditation else ""},
+        prompt_variables={
+            "practice_name": meditation.title if meditation else "Не указана",
+            "user_input": reflection_text,
+        },
     )
     try:
         await waiting_msg.delete()
@@ -1507,6 +1570,9 @@ async def render_funnel_analysis(
         )
 
     crisis_detected_now = crisis_was_detected_in_turn(user_id)
+    analysis_markup = await configured_analysis_keyboard()
+    bridge_markup = await configured_analysis_bridge_keyboard()
+    crisis_markup = await configured_funnel_crisis_keyboard()
 
     if parsed is None:
         fallback_content = await get_content("funnel_fallback_text")
@@ -1519,10 +1585,10 @@ async def render_funnel_analysis(
                 chat_id,
                 await get_crisis_contacts_text(),
                 bot,
-                safety_crisis_contacts_keyboard(),
+                crisis_markup,
             )
             return
-        await send_safe_response(chat_id, fallback_text, bot, analysis_keyboard())
+        await send_safe_response(chat_id, fallback_text, bot, analysis_markup)
         logger.warning("Funnel response parse failed for user_id=%s reason=%s", user_id, parse_error)
         return
 
@@ -1532,7 +1598,7 @@ async def render_funnel_analysis(
             chat_id,
             await get_crisis_contacts_text(),
             bot,
-            safety_crisis_contacts_keyboard(),
+            crisis_markup,
         )
         return
 
@@ -1542,12 +1608,12 @@ async def render_funnel_analysis(
             chat_id,
             await get_crisis_contacts_text(),
             bot,
-            safety_crisis_contacts_keyboard(),
+            crisis_markup,
         )
         return
 
     if parsed.mode == "clinical":
-        await send_safe_response(chat_id, parsed.reply, bot, analysis_keyboard())
+        await send_safe_response(chat_id, parsed.reply, bot, analysis_markup)
         return
 
     if crisis_detected_now:
@@ -1556,7 +1622,7 @@ async def render_funnel_analysis(
             chat_id,
             await get_crisis_contacts_text(),
             bot,
-            safety_crisis_contacts_keyboard(),
+            crisis_markup,
         )
         return
 
@@ -1564,10 +1630,10 @@ async def render_funnel_analysis(
         chat_id,
         parsed.reply,
         bot,
-        None if parsed.offer_eligible and not crisis_active else analysis_keyboard(),
+        None if parsed.offer_eligible and not crisis_active else analysis_markup,
     )
     if parsed.offer_eligible and not crisis_active:
-        await send_safe_response(chat_id, parsed.bridge, bot, analysis_bridge_keyboard())
+        await send_safe_response(chat_id, parsed.bridge, bot, bridge_markup)
         async with async_session_maker() as session:
             await register_event(
                 session,
@@ -1703,7 +1769,7 @@ async def start_strategy_session(target, state: FSMContext, bot=None):
 
     await state.set_state(FunnelStates.strategy_chat)
     await state.update_data(strategy_dialogue_id=dialogue_id)
-    await send_content(target, first_message, None, build_strategy_offer_keyboard(), bot)
+    await send_content(target, first_message, None, await configured_strategy_offer_keyboard(), bot)
 
 
 async def open_landing(
@@ -1835,7 +1901,7 @@ async def handle_strategy_message(message: Message, state: FSMContext):
         message.from_user.id,
         message.chat.id,
         response,
-        build_strategy_offer_keyboard(),
+        await configured_strategy_offer_keyboard(),
     )
 
 
@@ -1931,7 +1997,7 @@ async def handle_objection_message(message: Message, state: FSMContext):
         message.from_user.id,
         message.chat.id,
         response,
-        objection_response_keyboard(),
+        await configured_objection_response_keyboard(),
     )
 
 
@@ -4597,12 +4663,12 @@ async def process_funnel_followups(bot: Bot, single_iteration: bool = False):
                         content = await session.get(Content, "funnel_timeout_unstarted")
                         default_text = "Ты открыл(а) медитацию, но ещё не начал(а) практику. Готов(а) сделать первый шаг к спокойствию?"
                         text = content.text_content if content and content.text_content else default_text
-                        kb_markup = meditation_card_keyboard(st.meditation_id, 0) if st.meditation_id else None
+                        kb_markup = await configured_meditation_card_keyboard(st.meditation_id, 0) if st.meditation_id else None
                     else:  # listening
                         content = await session.get(Content, "funnel_timeout_uncompleted")
                         default_text = "Ты начал(а) практику, но мы ещё не обсудили твои впечатления. Как всё прошло?"
                         text = content.text_content if content and content.text_content else default_text
-                        kb_markup = meditation_listen_keyboard()
+                        kb_markup = await configured_meditation_listen_keyboard()
 
                     try:
                         if await _before_funnel_followup_send(st.user_id):
@@ -4665,7 +4731,7 @@ async def process_funnel_followups(bot: Bot, single_iteration: bool = False):
                             await bot.send_message(
                                 st.user_id,
                                 text,
-                                reply_markup=await build_no_strategy_keyboard(),
+                                reply_markup=await configured_no_strategy_keyboard(),
                                 parse_mode="HTML",
                                 link_preview_options=LinkPreviewOptions(is_disabled=True),
                             )
@@ -4714,7 +4780,7 @@ async def process_funnel_followups(bot: Bot, single_iteration: bool = False):
                             await bot.send_message(
                                 st.user_id,
                                 text,
-                                reply_markup=reminder_keyboard(),
+                                reply_markup=await configured_reminder_keyboard(),
                                 parse_mode="HTML",
                                 link_preview_options=LinkPreviewOptions(is_disabled=True),
                             )

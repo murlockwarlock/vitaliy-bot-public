@@ -1916,7 +1916,7 @@ async def _send_subscription_info(user_id: int, chat_id: int, bot: Bot):
         else:
             text = base_text
 
-    reply_markup = kb.subscription_info_keyboard(sub_info, referral_info=referral_info)
+    reply_markup = await kb.configured_subscription_info_keyboard(sub_info, referral_info=referral_info)
     if subscription_media and len(text) <= 1024:
         media = subscription_media[0]
         if media.file_type == "photo":
@@ -2600,7 +2600,7 @@ async def _ai_session_completed_payload(topic_slug: str, dialogue_id: int):
     )
     if summary_enabled:
         text += "\n\nМожно сформировать итог сессии или продолжить диалог."
-    markup = kb.topic_finish_actions_keyboard(topic_slug, dialogue_id, has_summary=summary_enabled)
+    markup = await kb.configured_topic_finish_actions_keyboard(topic_slug, dialogue_id, has_summary=summary_enabled)
     return text, markup
 
 
@@ -2701,7 +2701,7 @@ async def cb_ai_gen_summary(callback: CallbackQuery, state: FSMContext, bot: Bot
             except Exception:
                 pass
 
-        markup = kb.topic_summary_result_keyboard(topic_slug, dialogue_id)
+        markup = await kb.configured_topic_summary_result_keyboard(topic_slug, dialogue_id)
         safe_summary = html.escape(summary_text)
         await callback.message.answer(f"📝 <b>Итог сессии:</b>\n\n{safe_summary}", reply_markup=markup, parse_mode="HTML")
 
@@ -2737,7 +2737,7 @@ async def cb_ai_regen_summary(callback: CallbackQuery, state: FSMContext, bot: B
             except Exception:
                 pass
 
-        markup = kb.topic_summary_result_keyboard(topic_slug, dialogue_id)
+        markup = await kb.configured_topic_summary_result_keyboard(topic_slug, dialogue_id)
         safe_summary = html.escape(summary_text)
         await callback.message.answer(
             f"📝 <b>Обновлённый итог сессии{ver_text}:</b>\n\n{safe_summary}",
@@ -2809,28 +2809,20 @@ async def mode_habits(callback: CallbackQuery, bot: Bot, state: FSMContext | Non
         intro_text = content_obj.text_content if content_obj else "Раздел формирования привычек."
         media = content_obj.media if content_obj else None
 
-    builder = InlineKeyboardBuilder()
-
     if mode == 'catalog':
         intro_text += "\n\n📚 <b>Режим библиотеки:</b> Выбери полезную привычку из списка ниже, чтобы начать."
-        builder.button(text="📂 Выбрать из каталога", callback_data="habit_open_catalog")
-
     elif mode == 'custom':
         intro_text += "\n\n🛠 <b>Конструктор:</b> Создай свою собственную привычку и поставь таймер."
-        builder.button(text="➕ Создать привычку", callback_data="habit_create_new")
-
     elif mode == 'hybrid':
         intro_text += "\n\n🚀 <b>Трекер привычек:</b> Выбери готовую или создай свою."
-        builder.button(text="📂 Выбрать из каталога", callback_data="habit_open_catalog")
-        builder.button(text="➕ Создать свою", callback_data="habit_create_new")
 
-    builder.button(text="📋 Мои привычки", callback_data="habit_my_list")
-    builder.button(text="🌍 Часовой пояс", callback_data="habit_timezone")
-    builder.button(text="📔 Дневник саморефлексии", callback_data="mode_journal")
-    builder.button(text="⬅️ В главное меню", callback_data="back_to_main_menu_text")
-    builder.adjust(1)
-
-    await send_smart_content(callback, intro_text, media, builder.as_markup(), bot)
+    await send_smart_content(
+        callback,
+        intro_text,
+        media,
+        await kb.configured_habits_entry_keyboard(mode),
+        bot,
+    )
     await callback.answer()
 
 
@@ -4436,11 +4428,16 @@ async def admin_menu_section(callback: CallbackQuery, state: FSMContext | None =
     for button in buttons:
         status = "👁" if button.enabled else "🙈"
         builder.button(text=f"{status} {display_labels[button.id]}", callback_data=f"admin_menu_button:{button.id}")
-    section_action = "🙈 Скрыть раздел" if section.enabled else "👁 Показать раздел"
-    builder.button(text=section_action, callback_data=f"admin_menu_section_toggle:{section.key}")
+    if section_key != "funnel_crisis":
+        section_action = "🙈 Скрыть раздел" if section.enabled else "👁 Показать раздел"
+        builder.button(text=section_action, callback_data=f"admin_menu_section_toggle:{section.key}")
     builder.button(text="⬅️ К разделам", callback_data="admin_menu_sections")
     builder.adjust(1)
-    section_status = "Раздел виден клиентам" if section.enabled else "Раздел скрыт от клиентов"
+    section_status = (
+        "Экран помощи всегда доступен"
+        if section_key == "funnel_crisis"
+        else ("Раздел виден клиентам" if section.enabled else "Раздел скрыт от клиентов")
+    )
     await send_smart_content(
         callback,
         f"🧩 <b>{html.escape(section.title)}</b>\n\n{section_status}.\nВыбери кнопку:",
@@ -4456,6 +4453,9 @@ async def admin_menu_section_toggle(callback: CallbackQuery, state: FSMContext |
         await callback.answer("⛔️ Доступ запрещён.", show_alert=True)
         return
     section_key = callback.data.split(":", 1)[1]
+    if section_key == "funnel_crisis":
+        await callback.answer("Экран помощи нельзя отключить.", show_alert=True)
+        return
     blocked_last_root = False
     section_not_found = False
     async with _menu_section_toggle_lock:
@@ -4538,9 +4538,12 @@ async def _get_menu_button_view(button_id: int):
 def _menu_button_editor_keyboard(view: dict):
     builder = kb.InlineKeyboardBuilder()
     builder.button(text="✏️ Переименовать", callback_data=f"admin_menu_button_label:{view['id']}")
-    builder.button(text="🔗 Изменить ссылку или действие", callback_data=f"admin_menu_button_action:{view['id']}")
-    toggle_text = "🙈 Скрыть" if view["enabled"] else "👁 Показать"
-    builder.button(text=toggle_text, callback_data=f"admin_menu_button_toggle:{view['id']}")
+    if view["section_key"] != "funnel_crisis":
+        builder.button(text="🔗 Изменить ссылку или действие", callback_data=f"admin_menu_button_action:{view['id']}")
+    builder.button(text="🔢 Изменить порядок", callback_data=f"admin_menu_button_order:{view['id']}")
+    if view["section_key"] != "funnel_crisis":
+        toggle_text = "🙈 Скрыть" if view["enabled"] else "👁 Показать"
+        builder.button(text=toggle_text, callback_data=f"admin_menu_button_toggle:{view['id']}")
     builder.button(text="⬆️ Выше", callback_data=f"admin_menu_button_move:{view['id']}:up")
     builder.button(text="⬇️ Ниже", callback_data=f"admin_menu_button_move:{view['id']}:down")
     builder.button(text="⬅️ Назад к списку", callback_data=f"admin_menu_section:{view['section_key']}")
@@ -4550,6 +4553,13 @@ def _menu_button_editor_keyboard(view: dict):
 
 def _menu_button_editor_text(view: dict):
     status = "👁 Видна клиенту" if view["enabled"] else "🙈 Скрыта от клиентов"
+    if view["section_key"] == "funnel_crisis":
+        return (
+            f"🔘 <b>{html.escape(view['label'])}</b>\n\n"
+            "🔒 Экран помощи всегда показывает одну кнопку возврата в главное меню.\n"
+            "Её действие и доступность закреплены системой.\n"
+            f"Позиция: {view['position']} из {view['total']}."
+        )
     return (
         f"🔘 <b>{html.escape(view['label'])}</b>\n\n"
         f"{status}.\n"
@@ -4670,6 +4680,9 @@ async def admin_menu_button_toggle(callback: CallbackQuery, state: FSMContext | 
         if not button:
             await callback.answer("Кнопка не найдена", show_alert=True)
             return
+        if button.section_key == "funnel_crisis":
+            await callback.answer("Кнопку возврата нельзя скрыть.", show_alert=True)
+            return
         if not button.enabled and button.source_type == "book":
             book = await session.get(Book, button.source_id)
             if not book:
@@ -4759,6 +4772,14 @@ async def admin_menu_button_action_start(callback: CallbackQuery, state: FSMCont
     except (TypeError, ValueError, IndexError):
         await callback.answer("Кнопка не найдена", show_alert=True)
         return
+    async with async_session_maker() as session:
+        button = await session.get(MenuButton, button_id)
+    if not button:
+        await callback.answer("Кнопка не найдена", show_alert=True)
+        return
+    if button.section_key == "funnel_crisis":
+        await callback.answer("Действие кризисной кнопки закреплено за главным меню.", show_alert=True)
+        return
     await state.set_state(AdminStates.menu_button_action)
     await state.update_data(menu_button_id=button_id)
     await callback.message.answer(
@@ -4796,6 +4817,15 @@ async def admin_menu_button_action_save(message: Message, state: FSMContext):
         if not button:
             await state.clear()
             await message.answer("Кнопка не найдена. Открой разделы ещё раз.")
+            return
+        if button.section_key == "funnel_crisis":
+            button.action_type = "callback"
+            button.action_value = "funnel_to_main"
+            button.legacy_callback = "funnel_to_main"
+            await session.commit()
+            await state.clear()
+            await message.answer("Действие кризисной кнопки закреплено за главным меню.")
+            await _send_menu_button_editor_message(message, button_id)
             return
         if button.content_key and button.action_type in {"url", "web_app"}:
             if action_type not in {"url", "web_app"}:
@@ -8067,8 +8097,13 @@ async def open_payment_menu(callback: CallbackQuery, bot: Bot):
             f"Стоимость 1 сообщения: {conf.cost_per_message} токенов."
         )
     # ВАЖНО: Передаем media в функцию отправки
-    await send_smart_content(callback, text, media, kb.payment_main_keyboard(mode, user.balance, user.subscription_end),
-                             bot)
+    await send_smart_content(
+        callback,
+        text,
+        media,
+        await kb.configured_payment_main_keyboard(mode, user.balance, user.subscription_end),
+        bot,
+    )
 
 
 @router.callback_query(F.data == "show_subscription_info")
