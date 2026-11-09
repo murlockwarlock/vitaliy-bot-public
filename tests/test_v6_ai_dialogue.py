@@ -3143,7 +3143,7 @@ class AiDialoguePlatformV6Tests(unittest.IsolatedAsyncioTestCase):
 
         cb = SimpleNamespace(
             from_user=SimpleNamespace(id=user_id),
-            data=f"ureset_confirmed_dialog_{user_id}",
+            data=f"ureset_dialog_{user_id}",
             answer=AsyncMock(),
             model_copy=lambda **kw: SimpleNamespace(data=kw.get("update", {}).get("data", f"admin_user_resets_{user_id}"), from_user=SimpleNamespace(id=user_id), answer=AsyncMock()),
         )
@@ -3186,7 +3186,7 @@ class AiDialoguePlatformV6Tests(unittest.IsolatedAsyncioTestCase):
 
         cb = SimpleNamespace(
             from_user=SimpleNamespace(id=user_id),
-            data=f"ureset_confirmed_full_{user_id}",
+            data=f"ureset_full_{user_id}",
             answer=AsyncMock(),
             model_copy=lambda **kw: SimpleNamespace(data=kw.get("update", {}).get("data", f"admin_user_resets_{user_id}"), from_user=SimpleNamespace(id=user_id), answer=AsyncMock()),
         )
@@ -3951,7 +3951,7 @@ class AiDialoguePlatformV6Tests(unittest.IsolatedAsyncioTestCase):
 
         cb = SimpleNamespace(
             from_user=SimpleNamespace(id=user_id),
-            data=f"ureset_confirmed_dialog_{user_id}",
+            data=f"ureset_dialog_{user_id}",
             answer=AsyncMock(),
             model_copy=lambda **kw: SimpleNamespace(data=kw.get("update", {}).get("data", f"admin_user_resets_{user_id}"), from_user=SimpleNamespace(id=user_id), answer=AsyncMock()),
         )

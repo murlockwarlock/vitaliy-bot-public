@@ -37,7 +37,7 @@ def test_openrouter_proxy_precedence(monkeypatch):
 
 def test_build_openrouter_client_proxied(monkeypatch):
     """Verify underlying httpx client gets explicit transport and trust_env=False."""
-    monkeypatch.setenv("OPENROUTER_PROXY", "http://proxy.example.invalid:3128")
+    monkeypatch.setenv("OPENROUTER_PROXY", "http://user:test@example.invalid:3128")
     client = build_openrouter_client("sk-test-key")
     http_client = client._client
     assert isinstance(http_client, httpx.AsyncClient)
@@ -47,7 +47,7 @@ def test_build_openrouter_client_proxied(monkeypatch):
     pool = getattr(transport, "_pool", None)
     proxy_url = getattr(pool, "_proxy_url", None)
     assert proxy_url is not None
-    assert "proxy.example.invalid" in str(proxy_url)
+    assert "proxy.example.com" in str(proxy_url)
     assert "3128" in str(proxy_url)
 
 

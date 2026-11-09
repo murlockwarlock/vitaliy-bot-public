@@ -330,35 +330,99 @@ async def vitaly_keyboard():
     return builder.as_markup()
 
 
-def admin_panel_keyboard(role: AdminRole | str | None = None):
+def _admin_section_keyboard(
+    buttons: list[tuple[str, str]],
+    role: AdminRole | str | None,
+    back_callback: str | None = "admin_panel",
+) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    buttons = [
-        ("👥 Клиенты", "admin_clients_list_0"),
-        ("⚙️ Автоматизации", "automation_menu"),
-        ("🤖 Настройки ИИ", "admin_ai_settings"),
-        ("📜 Логи запросов ИИ", "admin_ai_logs_0_all"),
-        ("⭐️ Подписки", "admin_payment_settings"),
-        ("📚 База знаний", "admin_kb_page_0"),
-        ("✏️ Контент", "admin_content_list"),
-        ("💬 Темы диалогов", "admin_topics_list"),
-        ("👮\u200d♂️ Администраторы", "admin_manage_admins"),
-        ("✉️ Рассылка", "admin_mailing"),
-        ("🌀 Воронка гипносессий", "admin_funnel_settings"),
-        ("🧘 Настройки Привычек", "admin_habit_settings"),
-        ("📔 Настройки Дневника", "admin_journal_menu"),
-        ("🤝 Настройки Рефералки", "admin_referral_settings"),
-        ("🔔 Напоминания неактивным", "admin_reminders_settings"),
-        ("🧪 Универсальные тесты", "admin_test_system"),
-        ("📚 Наборы тестов", "admin_test_sets_list"),
-        ("⏱ Напоминания по цепочке", "admin_followup_list"),
-        ("📋 Логи", "admin_logs"),
-    ]
     for text, callback_data in buttons:
         permission = permission_for_callback(callback_data)
         if role is None or permission is None or role_has_permission(role, permission):
-            builder.button(text=text, callback_data=callback_data)
-    builder.adjust(1)
+            builder.row(InlineKeyboardButton(text=text, callback_data=callback_data))
+    if back_callback:
+        builder.row(InlineKeyboardButton(text="⬅️ Назад", callback_data=back_callback))
     return builder.as_markup()
+
+
+def admin_panel_keyboard(role: AdminRole | str | None = None):
+    return _admin_section_keyboard(
+        [
+            ("👥 Клиенты", "admin_clients_list_0"),
+            ("🤖 ИИ и знания", "admin_section_ai"),
+            ("✏️ Контент и программы", "admin_section_content"),
+            ("⚙️ Автоматизации", "admin_section_automation"),
+            ("💳 Подписки и оплата", "admin_payment_settings"),
+            ("📋 Логи", "admin_section_logs"),
+            ("👮 Администраторы", "admin_manage_admins"),
+        ],
+        role,
+        back_callback=None,
+    )
+
+
+def admin_clients_section_keyboard(role: AdminRole | str | None = None):
+    return _admin_section_keyboard(
+        [("👥 Все клиенты", "admin_clients_list_0")], role
+    )
+
+
+def admin_ai_section_keyboard(role: AdminRole | str | None = None):
+    return _admin_section_keyboard(
+        [
+            ("⚙️ Настройки ИИ", "admin_ai_settings"),
+            ("🤖 Провайдеры и модели", "admin_ai_keys"),
+            ("💬 Темы диалогов", "admin_topics_list"),
+            ("📚 База знаний", "admin_kb_page_0"),
+        ],
+        role,
+    )
+
+
+def admin_content_section_keyboard(role: AdminRole | str | None = None):
+    return _admin_section_keyboard(
+        [
+            ("✏️ Контент и разделы", "admin_content_list"),
+            ("🌀 Воронка гипносессий", "admin_funnel_settings"),
+            ("🧘 Привычки", "admin_habit_settings"),
+            ("📔 Дневник", "admin_journal_menu"),
+            ("🧪 Универсальные тесты", "admin_test_system"),
+            ("📚 Наборы тестов", "admin_test_sets_list"),
+        ],
+        role,
+    )
+
+
+def admin_automation_section_keyboard(role: AdminRole | str | None = None):
+    return _admin_section_keyboard(
+        [
+            ("⚙️ Основные автоматизации", "automation_menu"),
+            ("🔔 Напоминания неактивным", "admin_reminders_settings"),
+            ("⏱ Напоминания по цепочке", "admin_followup_list"),
+            ("✉️ Рассылки", "admin_mailing"),
+        ],
+        role,
+    )
+
+
+def admin_payments_section_keyboard(role: AdminRole | str | None = None):
+    return admin_payment_keyboard(role)
+
+
+def admin_logs_section_keyboard(role: AdminRole | str | None = None):
+    return _admin_section_keyboard(
+        [
+            ("📋 Общие логи", "admin_logs"),
+            ("🤖 Логи ИИ", "admin_ai_logs_0_all_logs"),
+        ],
+        role,
+    )
+
+
+def admin_admins_section_keyboard(role: AdminRole | str | None = None):
+    return _admin_section_keyboard(
+        [("👮 Управление администраторами", "admin_manage_admins")], role
+    )
 
 
 def back_to_admin():
@@ -384,7 +448,7 @@ def ai_settings_keyboard(current_provider: str):
         builder.button(text=text, callback_data=callback_data)
     builder.button(text="⚙️ Провайдеры и модели", callback_data="admin_ai_keys")
     builder.button(text="📜 Логи запросов ИИ", callback_data="admin_ai_logs_0_all")
-    builder.button(text="⬅️ Назад", callback_data="admin_panel")
+    builder.button(text="⬅️ Назад", callback_data="admin_section_ai")
     builder.adjust(1)
     return builder.as_markup()
 
@@ -464,7 +528,7 @@ def admin_test_system_keyboard(config, has_formulas, question_count):
     if question_count:
         builder.button(text="▶️ Пройти как администратор", callback_data="admin_test_preview")
     builder.button(text="📚 Все наборы тестов", callback_data="admin_test_sets_list")
-    builder.button(text="⬅️ В админ-панель", callback_data="admin_panel")
+    builder.button(text="⬅️ В контент и программы", callback_data="admin_section_content")
     builder.adjust(2, 1, 1, 2, 1, 1, 1, 1, 1, 1)
     return builder.as_markup()
 
@@ -536,25 +600,10 @@ async def books_keyboard(page=0):
     builder = InlineKeyboardBuilder()
 
     for book, menu_button in book_rows:
-        builder.button(text=menu_button.label, url=book.url)
+        builder.row(InlineKeyboardButton(text=menu_button.label, url=book.url))
 
-    nav_btns = []
-    if total_pages > 1:
-        prev_page = page - 1 if page > 0 else total_pages - 1
-        next_page = page + 1 if page < total_pages - 1 else 0
-        nav_btns.append(InlineKeyboardButton(text="⬅️", callback_data=f"menu_books_pg_{prev_page}"))
-        nav_btns.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="ignore"))
-        nav_btns.append(InlineKeyboardButton(text="➡️", callback_data=f"menu_books_pg_{next_page}"))
-
-    if nav_btns:
-        builder.row(*nav_btns)
-
-    builder.button(text="⬅️ Назад", callback_data="open_extended_menu")
-
-    if nav_btns:
-        builder.adjust(1, len(nav_btns), 1)
-    else:
-        builder.adjust(1)
+    builder.row(*standard_pagination_row(page, total_pages, lambda target: f"menu_books_pg_{target}"))
+    builder.row(InlineKeyboardButton(text="⬅️ Назад", callback_data="open_extended_menu"))
 
     return builder.as_markup()
 
@@ -643,53 +692,46 @@ async def admin_plans_keyboard(page=0):
         plan_text = f"{p.name} ({p.duration_value} {duration_unit_text}) ({p.price:.0f} руб)"
         if p.is_trial and p.upgrades_to_plan:
             plan_text += f" ➡️ «{p.upgrades_to_plan.name}»"
-        builder.button(
+        builder.row(InlineKeyboardButton(
             text=f"{status} {plan_text}",
-            callback_data=f"adm_edit_plan_{p.id}"
-        )
+            callback_data=f"adm_edit_plan_{p.id}",
+        ))
 
-    if total_pages > 1:
-        prev_page = page - 1 if page > 0 else total_pages - 1
-        next_page = page + 1 if page < total_pages - 1 else 0
-        builder.row(
-            InlineKeyboardButton(text="⬅️", callback_data=f"admin_manage_plans_{prev_page}"),
-            InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="ignore"),
-            InlineKeyboardButton(text="➡️", callback_data=f"admin_manage_plans_{next_page}")
-        )
-
-    builder.button(text="➕ Создать новый тариф", callback_data="adm_add_plan_start")
-    builder.button(text="⬅️ Назад", callback_data="admin_payment_settings")
-    builder.adjust(1)
+    builder.row(*standard_pagination_row(page, total_pages, lambda target: f"admin_manage_plans_{target}"))
+    builder.row(InlineKeyboardButton(text="➕ Создать новый тариф", callback_data="adm_add_plan_start"))
+    builder.row(InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_payment_settings"))
     return builder.as_markup()
 
 
-def admin_payment_keyboard():
+def admin_payment_keyboard(role: AdminRole | str | None = None):
     builder = InlineKeyboardBuilder()
-    builder.button(text="📈 Тарифные планы", callback_data="admin_manage_plans")
-    builder.button(text="🎁 Промокоды", callback_data="admin_promocodes")
-    builder.button(text="👥 Подписчики", callback_data="admin_subs_list_0_all")
-    builder.button(text="📊 Статистика и Доход", callback_data="admin_payment_stats")
-    builder.button(text="📋 История платежей", callback_data="admin_plog_0_all")
-    builder.button(text="⚙️ Режим оплаты", callback_data="admin_pay_mode")
-    builder.button(text="🔑 Данные Prodamus", callback_data="admin_prodamus_keys_from_root")
-    builder.button(text="🏦 Способы оплаты в Telegram", callback_data="admin_pay_providers")
-    builder.button(text="💰 Баланс и стоимость сообщений", callback_data="admin_pay_prices")
-    builder.button(text="📝 Текст 'О подписке'", callback_data="edit_cont_pay:subscription_info")
-    builder.button(text="🌐 Прием оплат с лендинга", callback_data="admin_webhook_settings")
-    builder.button(text="⬅️ Назад", callback_data="admin_panel")
-    builder.adjust(1)
+    actions = (
+        ("📈 Тарифные планы", "admin_manage_plans"),
+        ("👥 Подписчики", "admin_subs_list_0_all"),
+        ("🎁 Промокоды", "admin_promocodes"),
+        ("📊 Статистика и Доход", "admin_payment_stats:admin_payment_settings"),
+        ("📋 История платежей", "admin_plog_0_all"),
+        ("🤝 Реферальная программа", "admin_referral_settings"),
+        ("⚙️ Настройки оплаты", "admin_prodamus_settings"),
+        ("⬅️ Назад", "admin_panel"),
+    )
+    for text, callback_data in actions:
+        permission = permission_for_callback(callback_data)
+        if role is None or permission is None or role_has_permission(role, permission):
+            builder.row(InlineKeyboardButton(text=text, callback_data=callback_data))
     return builder.as_markup()
 
 
-def admin_pay_mode_keyboard(current):
+def admin_pay_mode_keyboard(current, return_callback="admin_payment_settings"):
     builder = InlineKeyboardBuilder()
     modes = {"free": "Бесплатный", "subscription": "Подписка", "token": "Токены"}
 
     for k, v in modes.items():
         text = f"✅ {v}" if k == current else v
-        builder.button(text=text, callback_data=f"confirm_set_pay_mode_{k}")
+        suffix = "" if return_callback == "admin_payment_settings" else f"__{return_callback}"
+        builder.button(text=text, callback_data=f"confirm_set_pay_mode_{k}{suffix}")
 
-    builder.button(text="⬅️ Назад", callback_data="admin_payment_settings")
+    builder.button(text="⬅️ Назад", callback_data=return_callback)
     builder.adjust(1)
     return builder.as_markup()
 
@@ -713,7 +755,7 @@ async def admin_habit_keyboard():
     builder.button(text="⚙️ Режимы работы", callback_data="admin_habit_modes")
     builder.button(text="📚 Управление шаблонами", callback_data="admin_habit_templates")
     builder.button(text="🏆 Настройки Геймификации", callback_data="admin_habit_game")
-    builder.button(text="⬅️ Назад", callback_data="admin_panel")
+    builder.button(text="⬅️ Назад", callback_data="admin_section_content")
     builder.adjust(1)
     return builder.as_markup()
 
@@ -738,7 +780,7 @@ def mailing_preview_keyboard(audience="all"):
     builder.button(text="🔘 Настроить кнопку", callback_data="mail_setup_btn")
     label = AUDIENCE_LABELS.get(audience, audience)
     builder.button(text=f"🎯 Кому: {label}", callback_data="mail_set_audience")
-    builder.button(text="❌ Отмена", callback_data="admin_panel")
+    builder.button(text="❌ Отмена", callback_data="admin_section_automation")
     builder.adjust(1, 2, 1, 1, 1)
     return builder.as_markup()
 
@@ -795,8 +837,21 @@ def admin_plan_edit_keyboard(plan_id, is_active, is_trial=False, allow_auto_rene
     return builder.as_markup()
 
 
-def admin_clients_keyboard(users, page, total_pages, is_searching=False):
+def admin_clients_keyboard(
+    users,
+    page,
+    total_pages,
+    is_searching=False,
+    navigation_token=None,
+    back_callback="admin_panel",
+):
     builder = InlineKeyboardBuilder()
+    profile_suffix = (
+        f":{navigation_token}"
+        if navigation_token
+        else f":admin_clients_list_{page}"
+    )
+    search_suffix = f":{navigation_token}" if navigation_token else ""
 
     for u in users:
         label = f"@{u.username}" if u.username else u.first_name
@@ -804,67 +859,75 @@ def admin_clients_keyboard(users, page, total_pages, is_searching=False):
             label = str(u.id)
         if u.crisis_detected_at:
             label = f"🚨 {label}"
-        builder.button(text=label, callback_data=f"admin_user_profile_{u.id}")
+        builder.row(InlineKeyboardButton(
+            text=label,
+            callback_data=f"admin_user_profile_{u.id}{profile_suffix}",
+        ))
 
-    nav_row = []
-    if total_pages > 1:
-        prev_page = page - 1 if page > 0 else total_pages - 1
-        next_page = page + 1 if page < total_pages - 1 else 0
-        nav_row.append(InlineKeyboardButton(text="⬅️", callback_data=f"admin_clients_list_{prev_page}"))
-        nav_row.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="ignore"))
-        nav_row.append(InlineKeyboardButton(text="➡️", callback_data=f"admin_clients_list_{next_page}"))
-
-    if nav_row:
-        builder.row(*nav_row)
-
+    pagination_suffix = f":{navigation_token}" if navigation_token else ""
+    builder.row(*standard_pagination_row(
+        page,
+        total_pages,
+        lambda target: f"admin_clients_list_{target}{pagination_suffix}",
+    ))
     if is_searching:
-        builder.button(text="❌ Сбросить поиск", callback_data="admin_clients_reset_search")
+        builder.row(InlineKeyboardButton(
+            text="❌ Сбросить поиск",
+            callback_data=f"admin_clients_reset_search{search_suffix}",
+        ))
     else:
-        builder.button(text="🔍 Поиск", callback_data="admin_clients_start_search")
-    builder.button(text="⬅️ Назад", callback_data="admin_panel")
-
-    if nav_row:
-        builder.adjust(1, len(nav_row), 1, 1)
-    else:
-        builder.adjust(1, 1, 1)
+        builder.row(InlineKeyboardButton(
+            text="🔍 Поиск",
+            callback_data=f"admin_clients_start_search{search_suffix}",
+        ))
+    back_data = (
+        f"admin_clients_back:{navigation_token}"
+        if navigation_token
+        else back_callback
+    )
+    builder.row(InlineKeyboardButton(text="⬅️ Назад", callback_data=back_data))
 
     return builder.as_markup()
 
 
-def admin_user_profile_keyboard(user_id, is_blocked, crisis_detected=False):
+def admin_user_profile_keyboard(
+    user_id,
+    is_blocked,
+    crisis_detected=False,
+    return_callback="admin_clients_list_0",
+    navigation_token=None,
+):
     builder = InlineKeyboardBuilder()
 
+    suffix = f":{navigation_token}" if navigation_token else ""
+
     block_text = "🔓 Разблокировать" if is_blocked else "🔒 Заблокировать"
-    builder.button(text=block_text, callback_data=f"admin_block_toggle_{user_id}")
+    builder.button(text=block_text, callback_data=f"admin_block_toggle_{user_id}{suffix}")
     if crisis_detected:
-        builder.button(text="🚨 Снять кризисный флаг", callback_data=f"admin_crisis_clear_{user_id}")
-    builder.button(text="🌀 Воронка клиента", callback_data=f"admin_user_funnel_{user_id}")
-    builder.button(text="📜 История диалога", callback_data=f"admin_history_view_{user_id}_0")
-    builder.button(text="🔄 Сбросы для тестирования", callback_data=f"admin_user_resets_{user_id}")
-    builder.button(text="⬅️ К списку", callback_data="admin_clients_list_0")
+        builder.button(text="🚨 Снять кризисный флаг", callback_data=f"admin_crisis_clear_{user_id}{suffix}")
+    builder.button(text="🌀 Воронка клиента", callback_data=f"admin_user_funnel_{user_id}{suffix}")
+    builder.button(text="📜 История диалога", callback_data=f"admin_history_view_{user_id}_0{suffix}")
+    builder.button(text="🔄 Сбросы для тестирования", callback_data=f"admin_user_resets_{user_id}{suffix}")
+    profile_return_callback = return_callback
+    if navigation_token and ":clientctx_" not in profile_return_callback:
+        profile_return_callback = f"{profile_return_callback}:{navigation_token}"
+    builder.button(text="⬅️ К списку", callback_data=profile_return_callback)
 
     builder.adjust(1)
     return builder.as_markup()
 
 
-def admin_history_keyboard(user_id, page, total_pages):
+def admin_history_keyboard(user_id, page, total_pages, navigation_token=None):
     builder = InlineKeyboardBuilder()
+    suffix = f":{navigation_token}" if navigation_token else ""
 
-    builder.button(text="💾 Скачать историю (.txt)", callback_data=f"admin_history_download_{user_id}")
-
-    prev_page = page - 1 if page > 0 else total_pages - 1
-    next_page = page + 1 if page < total_pages - 1 else 0
-
-    nav_row = []
-    if total_pages > 1:
-        nav_row.append(InlineKeyboardButton(text="⬅️", callback_data=f"admin_history_view_{user_id}_{prev_page}"))
-        nav_row.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="ignore"))
-        nav_row.append(InlineKeyboardButton(text="➡️", callback_data=f"admin_history_view_{user_id}_{next_page}"))
-
-    if nav_row:
-        builder.row(*nav_row)
-
-    builder.button(text="⬅️ Назад к профилю", callback_data=f"admin_user_profile_{user_id}")
+    builder.row(InlineKeyboardButton(text="💾 Скачать историю (.txt)", callback_data=f"admin_history_download_{user_id}{suffix}"))
+    builder.row(*standard_pagination_row(
+        page,
+        total_pages,
+        lambda target: f"admin_history_view_{user_id}_{target}{suffix}",
+    ))
+    builder.row(InlineKeyboardButton(text="⬅️ Назад к профилю", callback_data=f"admin_user_profile_{user_id}{suffix}"))
 
     return builder.as_markup()
 
@@ -899,32 +962,27 @@ def user_settings_keyboard(user):
 # ==================== ПОДПИСКИ И ТАРИФЫ ====================
 
 def admin_subscriptions_keyboard():
-    """Главное меню управления подписками для админа."""
-    builder = InlineKeyboardBuilder()
-    builder.button(text="📈 Тарифные планы", callback_data="admin_manage_plans")
-    builder.button(text="🎁 Промокоды", callback_data="admin_promocodes")
-    builder.button(text="⚙️ Настройки платежей", callback_data="admin_prodamus_settings")
-    builder.button(text="📊 Статистика и Доход", callback_data="admin_payment_stats")
-    builder.button(text="👥 Подписчики", callback_data="admin_subs_list_0_all")
-    builder.button(text="📋 Лог платежей", callback_data="admin_plog_0_all")
-    builder.button(text="⬅️ Назад", callback_data="admin_payment_settings")
-    builder.adjust(1)
-    return builder.as_markup()
+    """Legacy alias for the unified subscriptions and payments screen."""
+    return admin_payment_keyboard()
 
 
-def admin_prodamus_settings_keyboard(config):
-    """Настройки Prodamus для админа."""
+def admin_prodamus_settings_keyboard(config, back_callback: str = "admin_payment_settings"):
+    """Технические настройки оплаты для админа."""
     notif_status = "✅ Включены" if config.notifications_enabled else "❌ Выключены"
     sub_status = "✅ Включены" if config.subscriptions_enabled else "❌ Выключены"
     bonus_days = config.welcome_bonus_days
 
     builder = InlineKeyboardBuilder()
-    builder.button(text="📊 Статистика и Доход", callback_data="admin_payment_stats")
+    builder.button(text="⚙️ Режим оплаты", callback_data="admin_pay_mode__admin_prodamus_settings")
     builder.button(text="🔑 Данные Prodamus", callback_data="admin_prodamus_keys_from_settings")
-    builder.button(text=f"Уведомления о покупках: {notif_status}", callback_data="admin_toggle_sub_notifs")
-    builder.button(text=f"Система подписок: {sub_status}", callback_data="admin_toggle_subscriptions")
-    builder.button(text=f"🎁 Бонус при входе: {bonus_days} дн.", callback_data="admin_set_welcome_bonus")
-    builder.button(text="⬅️ Назад", callback_data="admin_payment_settings")
+    builder.button(text="🏦 Способы оплаты в Telegram", callback_data="admin_pay_providers_0__admin_prodamus_settings")
+    builder.button(text="💰 Баланс и стоимость сообщений", callback_data="admin_pay_prices__admin_prodamus_settings")
+    builder.button(text="🌐 Приём оплат с лендинга", callback_data="admin_webhook_settings__admin_prodamus_settings")
+    builder.button(text="📝 Текст «О подписке»", callback_data="edit_cont_pay:subscription_info__admin_prodamus_settings")
+    builder.button(text=f"Уведомления о покупках: {notif_status}", callback_data="admin_toggle_sub_notifs__admin_prodamus_settings")
+    builder.button(text=f"Система подписок: {sub_status}", callback_data="admin_toggle_subscriptions__admin_prodamus_settings")
+    builder.button(text=f"🎁 Бонус при входе: {bonus_days} дн.", callback_data="admin_set_welcome_bonus__admin_prodamus_settings")
+    builder.button(text="⬅️ Назад", callback_data=back_callback)
     builder.adjust(1)
     return builder.as_markup()
 
@@ -980,7 +1038,7 @@ def admin_referral_settings_keyboard(ref_config, sub_config):
     builder.button(text=f"✏️ % от первой оплаты: {sub_config.referral_first_pay_percent}%", callback_data="admin_ref_edit_first_percent")
     builder.button(text=f"✏️ % от повторных оплат: {sub_config.referral_recurring_pay_percent}%", callback_data="admin_ref_edit_recurring_percent")
     builder.button(text=f"✏️ Бонусные дни: {sub_config.referral_pay_bonus_days} дн.", callback_data="admin_ref_edit_bonus_days")
-    builder.button(text="⬅️ Назад", callback_data="admin_panel")
+    builder.button(text="⬅️ Назад", callback_data="admin_payment_settings")
     builder.adjust(1)
     return builder.as_markup()
 
@@ -1035,21 +1093,13 @@ def admin_promocodes_keyboard(promos, page=0, total_pages=1):
     builder = InlineKeyboardBuilder()
     for p in promos:
         status = "✅" if p.is_active else "❌"
-        builder.button(
+        builder.row(InlineKeyboardButton(
             text=f"{status} {p.code} ({p.discount_percent}% / {p.free_days}д)",
-            callback_data=f"admin_edit_promo_{p.id}"
-        )
-    if total_pages > 1:
-        prev_page = page - 1 if page > 0 else total_pages - 1
-        next_page = page + 1 if page < total_pages - 1 else 0
-        builder.row(
-            InlineKeyboardButton(text="⬅️", callback_data=f"admin_promocodes_{prev_page}"),
-            InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="ignore"),
-            InlineKeyboardButton(text="➡️", callback_data=f"admin_promocodes_{next_page}")
-        )
-    builder.button(text="➕ Добавить промокод", callback_data="admin_create_promo")
-    builder.button(text="⬅️ Назад", callback_data="admin_payment_settings")
-    builder.adjust(1)
+            callback_data=f"admin_edit_promo_{p.id}",
+        ))
+    builder.row(*standard_pagination_row(page, total_pages, lambda target: f"admin_promocodes_{target}"))
+    builder.row(InlineKeyboardButton(text="➕ Добавить промокод", callback_data="admin_create_promo"))
+    builder.row(InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_payment_settings"))
     return builder.as_markup()
 
 
@@ -1073,25 +1123,23 @@ def assign_promo_to_plan_keyboard(promo_id, all_plans, assigned_plan_ids, applie
     builder = InlineKeyboardBuilder()
 
     all_plans_text = "✅ Применяется ко всем тарифам" if applies_to_all else "❌ Только выбранные тарифы"
-    builder.button(text=all_plans_text, callback_data=f"promo_toggle_all_plans_{promo_id}_{page}")
+    builder.row(InlineKeyboardButton(text=all_plans_text, callback_data=f"promo_toggle_all_plans_{promo_id}_{page}"))
 
     if not applies_to_all:
         for plan in all_plans:
             is_assigned = plan.id in assigned_plan_ids
             action = "remove" if is_assigned else "add"
             text = f"✅ {plan.name}" if is_assigned else f"⭕️ {plan.name}"
-            builder.button(text=text, callback_data=f"promo_plan_toggle_{action}_{promo_id}_{plan.id}_{page}")
-        builder.adjust(1)
+            builder.row(InlineKeyboardButton(
+                text=text,
+                callback_data=f"promo_plan_toggle_{action}_{promo_id}_{plan.id}_{page}",
+            ))
 
-        nav_buttons = []
-        if page > 0:
-            nav_buttons.append(InlineKeyboardButton(text="⬅️", callback_data=f"admin_assign_promo_{promo_id}_page_{page - 1}"))
-        if total_pages > 1:
-            nav_buttons.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="noop"))
-        if page < total_pages - 1:
-            nav_buttons.append(InlineKeyboardButton(text="➡️", callback_data=f"admin_assign_promo_{promo_id}_page_{page + 1}"))
-        if nav_buttons:
-            builder.row(*nav_buttons)
+    builder.row(*standard_pagination_row(
+        page,
+        total_pages,
+        lambda target: f"admin_assign_promo_{promo_id}_page_{target}",
+    ))
 
     builder.row(InlineKeyboardButton(text="⬅️ Назад к промокоду", callback_data=f"admin_edit_promo_{promo_id}"))
     return builder.as_markup()
@@ -1104,26 +1152,22 @@ def back_to_previous_menu(callback_data):
     ])
 
 
-def fixed_pagination_rows(page: int, total_pages: int, callback_for_page) -> list[list[InlineKeyboardButton]]:
-    """Return the stable two-row navigation used by dialogue history and log screens."""
-    total_pages = max(1, total_pages)
-    page = max(0, min(page, total_pages - 1))
-    if total_pages == 1:
-        return [[InlineKeyboardButton(text="1/1", callback_data="noop")]]
-
-    previous_page = page - 1 if page > 0 else total_pages - 1
-    next_page = page + 1 if page < total_pages - 1 else 0
+def standard_pagination_row(page: int, total_pages: int, callback_for_page) -> list[InlineKeyboardButton]:
+    """Return one predictable pagination row with safe boundary buttons."""
+    total_pages = max(1, int(total_pages or 1))
+    page = max(0, min(int(page or 0), total_pages - 1))
+    previous_callback = callback_for_page(page - 1) if page > 0 else "noop"
+    next_callback = callback_for_page(page + 1) if page < total_pages - 1 else "noop"
     return [
-        [
-            InlineKeyboardButton(text="⬅️ Назад", callback_data=callback_for_page(previous_page)),
-            InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="noop"),
-            InlineKeyboardButton(text="Вперёд ➡️", callback_data=callback_for_page(next_page)),
-        ],
-        [
-            InlineKeyboardButton(text="⏮ В начало", callback_data=callback_for_page(0)),
-            InlineKeyboardButton(text="В конец ⏭", callback_data=callback_for_page(total_pages - 1)),
-        ],
+        InlineKeyboardButton(text="⬅️", callback_data=previous_callback),
+        InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="noop"),
+        InlineKeyboardButton(text="➡️", callback_data=next_callback),
     ]
+
+
+def fixed_pagination_rows(page: int, total_pages: int, callback_for_page) -> list[list[InlineKeyboardButton]]:
+    """Backward-compatible wrapper for the single-row admin pagination."""
+    return [standard_pagination_row(page, total_pages, callback_for_page)]
 
 
 def format_ai_log_button(log, max_length: int = 60) -> str:
@@ -1156,9 +1200,12 @@ def admin_ai_logs_keyboard(
     period: str = "all",
     request_type: str = "all",
     status: str = "all",
+    back_callback: str = "ai",
 ):
     request_type = request_type if request_type in {"all", "chat", "followup", "standalone"} else "all"
     status = status if status in {"all", "success", "error"} else "all"
+    back_callback = back_callback if back_callback in {"ai", "logs"} else "ai"
+    source_suffix = f"_{back_callback}"
 
     def filter_suffix() -> str:
         if status != "all" or request_type != "all":
@@ -1168,12 +1215,13 @@ def admin_ai_logs_keyboard(
     def list_callback(target_page: int) -> str:
         suffix = filter_suffix()
         if filter_user_id:
-            return f"admin_user_ai_logs_{filter_user_id}_{target_page}_{period}{suffix}"
-        return f"admin_ai_logs_{target_page}_{period}{suffix}"
+            return f"admin_user_ai_logs_{filter_user_id}_{target_page}_{period}{suffix}{source_suffix}"
+        return f"admin_ai_logs_{target_page}_{period}{suffix}{source_suffix}"
 
     builder = InlineKeyboardBuilder()
+    detail_source_suffix = f"_{back_callback}"
     for log in logs:
-        cb = f"admin_ai_log_{log.id}_{page}_{filter_user_id or 0}_{period}_{request_type}_{status}"
+        cb = f"admin_ai_log_{log.id}_{page}_{filter_user_id or 0}_{period}_{request_type}_{status}{detail_source_suffix}"
         builder.button(text=format_ai_log_button(log), callback_data=cb)
 
     builder.adjust(1)
@@ -1187,7 +1235,8 @@ def admin_ai_logs_keyboard(
             text=("✅ " if value == period else "") + label,
             callback_data=(
                 f"admin_user_ai_logs_{filter_user_id}_0_{value}{suffix}"
-                if filter_user_id else f"admin_ai_logs_0_{value}{suffix}"
+                f"{source_suffix}"
+                if filter_user_id else f"admin_ai_logs_0_{value}{suffix}{source_suffix}"
             ),
         )
         for label, value in period_labels
@@ -1198,8 +1247,9 @@ def admin_ai_logs_keyboard(
             text=("✅ " if value == request_type else "") + label,
             callback_data=(
                 f"admin_user_ai_logs_{filter_user_id}_0_{period}_{value}_{status}"
+                f"{source_suffix}"
                 if filter_user_id
-                else f"admin_ai_logs_0_{period}_{value}_{status}"
+                else f"admin_ai_logs_0_{period}_{value}_{status}{source_suffix}"
             ),
         )
         for label, value in type_labels
@@ -1210,8 +1260,9 @@ def admin_ai_logs_keyboard(
             text=("✅ " if value == status else "") + label,
             callback_data=(
                 f"admin_user_ai_logs_{filter_user_id}_0_{period}_{request_type}_{value}"
+                f"{source_suffix}"
                 if filter_user_id
-                else f"admin_ai_logs_0_{period}_{request_type}_{value}"
+                else f"admin_ai_logs_0_{period}_{request_type}_{value}{source_suffix}"
             ),
         )
         for label, value in status_labels
@@ -1220,7 +1271,9 @@ def admin_ai_logs_keyboard(
         text="📦 Скачать пакет логов",
         callback_data=f"export_ai_logs_{filter_user_id or 0}_{period}_{request_type}_{status}",
     ))
-    back_cb = f"view_client_{filter_user_id}" if filter_user_id else "admin_ai_settings"
+    back_cb = f"admin_user_profile_{filter_user_id}" if filter_user_id else (
+        "admin_section_logs" if back_callback == "logs" else "admin_ai_settings"
+    )
     builder.row(InlineKeyboardButton(text="⬅️ Назад", callback_data=back_cb))
     return builder.as_markup()
 
@@ -1232,14 +1285,22 @@ def admin_ai_log_detail_keyboard(
     period: str = "all",
     request_type: str = "all",
     status: str = "all",
+    back_callback: str = "ai",
 ):
     builder = InlineKeyboardBuilder()
-    builder.button(text="📄 Скачать .txt файл лога", callback_data=f"admin_ai_log_file_{log_id}")
+    builder.button(
+        text="📄 Скачать .txt файл лога",
+        callback_data=(
+            f"admin_ai_log_file_{log_id}_{filter_user_id}"
+            if filter_user_id
+            else f"admin_ai_log_file_{log_id}"
+        ),
+    )
     suffix = f"_{request_type}_{status}" if (request_type != "all" or status != "all") else ""
     back_cb = (
-        f"admin_user_ai_logs_{filter_user_id}_{page}_{period}{suffix}"
+        f"admin_user_ai_logs_{filter_user_id}_{page}_{period}{suffix}_{back_callback}"
         if filter_user_id
-        else f"admin_ai_logs_{page}_{period}{suffix}"
+        else f"admin_ai_logs_{page}_{period}{suffix}_{back_callback}"
     )
     builder.button(text="⬅️ Назад к логам", callback_data=back_cb)
     builder.adjust(1)

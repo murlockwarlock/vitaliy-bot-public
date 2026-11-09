@@ -9,7 +9,7 @@ import math
 import re
 import zipfile
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Any, Optional
 
 from aiogram import F, Router
 from aiogram.types import BufferedInputFile, CallbackQuery, Message
@@ -36,8 +36,59 @@ def _safe_int(val: Any, default: Optional[int] = None) -> Optional[int]:
         return default
 
 
-async def is_admin_actor(user_id: int) -> bool:
+async def is_system_admin_actor(user_id: int) -> bool:
+    return await user_has_permission(user_id, AdminPermission.SYSTEM)
+
+
+async def is_client_admin_actor(user_id: int) -> bool:
     return await user_has_permission(user_id, AdminPermission.CLIENTS)
+
+
+async def is_admin_actor(user_id: int) -> bool:
+    """Backward-compatible guard for generic system AI logs."""
+    return await is_system_admin_actor(user_id)
+
+
+async def _can_open_ai_log(callback: CallbackQuery, filter_user_id: int | None = None) -> bool:
+    if filter_user_id:
+        return await is_client_admin_actor(callback.from_user.id)
+    return await is_admin_actor(callback.from_user.id)
+
+
+async def _deny_ai_log_access(event: Message | CallbackQuery) -> None:
+    if isinstance(event, CallbackQuery) or hasattr(event, "data"):
+        await event.answer("⛔️ Доступ к этому логу запрещён.", show_alert=True)
+    else:
+        await event.answer("⛔️ Доступ к этому логу запрещён.")
+
+
+async def _load_authorized_ai_log(
+    event: Message | CallbackQuery,
+    log_id: int,
+    filter_user_id: int | None = None,
+) -> AILog | None:
+    filter_user_id = filter_user_id if filter_user_id and filter_user_id > 0 else None
+    actor_id = getattr(getattr(event, "from_user", None), "id", None)
+    if filter_user_id is None:
+        allowed = await is_system_admin_actor(actor_id)
+    else:
+        allowed = await is_client_admin_actor(actor_id)
+    if not allowed:
+        await _deny_ai_log_access(event)
+        return None
+
+    async with async_session_maker() as session:
+        log_entry = await session.get(AILog, log_id)
+    if log_entry is None:
+        if isinstance(event, CallbackQuery) or hasattr(event, "data"):
+            await event.answer("Запись лога не найдена.", show_alert=True)
+        else:
+            await event.answer("Запись лога не найдена.")
+        return None
+    if filter_user_id is not None and log_entry.user_id != filter_user_id:
+        await _deny_ai_log_access(event)
+        return None
+    return log_entry
 
 
 router = Router(name="ai_logs_admin")
@@ -103,6 +154,7 @@ async def show_ai_logs_list(
     period: str = "all",
     request_type: str = "all",
     status: str = "all",
+    back_callback: str = "ai",
 ):
     PER_PAGE = 8
     period = period if period in AI_LOG_PERIOD_LABELS else "all"
@@ -136,6 +188,7 @@ async def show_ai_logs_list(
             period=period,
             request_type=request_type,
             status=status,
+            back_callback=back_callback,
         )
         if getattr(event, "message", None) is not None:
             await event.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
@@ -162,6 +215,7 @@ async def show_ai_logs_list(
         period=period,
         request_type=request_type,
         status=status,
+        back_callback=back_callback,
     )
     if getattr(event, "message", None) is not None:
         await event.message.edit_text(header, reply_markup=markup, parse_mode="HTML")
@@ -179,17 +233,12 @@ async def show_ai_log_detail(
     period: str = "all",
     request_type: str = "all",
     status: str = "all",
+    back_callback: str = "ai",
 ):
+    log_entry = await _load_authorized_ai_log(event, log_id, filter_user_id)
+    if log_entry is None:
+        return
     async with async_session_maker() as session:
-        log_entry = await session.get(AILog, log_id)
-        if not log_entry:
-            msg = "Запись лога не найдена."
-            if isinstance(event, CallbackQuery) or hasattr(event, "message") or hasattr(event, "data"):
-                await event.answer(msg, show_alert=True)
-            else:
-                await event.answer(msg)
-            return
-
         u = await session.get(User, log_entry.user_id) if log_entry.user_id else None
 
         if u:
@@ -288,6 +337,7 @@ async def show_ai_log_detail(
         period=period,
         request_type=request_type,
         status=status,
+        back_callback=back_callback,
     )
     if getattr(event, "message", None) is not None:
         await event.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
@@ -297,12 +347,14 @@ async def show_ai_log_detail(
         await event.answer(text, reply_markup=markup, parse_mode="HTML")
 
 
-async def send_ai_log_file(callback: CallbackQuery, log_id: int):
-    async with async_session_maker() as session:
-        log_entry = await session.get(AILog, log_id)
-        if not log_entry:
-            await callback.answer("Запись не найдена.", show_alert=True)
-            return
+async def send_ai_log_file(
+    callback: CallbackQuery,
+    log_id: int,
+    filter_user_id: int | None = None,
+):
+    log_entry = await _load_authorized_ai_log(callback, log_id, filter_user_id)
+    if log_entry is None:
+        return
 
     content = build_ai_attempt_txt_file(log_entry)
     file_bytes = content.encode("utf-8")
@@ -323,12 +375,20 @@ async def callback_admin_ai_logs(callback: CallbackQuery):
     period = parts[4] if len(parts) > 4 and parts[4] in AI_LOG_PERIOD_LABELS else "all"
     request_type = parts[5] if len(parts) > 5 and parts[5] in AI_LOG_TYPE_LABELS else "all"
     status = parts[6] if len(parts) > 6 and parts[6] in AI_LOG_STATUS_LABELS else "all"
-    await show_ai_logs_list(callback, page=page, period=period, request_type=request_type, status=status)
+    back_callback = parts[-1] if parts[-1] in {"ai", "logs"} else "ai"
+    await show_ai_logs_list(
+        callback,
+        page=page,
+        period=period,
+        request_type=request_type,
+        status=status,
+        back_callback=back_callback,
+    )
 
 
 @router.callback_query(F.data.startswith("admin_user_ai_logs_"))
 async def callback_admin_user_ai_logs(callback: CallbackQuery):
-    if not await is_admin_actor(callback.from_user.id):
+    if not await is_client_admin_actor(callback.from_user.id):
         await callback.answer("⛔️ Доступ запрещён.", show_alert=True)
         return
     parts = callback.data.split("_")
@@ -347,45 +407,53 @@ async def callback_admin_user_ai_logs(callback: CallbackQuery):
         period=period,
         request_type=request_type,
         status=status,
+        back_callback=parts[-1] if parts[-1] in {"ai", "logs"} else "ai",
     )
 
 
 @router.callback_query(F.data.startswith("admin_ai_log_file_"))
 async def callback_admin_ai_log_file_explicit(callback: CallbackQuery):
-    if not await is_admin_actor(callback.from_user.id):
+    parts = callback.data.split("_")
+    filter_user_id = _safe_int(parts[5] if len(parts) > 5 else None, None)
+    if not await _can_open_ai_log(callback, filter_user_id):
         await callback.answer("⛔️ Доступ запрещён.", show_alert=True)
         return
-    raw_id = callback.data.rsplit("_", 1)[-1]
+    raw_id = parts[4] if len(parts) > 4 else None
     log_id = _safe_int(raw_id, None)
     if not log_id:
         await callback.answer("Неверный ID лога.", show_alert=True)
         return
-    await send_ai_log_file(callback, log_id)
+    await send_ai_log_file(callback, log_id, filter_user_id)
 
 
 @router.callback_query(F.data.startswith("admin_ai_log_"))
 async def callback_admin_ai_log_detail(callback: CallbackQuery):
-    if not await is_admin_actor(callback.from_user.id):
-        await callback.answer("⛔️ Доступ запрещён.", show_alert=True)
-        return
     parts = callback.data.split("_")
     if len(parts) > 3 and parts[3] == "file":
+        filter_user_id = _safe_int(parts[5] if len(parts) > 5 else None, None)
+        if not await _can_open_ai_log(callback, filter_user_id):
+            await callback.answer("⛔️ Доступ запрещён.", show_alert=True)
+            return
         log_id = _safe_int(parts[4] if len(parts) > 4 else None, None)
         if not log_id:
             await callback.answer("Неверный ID лога.", show_alert=True)
             return
-        await send_ai_log_file(callback, log_id)
+        await send_ai_log_file(callback, log_id, filter_user_id)
         return
     log_id = _safe_int(parts[3] if len(parts) > 3 else None, None)
+    raw_filter = parts[5] if len(parts) > 5 else None
+    filter_user_id = _safe_int(raw_filter, None) if raw_filter not in (None, "", "0", "None") else None
+    if not await _can_open_ai_log(callback, filter_user_id):
+        await callback.answer("⛔️ Доступ запрещён.", show_alert=True)
+        return
     if not log_id:
         await callback.answer("Неверный ID лога.", show_alert=True)
         return
     page = _safe_int(parts[4] if len(parts) > 4 else None, 0) or 0
-    raw_filter = parts[5] if len(parts) > 5 else None
-    filter_user_id = _safe_int(raw_filter, None) if raw_filter not in (None, "", "0", "None") else None
     period = parts[6] if len(parts) > 6 and parts[6] in AI_LOG_PERIOD_LABELS else "all"
     request_type = parts[7] if len(parts) > 7 and parts[7] in AI_LOG_TYPE_LABELS else "all"
     status = parts[8] if len(parts) > 8 and parts[8] in AI_LOG_STATUS_LABELS else "all"
+    back_callback = parts[-1] if parts[-1] in {"ai", "logs"} else "ai"
     await show_ai_log_detail(
         callback,
         log_id,
@@ -394,17 +462,18 @@ async def callback_admin_ai_log_detail(callback: CallbackQuery):
         period=period,
         request_type=request_type,
         status=status,
+        back_callback=back_callback,
     )
 
 
 @router.callback_query(F.data.startswith("export_ai_logs_"))
 async def export_ai_logs_package(callback: CallbackQuery):
-    if not await is_admin_actor(callback.from_user.id):
-        await callback.answer("⛔️ Доступ запрещён.", show_alert=True)
-        return
     parts = callback.data.split("_")
     raw_filter = parts[3] if len(parts) > 3 else None
     filter_user_id = _safe_int(raw_filter, None) if raw_filter not in (None, "", "0", "None") else None
+    if not await _can_open_ai_log(callback, filter_user_id):
+        await callback.answer("⛔️ Доступ запрещён.", show_alert=True)
+        return
     period = parts[4] if len(parts) > 4 and parts[4] in AI_LOG_PERIOD_LABELS else "all"
     request_type = parts[5] if len(parts) > 5 and parts[5] in AI_LOG_TYPE_LABELS else "all"
     status = parts[6] if len(parts) > 6 and parts[6] in AI_LOG_STATUS_LABELS else "all"

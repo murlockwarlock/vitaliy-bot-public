@@ -9,6 +9,7 @@ from __future__ import annotations
 import html
 import json
 import logging
+import math
 from typing import Any, Optional
 
 from aiogram import F, Router
@@ -26,6 +27,7 @@ from automation_engine import (
     get_stage_analytics,
 )
 from admin_roles import AdminPermission, user_has_permission
+from keyboards import standard_pagination_row
 from crisis_safety import get_crisis_marker_settings, normalize_crisis_marker, serialize_crisis_markers
 from database import Topic, User, async_session_maker, get_all_admin_ids
 
@@ -123,7 +125,7 @@ def _automation_menu_keyboard():
     builder.button(text="💬 Догоняющие сообщения", callback_data="admin_fu_list")
     builder.button(text="📊 Статистика этапов", callback_data="admin_automation_stage_stats")
     builder.button(text="📋 Справка по данным сценария", callback_data="automation_data_help")
-    builder.button(text="⬅️ В админ-панель", callback_data="admin_panel")
+    builder.button(text="⬅️ В раздел автоматизаций", callback_data="admin_section_automation")
     builder.adjust(1)
     return builder.as_markup()
 
@@ -158,9 +160,8 @@ async def _show_crisis_marker_settings(event: Message | CallbackQuery) -> None:
             InlineKeyboardButton(text=f"✏️ {marker}", callback_data=f"automation_crisis_edit_{index}"),
             InlineKeyboardButton(text="🗑", callback_data=f"automation_crisis_delete_{index}"),
         )
-    builder.button(text="➕ Добавить маркер", callback_data="automation_crisis_add")
-    builder.button(text="⬅️ Меню автоматизаций", callback_data="automation_menu")
-    builder.adjust(1)
+    builder.row(InlineKeyboardButton(text="➕ Добавить маркер", callback_data="automation_crisis_add"))
+    builder.row(InlineKeyboardButton(text="⬅️ Меню автоматизаций", callback_data="automation_menu"))
 
     text = "\n".join(lines)
     if isinstance(event, CallbackQuery) or hasattr(event, "data"):
@@ -397,6 +398,7 @@ async def automation_data_help(callback: CallbackQuery, state: FSMContext | None
 # ---------------------------------------------------------------------------
 
 @router.callback_query(F.data == "automation_handlers")
+@router.callback_query(F.data.startswith("automation_handlers_page_"))
 async def automation_handlers_list(callback: CallbackQuery, state: FSMContext | None = None):
     if not await _is_admin(callback.from_user.id):
         await callback.answer("⛔️ Доступ запрещён.", show_alert=True)
@@ -404,16 +406,24 @@ async def automation_handlers_list(callback: CallbackQuery, state: FSMContext | 
     if state is not None:
         await state.clear()
 
+    try:
+        page = int(callback.data.rsplit("_", 1)[1]) if callback.data.startswith("automation_handlers_page_") else 0
+    except ValueError:
+        page = 0
+    page_size = 10
     async with async_session_maker() as session:
+        base_query = select(AutomationHandler).order_by(AutomationHandler.id)
+        total = await session.scalar(select(func.count()).select_from(base_query.subquery())) or 0
+        total_pages = max(1, math.ceil(total / page_size)) if total else 1
+        page = max(0, min(page, total_pages - 1))
         handlers = (
-            await session.execute(
-                select(AutomationHandler).order_by(AutomationHandler.id)
-            )
+            await session.execute(base_query.offset(page * page_size).limit(page_size))
         ).scalars().all()
 
     builder = InlineKeyboardBuilder()
     text_lines = [
-        f"⚡ <b>Обработчики событий ({len(handlers)})</b>\n",
+        f"⚡ <b>Обработчики событий ({total})</b>\n",
+        f"Страница {page + 1} из {total_pages}.\n",
         "Обработчик — это правило «если произошло событие/шаг, сделать действие». "
         "Он срабатывает, только если подходит область и выполнены условия.\n",
     ]
@@ -431,6 +441,11 @@ async def automation_handlers_list(callback: CallbackQuery, state: FSMContext | 
                 )
             )
 
+    builder.row(*standard_pagination_row(
+        page,
+        total_pages,
+        lambda target: f"automation_handlers_page_{target}",
+    ))
     builder.row(InlineKeyboardButton(text="➕ Новый обработчик", callback_data="automation_handler_add"))
     builder.row(InlineKeyboardButton(text="⬅️ Меню автоматизаций", callback_data="automation_menu"))
 

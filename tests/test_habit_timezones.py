@@ -341,14 +341,8 @@ class HabitTimezoneTests(IsolatedAsyncioTestCase):
             for button in row
             if button.callback_data
         ]
-        self.assertIn(
-            "edit_cont_main:main_reminder_first:admin_reminders_settings",
-            callbacks,
-        )
-        self.assertIn(
-            "edit_cont_main:main_reminder_common:admin_reminders_settings",
-            callbacks,
-        )
+        self.assertIn("edit_cont_main:main_reminder_first", callbacks)
+        self.assertIn("edit_cont_main:main_reminder_common", callbacks)
         self.assertIn("Контент» → «Главное меню / Старт", send.call_args.args[1])
         self.assertIn("main_reminder_first", handlers.CATEGORIES["main"])
         self.assertIn("main_reminder_common", handlers.CATEGORIES["main"])

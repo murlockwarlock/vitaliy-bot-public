@@ -3,6 +3,7 @@ import csv
 import html
 import io
 import json
+import re
 import secrets
 import weakref
 from datetime import datetime, timedelta
@@ -69,6 +70,7 @@ from database import (
     FunnelMeditation,
     FunnelState,
     Message as DBMessage,
+    AdminNavigationContext,
     PaymentConfig,
     Topic,
     User,
@@ -80,6 +82,59 @@ router = Router()
 logger = get_logger("bot")
 funnel_logger = get_logger("funnel")
 _FUNNEL_FOLLOWUP_LOCKS = weakref.WeakKeyDictionary()
+
+
+async def _clear_admin_client_context(state: FSMContext | None) -> str:
+    return_callback = "admin_clients_list_0"
+    preserved = {}
+    if state is not None:
+        data = await state.get_data()
+        return_callback = data.get("admin_client_return_callback", return_callback)
+        for key in (
+            "admin_client_return_callback",
+            "admin_client_parent_callback",
+            "client_search_query",
+            "admin_client_search_reset_callback",
+            "admin_client_search_reset_query",
+            "admin_client_navigation_token",
+        ):
+            if key in data:
+                preserved[key] = data[key]
+        await state.clear()
+        if preserved:
+            await state.update_data(**preserved)
+    return return_callback
+
+
+async def _admin_client_context_return(callback: CallbackQuery, state: FSMContext | None) -> str | None:
+    callback_data = getattr(callback, "data", "") or ""
+    context_value = callback_data.rsplit(":", 1)[1] if ":" in callback_data else None
+    if not context_value or not re.fullmatch(r"clientctx_[0-9a-f]{16}", context_value):
+        return await _clear_admin_client_context(state)
+
+    async with async_session_maker() as session:
+        context = await session.get(AdminNavigationContext, context_value.removeprefix("clientctx_"))
+    if context is None:
+        return None
+    if context.admin_id != callback.from_user.id:
+        return None
+    if context.chat_id != getattr(getattr(callback.message, "chat", None), "id", 0):
+        return None
+    if context.message_id != getattr(callback.message, "message_id", 0):
+        return None
+
+    return_callback = f"{context.return_callback}:{context_value}"
+    if state is not None:
+        await state.clear()
+        await state.update_data(
+            admin_client_return_callback=context.return_callback,
+            admin_client_parent_callback=context.parent_callback or "admin_panel",
+            client_search_query=context.search_query,
+            admin_client_search_reset_callback=context.reset_callback,
+            admin_client_search_reset_query=context.reset_query,
+            admin_client_navigation_token=context_value,
+        )
+    return return_callback
 
 
 def _funnel_followup_lock():
@@ -1179,7 +1234,12 @@ async def show_meditation_choices(target, page: int = 0, bot=None, *, start_new_
         if meditation.short_description:
             lines.append(html.escape(meditation.short_description))
         lines.append("")
-        builder.button(text=f"{meditation.sort_order}. {meditation.title}", callback_data=f"funnel_card_{meditation.id}_{page}")
+        builder.row(
+            InlineKeyboardButton(
+                text=f"{meditation.sort_order}. {meditation.title}",
+                callback_data=f"funnel_card_{meditation.id}_{page}",
+            )
+        )
 
     nav_row = []
     if total_pages > 1:
@@ -1190,9 +1250,8 @@ async def show_meditation_choices(target, page: int = 0, bot=None, *, start_new_
         nav_row.append(InlineKeyboardButton(text="➡️", callback_data=f"funnel_choice_{next_page}"))
         builder.row(*nav_row)
 
-    builder.button(text="Узнать о стратегической сессии", callback_data="funnel_resume_strategy")
-    builder.button(text="Главное меню", callback_data="funnel_to_main")
-    builder.adjust(1)
+    builder.row(InlineKeyboardButton(text="Узнать о стратегической сессии", callback_data="funnel_resume_strategy"))
+    builder.row(InlineKeyboardButton(text="Главное меню", callback_data="funnel_to_main"))
 
     await send_content(target, "\n".join(lines).strip(), content.media if content else None, builder.as_markup(), bot)
 
@@ -2248,7 +2307,7 @@ def funnel_admin_menu_keyboard(role: AdminRole | str | None = None):
         permission = permission_for_callback(callback_data)
         if role is None or permission is None or role_has_permission(role, permission):
             builder.button(text=text, callback_data=callback_data)
-    builder.button(text="⬅️ Назад", callback_data="admin_panel")
+    builder.button(text="⬅️ В контент и программы", callback_data="admin_section_content")
     builder.adjust(1)
     return builder.as_markup()
 
@@ -2296,40 +2355,47 @@ def funnel_stats_keyboard(period_key: str):
 def funnel_landing_list_keyboard(items: list[FunnelLanding], status_filter: str, page: int, total_pages: int):
     builder = InlineKeyboardBuilder()
 
+    filter_buttons = []
     for key, label in LANDING_STATUS_FILTERS.items():
         text = f"✅ {label}" if key == status_filter else label
-        builder.button(text=text, callback_data=f"admin_funnel_landings_{key}_0")
+        filter_buttons.append(InlineKeyboardButton(text=text, callback_data=f"admin_funnel_landings_{key}_0"))
+    builder.row(*filter_buttons)
 
     for landing in items:
         status_icon = "✅" if landing.status == "paid" else "📝" if landing.status == "form_submitted" else "🟡" if landing.status == "opened" else "❌"
         opened_str = format_msk(landing.opened_at, "%d.%m %H:%M")
-        builder.button(
+        builder.row(InlineKeyboardButton(
             text=f"{status_icon} {opened_str} • {landing.user_id}",
             callback_data=f"admin_flanding_{landing.id}_{status_filter}_{page}",
-        )
+        ))
 
-    if total_pages > 1:
-        prev_page = page - 1 if page > 0 else total_pages - 1
-        next_page = page + 1 if page < total_pages - 1 else 0
-        builder.row(
-            InlineKeyboardButton(text="⬅️", callback_data=f"admin_funnel_landings_{status_filter}_{prev_page}"),
-            InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="ignore"),
-            InlineKeyboardButton(text="➡️", callback_data=f"admin_funnel_landings_{status_filter}_{next_page}"),
-        )
+    builder.row(*kb.standard_pagination_row(
+        page,
+        total_pages,
+        lambda target: f"admin_funnel_landings_{status_filter}_{target}",
+    ))
 
-    builder.button(text="💾 Экспорт CSV", callback_data=f"admin_flandings_export_{status_filter}")
-    builder.button(text="⬅️ Назад", callback_data="admin_funnel_settings")
-    builder.adjust(2, 2, 1)
+    builder.row(InlineKeyboardButton(text="💾 Экспорт CSV", callback_data=f"admin_flandings_export_{status_filter}"))
+    builder.row(InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_funnel_settings"))
     return builder.as_markup()
 
 
 def funnel_landing_detail_keyboard(landing_id: int, user_id: int, status_filter: str, page: int):
     builder = InlineKeyboardBuilder()
-    builder.button(text="✅ Отметить как оплачено", callback_data=f"admin_flanding_mark_paid_{landing_id}")
-    builder.button(text="📝 Отметить как анкету", callback_data=f"admin_flanding_mark_form_{landing_id}")
-    builder.button(text="🟡 Отметить как открыта", callback_data=f"admin_flanding_mark_opened_{landing_id}")
-    builder.button(text="❌ Отметить как не оплачена", callback_data=f"admin_flanding_mark_failed_{landing_id}")
-    builder.button(text="👤 Профиль клиента", callback_data=f"admin_user_profile_{user_id}")
+    context = f"_{status_filter}_{page}"
+    builder.button(text="✅ Отметить как оплачено", callback_data=f"admin_flanding_mark_paid_{landing_id}{context}")
+    builder.button(text="📝 Отметить как анкету", callback_data=f"admin_flanding_mark_form_{landing_id}{context}")
+    builder.button(text="🟡 Отметить как открыта", callback_data=f"admin_flanding_mark_opened_{landing_id}{context}")
+    builder.button(text="❌ Отметить как не оплачена", callback_data=f"admin_flanding_mark_failed_{landing_id}{context}")
+    profile_status_code = {
+        "all": "all",
+        "opened": "opened",
+        "form_submitted": "form",
+        "paid": "paid",
+        "failed": "failed",
+    }.get(status_filter, "all")
+    profile_return = f"landing_{profile_status_code}_{page}"
+    builder.button(text="👤 Профиль клиента", callback_data=f"admin_user_profile_{user_id}:{profile_return}")
     builder.button(text="📄 Данные заявки", callback_data=f"admin_flanding_payload_{landing_id}")
     builder.button(text="⬅️ К списку", callback_data=f"admin_funnel_landings_{status_filter}_{page}")
     builder.adjust(2, 2, 1, 1, 1)
@@ -2348,12 +2414,15 @@ def funnel_tools_keyboard():
     return builder.as_markup()
 
 
-def admin_user_funnel_keyboard(user_id: int):
+def admin_user_funnel_keyboard(user_id: int, return_callback: str = "admin_clients_list_0"):
     builder = InlineKeyboardBuilder()
-    builder.button(text="⏰ Отправить напоминание", callback_data=f"admin_user_funnel_followup_{user_id}")
-    builder.button(text="♻️ Сбросить состояние", callback_data=f"admin_user_funnel_reset_{user_id}")
-    builder.button(text="👤 К профилю", callback_data=f"admin_user_profile_{user_id}")
-    builder.button(text="⬅️ К списку", callback_data="admin_clients_list_0")
+    context_suffix = ""
+    if ":clientctx_" in return_callback:
+        context_suffix = f":{return_callback.rsplit(':', 1)[1]}"
+    builder.button(text="⏰ Отправить напоминание", callback_data=f"admin_user_funnel_followup_{user_id}{context_suffix}")
+    builder.button(text="♻️ Сбросить состояние", callback_data=f"admin_user_funnel_reset_{user_id}{context_suffix}")
+    builder.button(text="👤 К профилю", callback_data=f"admin_user_profile_{user_id}{context_suffix}")
+    builder.button(text="⬅️ К списку", callback_data=return_callback)
     builder.adjust(1)
     return builder.as_markup()
 
@@ -2952,20 +3021,18 @@ async def meditation_list_markup(page: int = 0):
 
     for meditation in page_items:
         status = "✅" if meditation.is_active else "❌"
-        builder.button(text=f"{status} {meditation.sort_order}. {meditation.title}", callback_data=f"admin_fmed_{meditation.id}_{page}")
+        builder.row(InlineKeyboardButton(
+            text=f"{status} {meditation.sort_order}. {meditation.title}",
+            callback_data=f"admin_fmed_{meditation.id}_{page}",
+        ))
 
-    if total_pages > 1:
-        prev_page = page - 1 if page > 0 else total_pages - 1
-        next_page = page + 1 if page < total_pages - 1 else 0
-        builder.row(
-            InlineKeyboardButton(text="⬅️", callback_data=f"admin_funnel_meds_{prev_page}"),
-            InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="ignore"),
-            InlineKeyboardButton(text="➡️", callback_data=f"admin_funnel_meds_{next_page}"),
-        )
-
-    builder.button(text="➕ Добавить медитацию", callback_data="admin_fmed_add")
-    builder.button(text="⬅️ Назад", callback_data="admin_funnel_settings")
-    builder.adjust(1)
+    builder.row(*kb.standard_pagination_row(
+        page,
+        total_pages,
+        lambda target: f"admin_funnel_meds_{target}",
+    ))
+    builder.row(InlineKeyboardButton(text="➕ Добавить медитацию", callback_data="admin_fmed_add"))
+    builder.row(InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_funnel_settings"))
 
     text = "Список медитаций. Нажмите на элемент для управления."
     return text, builder.as_markup()
@@ -4048,7 +4115,6 @@ async def export_funnel_stats_csv(target, period_key: str, bot=None):
 async def show_admin_funnel_landings(target, status_filter: str = "all", page: int = 0):
     status_filter = status_filter if status_filter in LANDING_STATUS_FILTERS else "all"
     limit = 8
-    offset = page * limit
     async with async_session_maker() as session:
         count_stmt = select(func.count(FunnelLanding.id))
         items_stmt = select(FunnelLanding).order_by(FunnelLanding.id.desc())
@@ -4058,12 +4124,14 @@ async def show_admin_funnel_landings(target, status_filter: str = "all", page: i
             items_stmt = items_stmt.where(condition)
 
         total = (await session.scalar(count_stmt)) or 0
+
+        total_pages = max(1, (total + limit - 1) // limit)
+        page = min(max(page, 0), total_pages - 1)
+        offset = page * limit
         items = (
             await session.execute(items_stmt.limit(limit).offset(offset))
         ).scalars().all()
 
-    total_pages = max(1, (total + limit - 1) // limit)
-    page = min(max(page, 0), total_pages - 1)
     text = (
         f"<b>Лиды и оплаты</b>\n\n"
         f"Фильтр: {LANDING_STATUS_FILTERS[status_filter]}\n"
@@ -4109,7 +4177,11 @@ async def show_admin_funnel_tools(target):
     )
 
 
-async def show_admin_user_funnel(target, user_id: int):
+async def show_admin_user_funnel(
+    target,
+    user_id: int,
+    return_callback: str = "admin_clients_list_0",
+):
     async with async_session_maker() as session:
         user = await session.get(User, user_id)
         funnel_state = await get_or_create_funnel_state(session, user_id)
@@ -4124,7 +4196,7 @@ async def show_admin_user_funnel(target, user_id: int):
         f"Последнее действие: {format_msk(get_state_anchor_time(funnel_state), '%d-%m-%Y %H:%M')}\n"
         f"Следующее напоминание: {format_msk(funnel_state.next_followup_at, '%d-%m-%Y %H:%M') if funnel_state.next_followup_at else 'не запланировано'}"
     )
-    await send_content(target, text, None, admin_user_funnel_keyboard(user_id))
+    await send_content(target, text, None, admin_user_funnel_keyboard(user_id, return_callback))
 
 
 @router.callback_query(F.data == "admin_funnel_tools")
@@ -4226,19 +4298,18 @@ async def admin_ftool_reset_self(callback: CallbackQuery, state: FSMContext | No
     await show_admin_funnel_tools(callback)
 
 
-@router.callback_query(F.data.regexp(r"^admin_user_funnel_\d+$"))
+@router.callback_query(F.data.regexp(r"^admin_user_funnel_\d+(?::clientctx_[0-9a-f]{16})?$"))
 async def admin_user_funnel(callback: CallbackQuery, state: FSMContext | None = None):
     if not await is_admin_user(callback.from_user.id):
         await callback.answer("Недостаточно прав", show_alert=True)
         return
-    if state is not None:
-        await state.clear()
-    parts = callback.data.split("_")
-    if len(parts) != 4:
+    return_callback = await _admin_client_context_return(callback, state)
+    if return_callback is None:
+        await callback.answer("Экран профиля устарел. Откройте список клиентов заново.", show_alert=True)
         return
-    user_id = int(parts[-1])
+    user_id = int(callback.data.split(":", 1)[0].split("_")[-1])
     await callback.answer()
-    await show_admin_user_funnel(callback, user_id)
+    await show_admin_user_funnel(callback, user_id, return_callback)
 
 
 @router.callback_query(F.data.startswith("admin_user_funnel_followup_"))
@@ -4246,9 +4317,11 @@ async def admin_user_funnel_followup(callback: CallbackQuery, state: FSMContext 
     if not await is_admin_user(callback.from_user.id):
         await callback.answer("Недостаточно прав", show_alert=True)
         return
-    if state is not None:
-        await state.clear()
-    user_id = int(callback.data.split("_")[-1])
+    return_callback = await _admin_client_context_return(callback, state)
+    if return_callback is None:
+        await callback.answer("Экран профиля устарел. Откройте список клиентов заново.", show_alert=True)
+        return
+    user_id = int(callback.data.split(":", 1)[0].split("_")[-1])
     async with async_session_maker() as session:
         state = await get_or_create_funnel_state(session, user_id)
         if not state.is_active:
@@ -4267,7 +4340,7 @@ async def admin_user_funnel_followup(callback: CallbackQuery, state: FSMContext 
             await callback.answer("Не удалось отправить напоминание", show_alert=True)
             return
     await callback.answer("Напоминание отправлено")
-    await show_admin_user_funnel(callback, user_id)
+    await show_admin_user_funnel(callback, user_id, return_callback)
 
 
 @router.callback_query(F.data.startswith("admin_user_funnel_reset_"))
@@ -4275,17 +4348,21 @@ async def admin_user_funnel_reset(callback: CallbackQuery, state: FSMContext | N
     if not await is_admin_user(callback.from_user.id):
         await callback.answer("Недостаточно прав", show_alert=True)
         return
-    if state is not None:
-        await state.clear()
+    return_callback = await _admin_client_context_return(callback, state)
+    if return_callback is None:
+        await callback.answer("Экран профиля устарел. Откройте список клиентов заново.", show_alert=True)
+        return
     payload = callback.data.removeprefix("admin_user_funnel_reset_")
+    payload = payload.split(":", 1)[0]
     confirmed = payload.startswith("confirm_")
     user_id = int(payload.removeprefix("confirm_") if confirmed else payload)
     if not confirmed:
+        context_suffix = f":{return_callback.rsplit(':', 1)[1]}" if ":clientctx_" in return_callback else ""
         await _ask_funnel_admin_confirmation(
             callback,
             "Состояние воронки этого клиента будет сброшено. Продолжить?",
-            f"admin_user_funnel_reset_confirm_{user_id}",
-            f"admin_user_funnel_{user_id}",
+            f"admin_user_funnel_reset_confirm_{user_id}{context_suffix}",
+            f"admin_user_funnel_{user_id}{context_suffix}",
         )
         return
     async with async_session_maker() as session:
@@ -4293,7 +4370,7 @@ async def admin_user_funnel_reset(callback: CallbackQuery, state: FSMContext | N
         await register_event(session, user_id, "admin_reset", "admin_reset")
         await session.commit()
     await callback.answer("Состояние сброшено")
-    await show_admin_user_funnel(callback, user_id)
+    await show_admin_user_funnel(callback, user_id, return_callback)
 
 
 @router.callback_query(F.data == "admin_funnel_stats")
@@ -4334,23 +4411,30 @@ async def admin_funnel_landings(callback: CallbackQuery, state: FSMContext | Non
         return
     if state is not None:
         await state.clear()
-    _, _, _, status_filter, page = callback.data.split("_")
+    payload = callback.data.removeprefix("admin_funnel_landings_")
+    status_filter, page_raw = payload.rsplit("_", 1)
     await callback.answer()
-    await show_admin_funnel_landings(callback, status_filter, int(page))
+    await show_admin_funnel_landings(callback, status_filter, int(page_raw))
 
 
-@router.callback_query(F.data.regexp(r"^admin_flanding_\d+_[a-z]+_\d+$"))
+@router.callback_query(F.data.regexp(r"^admin_flanding_\d+_[a-z_]+_\d+$"))
 async def admin_flanding_detail(callback: CallbackQuery, state: FSMContext | None = None):
     if not await is_admin_user(callback.from_user.id):
         await callback.answer("Недостаточно прав", show_alert=True)
         return
     if state is not None:
         await state.clear()
-    parts = callback.data.split("_")
-    if len(parts) == 5:
-        _, _, landing_id, status_filter, page = parts
-        await callback.answer()
-        await show_admin_landing_detail(callback, int(landing_id), status_filter, int(page))
+    payload = callback.data.removeprefix("admin_flanding_")
+    try:
+        landing_id_raw, status_and_page = payload.split("_", 1)
+        status_filter, page_raw = status_and_page.rsplit("_", 1)
+        landing_id = int(landing_id_raw)
+        page = int(page_raw)
+    except (TypeError, ValueError):
+        await callback.answer("Заявка не найдена.", show_alert=True)
+        return
+    await callback.answer()
+    await show_admin_landing_detail(callback, landing_id, status_filter, page)
 
 
 @router.callback_query(F.data.startswith("admin_flanding_mark_"))
@@ -4360,7 +4444,27 @@ async def admin_flanding_mark(callback: CallbackQuery, state: FSMContext | None 
         return
     if state is not None:
         await state.clear()
-    _, _, _, new_status, landing_id = callback.data.split("_")
+    payload = callback.data.removeprefix("admin_flanding_mark_")
+    context_match = re.fullmatch(
+        r"(paid|form|opened|failed)_(\d+)_([a-z_]+)_(\d+)",
+        payload,
+    )
+    if context_match:
+        new_status, landing_id_raw, status_filter, page_raw = context_match.groups()
+        try:
+            landing_id = int(landing_id_raw)
+            page = int(page_raw)
+        except ValueError:
+            await callback.answer("Заявка не найдена", show_alert=True)
+            return
+    else:
+        try:
+            new_status, landing_id_raw = payload.rsplit("_", 1)
+            landing_id = int(landing_id_raw)
+        except ValueError:
+            await callback.answer("Заявка не найдена", show_alert=True)
+            return
+        status_filter, page = "all", 0
     if new_status == "form":
         new_status = "form_submitted"
     async with async_session_maker() as session:
@@ -4390,7 +4494,7 @@ async def admin_flanding_mark(callback: CallbackQuery, state: FSMContext | None 
         )
         await session.commit()
     await callback.answer("Статус обновлён")
-    await show_admin_landing_detail(callback, int(landing_id), "all", 0)
+    await show_admin_landing_detail(callback, landing_id, status_filter, page)
 
 
 @router.callback_query(F.data.startswith("admin_flanding_payload_"))

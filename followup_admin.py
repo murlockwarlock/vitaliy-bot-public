@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import html
 import logging
+import math
 from typing import Any, Optional
 
 from aiogram import F, Router
@@ -15,6 +16,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import selectinload
 
 from admin_roles import AdminPermission, user_has_permission
+from keyboards import standard_pagination_row
 from database import Topic, User, async_session_maker
 from followups import (
     FollowupCampaign,
@@ -55,6 +57,8 @@ class FollowupAdminStates(StatesGroup):
 # ---------------------------------------------------------------------------
 
 @router.callback_query(F.data.in_({"admin_followup_list", "admin_fu_list"}))
+@router.callback_query(F.data.startswith("admin_followup_list_"))
+@router.callback_query(F.data.startswith("admin_fu_list_"))
 async def admin_followup_list(callback: CallbackQuery, state: FSMContext | None = None):
     """Lists all follow-up campaigns with status and quick controls."""
     if not await _is_admin(callback.from_user.id):
@@ -63,10 +67,21 @@ async def admin_followup_list(callback: CallbackQuery, state: FSMContext | None 
     if state is not None:
         await state.clear()
 
+    try:
+        page = int(callback.data.rsplit("_", 1)[1]) if callback.data.rsplit("_", 1)[-1].isdigit() else 0
+    except ValueError:
+        page = 0
+    page_size = 10
     async with async_session_maker() as session:
+        base_query = select(FollowupCampaign).order_by(FollowupCampaign.id)
+        total = await session.scalar(select(func.count()).select_from(base_query.subquery())) or 0
+        total_pages = max(1, math.ceil(total / page_size)) if total else 1
+        page = max(0, min(page, total_pages - 1))
         campaigns = (
             await session.execute(
-                select(FollowupCampaign).options(selectinload(FollowupCampaign.steps)).order_by(FollowupCampaign.id)
+                base_query.options(selectinload(FollowupCampaign.steps))
+                .offset(page * page_size)
+                .limit(page_size)
             )
         ).scalars().all()
 
@@ -74,6 +89,7 @@ async def admin_followup_list(callback: CallbackQuery, state: FSMContext | None 
         text_lines = [
             "💬 <b>Напоминания неактивным</b>\n",
             "Цепочки сообщений для пользователей, которые надолго прервали диалог.\n",
+            f"Страница {page + 1} из {total_pages}.\n",
         ]
 
         if not campaigns:
@@ -88,17 +104,21 @@ async def admin_followup_list(callback: CallbackQuery, state: FSMContext | None 
                 text_lines.append(
                     f"{status_icon} <b>{html.escape(c.name)}</b> ({scope_label}, шагов: {step_count})"
                 )
-                kb.button(
+                kb.row(InlineKeyboardButton(
                     text=f"{status_icon} {c.name}",
                     callback_data=f"admin_fu_campaign_{c.id}",
-                )
+                ))
 
-        kb.adjust(1)
+        kb.row(*standard_pagination_row(
+            page,
+            total_pages,
+            lambda target: f"admin_fu_list_{target}",
+        ))
         kb.row(
             InlineKeyboardButton(text="➕ Новая цепочка", callback_data="admin_fu_add")
         )
         kb.row(
-            InlineKeyboardButton(text="⬅️ Назад в админку", callback_data="admin_panel")
+            InlineKeyboardButton(text="⬅️ В раздел автоматизаций", callback_data="admin_section_automation")
         )
 
         text = "\n".join(text_lines)

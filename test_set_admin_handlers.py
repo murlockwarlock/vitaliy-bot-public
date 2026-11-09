@@ -4,6 +4,7 @@ import html
 import io
 import json
 import logging
+import math
 import re
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramBadRequest
@@ -15,6 +16,7 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 
 from admin_roles import AdminPermission, user_has_permission
+from keyboards import standard_pagination_row
 from database import (
     TestAttempt,
     TestQuestion,
@@ -164,6 +166,7 @@ def _question_edit_payload(raw_text: str, question: TestQuestion) -> dict:
 
 
 @router.callback_query(F.data == "admin_test_sets_list")
+@router.callback_query(F.data.startswith("admin_test_sets_list_"))
 async def list_test_sets(callback: CallbackQuery, state: FSMContext | None = None):
     if not await _is_admin(_extract_user_id(callback)):
         await callback.answer("Доступ запрещен.", show_alert=True)
@@ -171,9 +174,18 @@ async def list_test_sets(callback: CallbackQuery, state: FSMContext | None = Non
     if state:
         await state.clear()
 
+    try:
+        page = int(callback.data.rsplit("_", 1)[1]) if callback.data.startswith("admin_test_sets_list_") else 0
+    except ValueError:
+        page = 0
+    page_size = 10
     async with async_session_maker() as session:
+        base_query = select(TestSet).where(TestSet.is_archived == False).order_by(TestSet.id.asc())
+        total = await session.scalar(select(func.count()).select_from(base_query.subquery())) or 0
+        total_pages = max(1, math.ceil(total / page_size)) if total else 1
+        page = max(0, min(page, total_pages - 1))
         test_sets = (await session.execute(
-            select(TestSet).where(TestSet.is_archived == False).order_by(TestSet.id.asc())
+            base_query.offset(page * page_size).limit(page_size)
         )).scalars().all()
 
         builder = InlineKeyboardBuilder()
@@ -182,16 +194,20 @@ async def list_test_sets(callback: CallbackQuery, state: FSMContext | None = Non
                 select(func.count(TestQuestion.id)).where(TestQuestion.test_set_id == ts.id)
             )).scalar() or 0
             status_badge = "🟢" if ts.is_enabled else "🔴"
-            builder.button(
+            builder.row(InlineKeyboardButton(
                 text=f"{status_badge} {ts.title} ({q_count} вопр.)",
                 callback_data=f"edit_testset_{ts.id}",
-            )
+            ))
 
-        builder.button(text="➕ Создать новый набор", callback_data="testset_create_new")
-        builder.button(text="⬅️ В админ-панель", callback_data="admin_panel")
-        builder.adjust(1)
+        builder.row(*standard_pagination_row(
+            page,
+            total_pages,
+            lambda target: f"admin_test_sets_list_{target}",
+        ))
+        builder.row(InlineKeyboardButton(text="➕ Создать новый набор", callback_data="testset_create_new"))
+        builder.row(InlineKeyboardButton(text="⬅️ В контент и программы", callback_data="admin_section_content"))
 
-    text = "🧪 <b>Управление наборами тестов</b>\n\nВыберите набор для настройки или создайте новый:"
+    text = f"🧪 <b>Управление наборами тестов</b>\n\nСтраница {page + 1} из {total_pages}. Выберите набор или создайте новый:"
     try:
         await callback.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode="HTML")
     except TelegramBadRequest:
@@ -669,7 +685,10 @@ async def view_test_set_questions(callback: CallbackQuery, state: FSMContext | N
         type_label = _question_type_label(get_question_type(q))
         status = "" if q.is_active else " ⏸"
         lines.append(f"{q.order_num}. {html.escape(q.text[:80])} [{type_label}, {len(opts)} вар.]{status}")
-        builder.button(text=f"✏️ {q.order_num}. {q.text[:35]}", callback_data=f"ts_q_edit_{ts_id}_{q.id}")
+        builder.row(InlineKeyboardButton(
+            text=f"✏️ {q.order_num}. {q.text[:35]}",
+            callback_data=f"ts_q_edit_{ts_id}_{q.id}",
+        ))
         builder.row(
             InlineKeyboardButton(text="⬆️", callback_data=f"ts_q_up_{ts_id}_{q.id}"),
             InlineKeyboardButton(text="⬇️", callback_data=f"ts_q_down_{ts_id}_{q.id}"),
@@ -678,7 +697,7 @@ async def view_test_set_questions(callback: CallbackQuery, state: FSMContext | N
     if len(questions) > 30:
         lines.append(f"\n<i>... и еще {len(questions) - 30} вопросов</i>")
 
-    builder.button(text="⬅️ Назад", callback_data=f"edit_testset_{ts_id}")
+    builder.row(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"edit_testset_{ts_id}"))
     await callback.message.edit_text("\n".join(lines), reply_markup=builder.as_markup(), parse_mode="HTML")
     await callback.answer()
 

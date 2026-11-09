@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import html
 import hashlib
 import hmac
@@ -57,7 +58,7 @@ from database import async_session_maker, User, Topic, Content, Message as DBMes
     UserSubscription, PromoCode, ProdamusPayment, TrialUsageHistory, get_all_admin_ids, \
     PaymentIntent, ReferralPaymentLog, AiDisclaimerClaim, TopicDialogueConfig, PendingAiFlow, SessionSummary, SummaryClaim, \
     UserTopicSession, PreTestClaim, TopicPrerecordedDelivery, TestSession, TestAttempt, MenuSection, MenuButton, \
-    sync_book_menu_buttons
+    AdminNavigationContext, sync_book_menu_buttons
 import keyboards as kb
 from menu_service import classify_menu_action, is_menu_section_enabled, validate_menu_url
 from ai_dialogue_service import (
@@ -122,9 +123,316 @@ payments_logger = get_logger("payments")
 vector_logger = get_logger("vector")
 
 
-async def _clear_admin_navigation_state(state: FSMContext | None) -> None:
-    if state is not None:
-        await state.clear()
+_ADMIN_PAYMENT_MAIN_CALLBACK = "admin_payment_settings"
+_ADMIN_PAYMENT_SETTINGS_CALLBACK = "admin_prodamus_settings"
+_ADMIN_PAYMENT_RETURN_CALLBACKS = {
+    _ADMIN_PAYMENT_MAIN_CALLBACK,
+    _ADMIN_PAYMENT_SETTINGS_CALLBACK,
+}
+
+
+def _normalize_admin_payment_return(value: str | None, fallback: str = _ADMIN_PAYMENT_MAIN_CALLBACK) -> str:
+    if value == "admin_subscriptions":
+        return _ADMIN_PAYMENT_MAIN_CALLBACK
+    if value in _ADMIN_PAYMENT_RETURN_CALLBACKS:
+        return value
+    return fallback
+
+
+def _admin_payment_action_source(data: str | None, fallback: str = _ADMIN_PAYMENT_MAIN_CALLBACK) -> str:
+    if not isinstance(data, str) or "__" not in data:
+        return fallback
+    return _normalize_admin_payment_return(data.rsplit("__", 1)[1], fallback)
+
+
+def _admin_payment_action_callback(action: str, source: str = _ADMIN_PAYMENT_SETTINGS_CALLBACK) -> str:
+    normalized_source = _normalize_admin_payment_return(source, _ADMIN_PAYMENT_SETTINGS_CALLBACK)
+    return action if normalized_source == _ADMIN_PAYMENT_MAIN_CALLBACK else f"{action}__{normalized_source}"
+
+
+def _admin_payment_settings_parent(value: str | None) -> str:
+    current_screen = _normalize_admin_payment_return(value, _ADMIN_PAYMENT_MAIN_CALLBACK)
+    if current_screen == _ADMIN_PAYMENT_SETTINGS_CALLBACK:
+        return _ADMIN_PAYMENT_MAIN_CALLBACK
+    return current_screen
+
+
+def _normalize_admin_payment_resume(
+    value: str | None,
+    fallback_source: str = _ADMIN_PAYMENT_MAIN_CALLBACK,
+) -> str | None:
+    if not isinstance(value, str):
+        return None
+    base_value = value.split("__", 1)[0]
+    if base_value in {"admin_prodamus_keys_from_root", "admin_prodamus_keys_from_settings"}:
+        return base_value
+    if base_value in {"admin_pay_prices", "admin_webhook_settings", "admin_pay_mode"}:
+        source = _admin_payment_action_source(value, fallback_source)
+        return _admin_payment_action_callback(base_value, source)
+    provider_match = re.fullmatch(r"admin_pay_providers(?:_(\d+))?", base_value)
+    if provider_match:
+        page = provider_match.group(1) or "0"
+        source = _admin_payment_action_source(value, fallback_source)
+        return _admin_payment_action_callback(f"admin_pay_providers_{page}", source)
+    return None
+
+
+async def _admin_payment_state_return(state: FSMContext | None, fallback: str = _ADMIN_PAYMENT_MAIN_CALLBACK) -> str:
+    if state is None:
+        return fallback
+    data = await state.get_data()
+    return _normalize_admin_payment_return(data.get("admin_payment_return_callback"), fallback)
+
+
+async def _admin_payment_state_resume(
+    state: FSMContext | None,
+    fallback_source: str = _ADMIN_PAYMENT_MAIN_CALLBACK,
+) -> str | None:
+    if state is None:
+        return None
+    data = await state.get_data()
+    return _normalize_admin_payment_resume(data.get("admin_payment_resume_callback"), fallback_source)
+
+
+async def _render_admin_payment_return(event, state: FSMContext | None, return_callback: str) -> None:
+    target = _normalize_admin_payment_return(return_callback)
+    if target == _ADMIN_PAYMENT_SETTINGS_CALLBACK:
+        await admin_prodamus_settings(event, state=state)
+    else:
+        await admin_payment_settings(event, state=state)
+
+
+async def _render_admin_payment_resume(
+    event,
+    state: FSMContext | None,
+    resume_callback: str | None,
+    fallback_source: str = _ADMIN_PAYMENT_MAIN_CALLBACK,
+) -> None:
+    target = _normalize_admin_payment_resume(resume_callback, fallback_source)
+    if target is None:
+        await _render_admin_payment_return(event, state, fallback_source)
+        return
+    base_target = target.split("__", 1)[0]
+    if base_target.startswith("admin_pay_providers"):
+        page_match = re.fullmatch(r"admin_pay_providers_(\d+)", base_target)
+        page = int(page_match.group(1)) if page_match else 0
+        await admin_pay_providers(event, state=state, requested_page=page)
+        return
+    if base_target == "admin_pay_prices":
+        await admin_pay_prices(event, state=state)
+        return
+    if base_target == "admin_webhook_settings":
+        await admin_webhook_settings(event, state=state)
+        return
+    if base_target == "admin_pay_mode":
+        await admin_pay_mode(event, state=state)
+        return
+    if base_target.startswith("admin_prodamus_keys_from_"):
+        if isinstance(event, CallbackQuery):
+            await admin_prodamus_keys(
+                event.model_copy(update={"data": base_target}),
+                state=state,
+            )
+        else:
+            target = (
+                _ADMIN_PAYMENT_SETTINGS_CALLBACK
+                if base_target.endswith("_settings")
+                else _ADMIN_PAYMENT_MAIN_CALLBACK
+            )
+            await _render_admin_payment_return(event, state, target)
+        return
+    await _render_admin_payment_return(event, state, fallback_source)
+
+
+async def _clear_admin_navigation_state(
+    state: FSMContext | None,
+    *,
+    preserve_client_context: bool = False,
+) -> None:
+    if state is None:
+        return
+    preserved = {}
+    if preserve_client_context:
+        data = await state.get_data()
+        for key in (
+            "admin_client_return_callback",
+            "admin_client_parent_callback",
+            "client_search_query",
+            "admin_client_search_reset_callback",
+            "admin_client_search_reset_query",
+            "admin_client_navigation_token",
+        ):
+            if key in data:
+                preserved[key] = data[key]
+    await state.clear()
+    if preserved:
+        await state.update_data(**preserved)
+
+
+def _admin_client_return_callback(value: str | None) -> str | None:
+    if not isinstance(value, str):
+        return None
+    if re.fullmatch(r"admin_clients_list_\d+", value):
+        return value
+    if re.fullmatch(r"admin_funnel_landings_(?:all|opened|form_submitted|paid|failed)_\d+", value):
+        return value
+    compact_match = re.fullmatch(r"landing_(all|opened|form|paid|failed)_(\d+)", value)
+    if compact_match:
+        status_code, page = compact_match.groups()
+        status_filter = {
+            "all": "all",
+            "opened": "opened",
+            "form": "form_submitted",
+            "paid": "paid",
+            "failed": "failed",
+        }[status_code]
+        return f"admin_funnel_landings_{status_filter}_{page}"
+    return None
+
+
+def _admin_client_parent_callback(value: str | None) -> str:
+    if value == "admin_section_clients":
+        return "admin_panel"
+    if value == "admin_panel":
+        return value
+    return _admin_client_return_callback(value) or "admin_panel"
+
+
+def _admin_client_action_context(value: str | None) -> str | None:
+    if not isinstance(value, str) or ":" not in value:
+        return None
+    context_value = value.rsplit(":", 1)[1]
+    return context_value if _admin_client_context_token(context_value) else None
+
+
+def _admin_client_action_suffix(value: str | None) -> str:
+    context_value = _admin_client_action_context(value)
+    return f":{context_value}" if context_value else ""
+
+
+def _admin_client_action_user_id(value: str, prefix: str) -> int:
+    return int(value.removeprefix(prefix).split(":", 1)[0])
+
+
+def _callback_with_data(callback, data: str):
+    if isinstance(callback, CallbackQuery):
+        return callback.model_copy(update={"data": data})
+    clone = copy.copy(callback)
+    clone.data = data
+    return clone
+
+
+_ADMIN_CLIENT_CONTEXT_PREFIX = "clientctx_"
+_ADMIN_CLIENT_CONTEXT_RE = re.compile(r"^clientctx_([0-9a-f]{16})$")
+_ADMIN_CLIENT_LIST_RE = re.compile(
+    r"^admin_clients_list_(\d+)(?::(clientctx_[0-9a-f]{16}))?$"
+)
+_ADMIN_CLIENT_CONTEXT_TTL = timedelta(hours=24)
+
+
+def _admin_client_context_token(value: str | None) -> str | None:
+    if not isinstance(value, str):
+        return None
+    match = _ADMIN_CLIENT_CONTEXT_RE.fullmatch(value)
+    return match.group(1) if match else None
+
+
+def _parse_admin_client_list_callback(value: str | None) -> tuple[int, str | None] | None:
+    if not isinstance(value, str):
+        return None
+    match = _ADMIN_CLIENT_LIST_RE.fullmatch(value)
+    if not match:
+        return None
+    return int(match.group(1)), match.group(2)
+
+
+def _admin_client_list_callback(page: int, context_value: str | None = None) -> str:
+    suffix = f":{context_value}" if _admin_client_context_token(context_value) else ""
+    return f"admin_clients_list_{page}{suffix}"
+
+
+def _callback_chat_id(callback: CallbackQuery) -> int | None:
+    return getattr(getattr(callback.message, "chat", None), "id", None)
+
+
+def _callback_message_id(callback: CallbackQuery) -> int | None:
+    return getattr(callback.message, "message_id", None)
+
+
+async def _create_admin_client_context(
+    callback: CallbackQuery,
+    *,
+    return_callback: str,
+    search_query: str | None,
+    reset_callback: str,
+    reset_query: str | None,
+    parent_callback: str = "admin_panel",
+) -> str:
+    token = secrets.token_hex(8)
+    async with async_session_maker() as session:
+        await session.execute(
+            delete(AdminNavigationContext).where(
+                AdminNavigationContext.admin_id == callback.from_user.id,
+                AdminNavigationContext.created_at < datetime.utcnow() - _ADMIN_CLIENT_CONTEXT_TTL,
+            )
+        )
+        session.add(
+            AdminNavigationContext(
+                token=token,
+                admin_id=callback.from_user.id,
+                chat_id=_callback_chat_id(callback) or 0,
+                message_id=_callback_message_id(callback) or 0,
+                return_callback=return_callback,
+                parent_callback=_admin_client_parent_callback(parent_callback),
+                search_query=search_query or None,
+                reset_callback=reset_callback,
+                reset_query=reset_query or None,
+            )
+        )
+        await session.commit()
+    return f"{_ADMIN_CLIENT_CONTEXT_PREFIX}{token}"
+
+
+async def _load_admin_client_context(
+    callback: CallbackQuery,
+    context_value: str | None,
+) -> AdminNavigationContext | None:
+    token = _admin_client_context_token(context_value)
+    if not token:
+        return None
+    async with async_session_maker() as session:
+        context = await session.get(AdminNavigationContext, token)
+    if context is None:
+        return None
+    if context.admin_id != callback.from_user.id:
+        return None
+    if context.chat_id != (_callback_chat_id(callback) or 0):
+        return None
+    if context.message_id != (_callback_message_id(callback) or 0):
+        return None
+    return context
+
+
+async def _bind_admin_client_context_message(
+    context_value: str,
+    callback: CallbackQuery,
+    rendered_message,
+) -> None:
+    token = _admin_client_context_token(context_value)
+    message_id = getattr(rendered_message, "message_id", None)
+    chat_id = getattr(getattr(rendered_message, "chat", None), "id", None)
+    if not token or not isinstance(message_id, int):
+        return
+    chat_id = chat_id if isinstance(chat_id, int) else _callback_chat_id(callback)
+    if not isinstance(chat_id, int):
+        return
+    async with async_session_maker() as session:
+        context = await session.get(AdminNavigationContext, token)
+        if context is None or context.admin_id != callback.from_user.id:
+            return
+        context.chat_id = chat_id
+        context.message_id = message_id
+        await session.commit()
 
 
 def _admin_confirmation_markup(confirm_callback: str, cancel_callback: str):
@@ -584,7 +892,7 @@ def admin_logs_keyboard():
     builder = InlineKeyboardBuilder()
     for key, (label, _) in LOG_FILES.items():
         builder.button(text=label, callback_data=f"admin_log_view_{key}")
-    builder.button(text="⬅️ Назад", callback_data="admin_panel")
+    builder.button(text="⬅️ Назад", callback_data="admin_section_logs")
     builder.adjust(1)
     return builder.as_markup()
 
@@ -1819,7 +2127,13 @@ async def back_to_extended_menu(callback: CallbackQuery):
 
 
 @router.callback_query(F.data.in_(["back_to_main_menu_text", "back_to_main_menu"]))
-async def back_to_main(callback: CallbackQuery, bot: Bot):
+async def back_to_main(
+    callback: CallbackQuery,
+    bot: Bot,
+    state: FSMContext | None = None,
+):
+    if state is not None:
+        await state.clear()
     await touch_user_activity(callback.from_user.id)
     try:
         await callback.answer()
@@ -3662,6 +3976,59 @@ async def admin_panel_cb(callback: CallbackQuery, state: FSMContext | None = Non
     await callback.answer()
 
 
+@router.callback_query(F.data.startswith("admin_section_"))
+async def admin_section_menu(callback: CallbackQuery, state: FSMContext | None = None):
+    section_key = callback.data.removeprefix("admin_section_")
+    if section_key == "clients":
+        if not await require_permission(callback, AdminPermission.CLIENTS, state=state):
+            return
+        await admin_clients_list(callback, state, parent_callback="admin_panel")
+        return
+    if section_key == "admins":
+        if not await require_permission(callback, AdminPermission.ADMIN_MANAGEMENT, state=state):
+            return
+        await admin_manage_admins(callback, state)
+        return
+    if section_key == "payments":
+        if not await require_permission(callback, AdminPermission.PAYMENTS, state=state):
+            return
+        await admin_payment_settings(callback, state)
+        return
+    section_config = {
+        "ai": (
+            "🤖 <b>ИИ и знания</b>\n\nНастройки ИИ, провайдеры, модели, темы диалогов и база знаний.",
+            kb.admin_ai_section_keyboard,
+            AdminPermission.CONTENT,
+        ),
+        "content": (
+            "✏️ <b>Контент и программы</b>\n\nТексты, медиа, воронка, привычки, дневник и тестовые программы.",
+            kb.admin_content_section_keyboard,
+            AdminPermission.CONTENT,
+        ),
+        "automation": (
+            "⚙️ <b>Автоматизации</b>\n\nСценарии, напоминания и рассылки, которые бот выполняет сам.",
+            kb.admin_automation_section_keyboard,
+            AdminPermission.SYSTEM,
+        ),
+        "logs": (
+            "📋 <b>Логи</b>\n\nОбщие логи и запросы к ИИ.",
+            kb.admin_logs_section_keyboard,
+            AdminPermission.SYSTEM,
+        ),
+    }
+    config = section_config.get(section_key)
+    if config is None:
+        await callback.answer("Раздел не найден.", show_alert=True)
+        return
+    text, keyboard_factory, permission = config
+    if not await require_permission(callback, permission, state=state):
+        return
+    await _clear_admin_navigation_state(state)
+    role = await get_admin_role(callback.from_user.id)
+    await send_smart_content(callback, text, None, keyboard_factory(role))
+    await callback.answer()
+
+
 @router.message(Command("help"))
 async def cmd_help(message: Message):
     if not await require_permission(message, AdminPermission.SYSTEM):
@@ -3952,7 +4319,7 @@ async def admin_content_list(event, state: FSMContext | None = None):
     builder.button(text="📂 Доп. разделы (Академия и др.)", callback_data="admin_cat_extra")
     builder.button(text="📂 AI Диагностика", callback_data="admin_cat_ai")
 
-    builder.button(text="⬅️ Назад", callback_data="admin_panel")
+    builder.button(text="⬅️ Назад", callback_data="admin_section_content")
     builder.adjust(1)
 
     await send_smart_content(
@@ -4665,6 +5032,7 @@ _CONTENT_EDITOR_ALLOWED_BACK = {
     "admin_content_list",
     "admin_manage_buttons",
     "admin_payment_settings",
+    "admin_prodamus_settings",
     "admin_reminders_settings",
 }
 
@@ -4694,7 +5062,18 @@ async def _return_from_content_editor(
         await admin_reminders_settings(event, state=state)
         return
     if callback_data == "admin_payment_settings":
-        await admin_payment_settings(event, state=state)
+        role = await get_admin_role(getattr(event.from_user, "id", None))
+        if role_has_permission(role, AdminPermission.PAYMENTS):
+            await admin_payment_settings(event, state=state)
+        else:
+            await admin_content_list(event, state=state)
+        return
+    if callback_data == "admin_prodamus_settings":
+        role = await get_admin_role(getattr(event.from_user, "id", None))
+        if role_has_permission(role, AdminPermission.PAYMENTS):
+            await admin_prodamus_settings(event, state=state)
+        else:
+            await admin_content_list(event, state=state)
         return
     if callback_data == "admin_content_list":
         await admin_content_list(event, state=state)
@@ -4742,18 +5121,14 @@ async def admin_content_category(callback: CallbackQuery, state: FSMContext | No
     page_items = items[page * page_size:(page + 1) * page_size]
 
     for key, name in page_items:
-        builder.button(text=f"✏️ {name}", callback_data=f"edit_cont_{category}:{key}")
+        builder.row(InlineKeyboardButton(text=f"✏️ {name}", callback_data=f"edit_cont_{category}:{key}"))
 
-    if total_pages > 1:
-        prev_page = page - 1 if page > 0 else total_pages - 1
-        next_page = page + 1 if page < total_pages - 1 else 0
-        builder.row(
-            InlineKeyboardButton(text="⬅️", callback_data=f"admin_cat_{category}_page_{prev_page}"),
-            InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="ignore"),
-            InlineKeyboardButton(text="➡️", callback_data=f"admin_cat_{category}_page_{next_page}")
-        )
-    builder.button(text="⬅️ Назад к категориям", callback_data="admin_content_list")
-    builder.adjust(1)
+    builder.row(*kb.standard_pagination_row(
+        page,
+        total_pages,
+        lambda target: f"admin_cat_{category}_page_{target}",
+    ))
+    builder.row(InlineKeyboardButton(text="⬅️ Назад к категориям", callback_data="admin_content_list"))
 
     category_names = {
         "main": "Главное меню / Старт",
@@ -4782,14 +5157,17 @@ async def edit_content_start(callback: CallbackQuery, state: FSMContext):
         await callback.answer("⛔️ Доступ запрещён.", show_alert=True)
         return
     data_str = callback.data.split("edit_cont_")[1]
+    source_callback = None
+    if "__" in data_str:
+        data_str, source_callback = data_str.rsplit("__", 1)
     state_data = await state.get_data()
 
     if ":" in data_str:
         category, key, *return_parts = data_str.split(":", 2)
-        return_callback = return_parts[0] if return_parts else None
+        return_callback = return_parts[0] if return_parts else source_callback
     else:
         category, key = "main", data_str
-        return_callback = None
+        return_callback = source_callback
     if not return_callback:
         return_callback = state_data.get("return_callback")
 
@@ -4867,10 +5245,13 @@ async def _execute_content_media_delete(callback: CallbackQuery, state: FSMConte
         await session.commit()
     invalidate_content_cache(key)
     await callback.answer("Медиа удалено.")
-    callback.data = f"edit_cont_{category}:{key}"
+    next_callback_data = f"edit_cont_{category}:{key}"
     if return_callback:
-        callback.data += f":{return_callback}"
-    await edit_content_start(callback, state)
+        next_callback_data += f":{return_callback}"
+    await edit_content_start(
+        _callback_with_data(callback, next_callback_data),
+        state,
+    )
 
 
 @router.callback_query(F.data.startswith("del_cont_media_"))
@@ -5101,9 +5482,18 @@ def topic_admin_button_text(topic, section: str) -> str:
 
 @router.callback_query(F.data == "admin_topics_list")
 @router.callback_query(F.data.startswith("admin_topics_list_"))
-@router.callback_query(F.data == "admin_topics_page_0")
+@router.callback_query(F.data.startswith("admin_topics_page_"))
 async def admin_topics_list(event, state: FSMContext | None = None):
     await _clear_admin_navigation_state(state)
+    raw_page = str(getattr(event, "data", "") or "")
+    try:
+        page = (
+            int(raw_page.rsplit("_", 1)[1])
+            if raw_page.startswith(("admin_topics_list_", "admin_topics_page_"))
+            else 0
+        )
+    except ValueError:
+        page = 0
     async with async_session_maker() as session:
         topics = await session.execute(
             select(Topic).order_by(Topic.id.asc())
@@ -5111,26 +5501,38 @@ async def admin_topics_list(event, state: FSMContext | None = None):
         topics = topics.scalars().all()
 
     grouped = group_topics_for_admin(topics)
+    ordered_topics = [
+        (section, topic)
+        for section, _ in TOPIC_ADMIN_SECTION_ORDER
+        for topic in grouped[section]
+    ]
+    page_size = 10
+    total_pages = max(1, (len(ordered_topics) + page_size - 1) // page_size)
+    page = max(0, min(page, total_pages - 1))
+    page_topics = ordered_topics[page * page_size:(page + 1) * page_size]
     builder = kb.InlineKeyboardBuilder()
     text_lines = [
         "💬 <b>Темы диалогов</b>",
         "",
-        "Выбери раздел для настройки:",
+        f"Страница {page + 1} из {total_pages}. Выберите тему для настройки:",
     ]
-    for section, section_label in TOPIC_ADMIN_SECTION_ORDER:
-        section_topics = grouped[section]
-        if not section_topics:
-            continue
-        text_lines.extend(["", f"<b>{html.escape(section_label)}</b>"])
-        builder.row(InlineKeyboardButton(text=f"━━ {section_label} ━━", callback_data="ignore"))
-        for topic in section_topics:
-            text_lines.append(f"• {html.escape(topic.name)}")
-            builder.button(
-                text=topic_admin_button_text(topic, section),
-                callback_data=f"edit_topic_{topic.slug}",
-            )
-    builder.button(text="⬅️ Назад", callback_data="admin_panel")
-    builder.adjust(1)
+    current_section = None
+    for section, topic in page_topics:
+        if section != current_section:
+            label = dict(TOPIC_ADMIN_SECTION_ORDER).get(section, section)
+            text_lines.extend(["", f"<b>{html.escape(label)}</b>"])
+            current_section = section
+        text_lines.append(f"• {html.escape(topic.name)}")
+        builder.row(InlineKeyboardButton(
+            text=topic_admin_button_text(topic, section),
+            callback_data=f"edit_topic_{topic.slug}",
+        ))
+    builder.row(*kb.standard_pagination_row(
+        page,
+        total_pages,
+        lambda target: f"admin_topics_list_{target}",
+    ))
+    builder.row(InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_section_ai"))
 
     await send_smart_content(event, "\n".join(text_lines), None, builder.as_markup())
 
@@ -5242,9 +5644,7 @@ async def toggle_topic_paid(callback: CallbackQuery):
             topic.is_paid = not topic.is_paid
             await session.commit()
     await callback.answer("Обновлено")
-    # Подменяем data чтобы edit_topic_menu корректно извлёк slug
-    callback.data = f"edit_topic_{slug}"
-    await edit_topic_menu(callback)
+    await edit_topic_menu(_callback_with_data(callback, f"edit_topic_{slug}"))
 
 
 @router.callback_query(F.data.startswith("attach_kb_"))
@@ -5274,18 +5674,14 @@ async def attach_kb_list(callback: CallbackQuery):
     builder = InlineKeyboardBuilder()
     for f in files:
         icon = "✅" if f.id in attached_ids else "⭕️"
-        builder.button(text=f"{icon} {f.filename}", callback_data=f"toggle_kb_{slug}_{f.id}")
+        builder.row(InlineKeyboardButton(text=f"{icon} {f.filename}", callback_data=f"toggle_kb_{slug}_{f.id}"))
 
-    if total_pages > 1:
-        prev_page = page - 1 if page > 0 else total_pages - 1
-        next_page = page + 1 if page < total_pages - 1 else 0
-        builder.row(
-            InlineKeyboardButton(text="⬅️", callback_data=f"attach_kb_{slug}_page_{prev_page}"),
-            InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="ignore"),
-            InlineKeyboardButton(text="➡️", callback_data=f"attach_kb_{slug}_page_{next_page}")
-        )
-    builder.button(text="⬅️ Назад", callback_data=f"edit_topic_{slug}")
-    builder.adjust(1)
+    builder.row(*kb.standard_pagination_row(
+        page,
+        total_pages,
+        lambda target: f"attach_kb_{slug}_page_{target}",
+    ))
+    builder.row(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"edit_topic_{slug}"))
 
     text = (
         f"📎 <b>Управление знаниями для: {topic_name}</b>\n\n"
@@ -5332,7 +5728,7 @@ async def mailing_start(callback: CallbackQuery, state: FSMContext):
 
     msg = await callback.message.answer(
         "📣 <b>Создание рассылки</b>\n\nПришлите сообщение (текст, фото или видео), которое хотите отправить пользователям:",
-        reply_markup=kb.back_to_admin(), parse_mode='HTML')
+        reply_markup=kb.back_to_previous_menu("admin_section_automation"), parse_mode='HTML')
     await state.update_data(last_msg_id=msg.message_id)
     try:
         await callback.message.delete()
@@ -5617,9 +6013,10 @@ async def mail_send_final(callback: CallbackQuery, state: FSMContext, bot: Bot):
             self.from_user = msg.from_user
             self.bot = msg.bot
             self.chat = msg.chat
+            self.answer = callback.answer
 
-    fake_cb = FakeUpdate(callback.message, "admin_panel")
-    await admin_panel_cb(fake_cb)
+    fake_cb = FakeUpdate(callback.message, "admin_section_automation")
+    await admin_section_menu(fake_cb)
 
 
 @router.callback_query(F.data == "mail_set_audience")
@@ -6166,31 +6563,24 @@ async def admin_kb_list(event, state: FSMContext | None = None):
         page = 0
 
     page_size = 10
-    offset = page * page_size
-
     async with async_session_maker() as session:
-        files = await session.execute(select(KnowledgeBase).limit(page_size).offset(offset).order_by(KnowledgeBase.id.desc()))
-        files = files.scalars().all()
         total = await session.scalar(select(func.count(KnowledgeBase.id))) or 0
     total_pages = max(1, math.ceil(total / page_size)) if total else 1
     page = max(0, min(page, total_pages - 1))
 
+    async with async_session_maker() as session:
+        files = await session.execute(
+            select(KnowledgeBase).limit(page_size).offset(page * page_size).order_by(KnowledgeBase.id.desc())
+        )
+        files = files.scalars().all()
+
     builder = kb.InlineKeyboardBuilder()
     for f in files:
-        builder.button(text=f"🗑 {f.filename}", callback_data=f"confirm_del_kb_{f.id}_{page}")
+        builder.row(kb.InlineKeyboardButton(text=f"🗑 {f.filename}", callback_data=f"confirm_del_kb_{f.id}_{page}"))
 
-    nav_btns = []
-    if total_pages > 1:
-        prev_page = page - 1 if page > 0 else total_pages - 1
-        next_page = page + 1 if page < total_pages - 1 else 0
-        nav_btns.append(kb.InlineKeyboardButton(text="⬅️", callback_data=f"admin_kb_page_{prev_page}"))
-        nav_btns.append(kb.InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="ignore"))
-        nav_btns.append(kb.InlineKeyboardButton(text="➡️", callback_data=f"admin_kb_page_{next_page}"))
-
-    builder.row(*nav_btns)
-    builder.button(text="➕ Загрузить файл", callback_data="upload_kb_start")
-    builder.button(text="⬅️ В админку", callback_data="admin_panel")
-    builder.adjust(1, 2 if nav_btns else 1, 1, 1)
+    builder.row(*kb.standard_pagination_row(page, total_pages, lambda target: f"admin_kb_page_{target}"))
+    builder.row(kb.InlineKeyboardButton(text="➕ Загрузить файл", callback_data="upload_kb_start"))
+    builder.row(kb.InlineKeyboardButton(text="⬅️ В раздел ИИ и знаний", callback_data="admin_section_ai"))
 
     await send_smart_content(event, f"📚 База знаний ({total} файлов):", None, builder.as_markup())
 
@@ -6532,6 +6922,7 @@ async def save_ref_bonus_days(message: Message, state: FSMContext, bot: Bot):
 
 
 
+@router.callback_query(F.data == "admin_section_admins")
 @router.callback_query(F.data == "admin_manage_admins")
 @router.callback_query(F.data.startswith("admin_manage_admins_"))
 async def admin_manage_admins(event, state: FSMContext | None = None):
@@ -6574,23 +6965,24 @@ async def admin_manage_admins(event, state: FSMContext | None = None):
         text += f"- {name_link} {username_text} <code>{a.id}</code>: {html.escape(role_label(current_role))}\n"
 
         if a.id not in OWNER_IDS and a.id != event.from_user.id:
-            builder.button(text=f"🎭 Изменить роль: {first_name_display}", callback_data=f"admin_role_edit_{a.id}")
-            builder.button(
+            builder.row(
+                InlineKeyboardButton(
+                    text=f"🎭 Изменить роль: {first_name_display}",
+                    callback_data=f"admin_role_edit_{a.id}",
+                )
+            )
+            builder.row(InlineKeyboardButton(
                 text=f"🗑 Удалить: {first_name_display}",
                 callback_data=f"confirm_del_admin_{a.id}",
-            )
+            ))
 
-    if total_pages > 1:
-        prev_page = page - 1 if page > 0 else total_pages - 1
-        next_page = page + 1 if page < total_pages - 1 else 0
-        builder.row(
-            InlineKeyboardButton(text="⬅️", callback_data=f"admin_manage_admins_{prev_page}"),
-            InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="ignore"),
-            InlineKeyboardButton(text="➡️", callback_data=f"admin_manage_admins_{next_page}")
-        )
-    builder.button(text="➕ Добавить админа", callback_data="add_admin_start")
-    builder.button(text="⬅️ Назад", callback_data="admin_panel")
-    builder.adjust(1)
+    builder.row(*kb.standard_pagination_row(
+        page,
+        total_pages,
+        lambda target: f"admin_manage_admins_{target}",
+    ))
+    builder.row(InlineKeyboardButton(text="➕ Добавить админа", callback_data="add_admin_start"))
+    builder.row(InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_panel"))
 
     await send_smart_content(event, text, None, builder.as_markup())
 
@@ -7027,19 +7419,15 @@ async def admin_habit_templates(event, state: FSMContext | None = None):
     builder = InlineKeyboardBuilder()
 
     for t in templates:
-        builder.button(text=f"🗑 {t.name}", callback_data=f"confirm_adm_del_tpl_{t.id}")
+        builder.row(InlineKeyboardButton(text=f"🗑 {t.name}", callback_data=f"confirm_adm_del_tpl_{t.id}"))
 
-    if total_pages > 1:
-        prev_page = page - 1 if page > 0 else total_pages - 1
-        next_page = page + 1 if page < total_pages - 1 else 0
-        builder.row(
-            InlineKeyboardButton(text="⬅️", callback_data=f"admin_habit_templates_{prev_page}"),
-            InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="ignore"),
-            InlineKeyboardButton(text="➡️", callback_data=f"admin_habit_templates_{next_page}")
-        )
-    builder.button(text="➕ Добавить шаблон", callback_data="adm_add_tpl_start")
-    builder.button(text="⬅️ Назад", callback_data="admin_habit_settings")
-    builder.adjust(1)
+    builder.row(*kb.standard_pagination_row(
+        page,
+        total_pages,
+        lambda target: f"admin_habit_templates_{target}",
+    ))
+    builder.row(InlineKeyboardButton(text="➕ Добавить шаблон", callback_data="adm_add_tpl_start"))
+    builder.row(InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_habit_settings"))
 
     await send_smart_content(event, text, None, builder.as_markup())
 
@@ -7281,14 +7669,14 @@ async def set_game_msg_save(message: Message, state: FSMContext, bot: Bot):
     await admin_habit_game(message)
 
 
+@router.callback_query(F.data == "admin_section_payments")
 @router.callback_query(F.data == "admin_payment_settings")
-@router.callback_query(F.data == "admin_subscriptions")
 async def admin_payment_settings(event, state: FSMContext | None = None):
-    if hasattr(event, "from_user") and not await is_admin_actor(event.from_user.id):
-        if hasattr(event, "answer"):
-            await event.answer("⛔️ Доступ запрещён.", show_alert=True)
+    if not await require_permission(event, AdminPermission.PAYMENTS, state=state):
         return
     await _clear_admin_navigation_state(state)
+    if state is not None:
+        await state.update_data(admin_payment_stats_return="admin_payment_settings")
     async with async_session_maker() as session:
         conf = await session.get(PaymentConfig, 1)
         mode = conf.mode
@@ -7299,7 +7687,7 @@ async def admin_payment_settings(event, state: FSMContext | None = None):
         "token": "Оплата за сообщения",
     }.get(mode, mode)
     text = (
-        f"⭐️ <b>Подписки</b>\n\n"
+        f"💳 <b>Подписки и оплата</b>\n\n"
         f"Текущий режим: <b>{mode_label}</b>\n\n"
         f"<b>Бесплатный</b> - доступ открыт всем.\n"
         f"<b>По подписке</b> - доступ через тарифы и оплату.\n"
@@ -7309,9 +7697,12 @@ async def admin_payment_settings(event, state: FSMContext | None = None):
     await send_smart_content(event, text, None, kb.admin_payment_keyboard())
 
 
-@router.callback_query(F.data == "admin_pay_mode")
+@router.callback_query(F.data.startswith("admin_pay_mode"))
 async def admin_pay_mode(callback: CallbackQuery, state: FSMContext | None = None):
+    return_callback = _admin_payment_action_source(callback.data)
     await _clear_admin_navigation_state(state)
+    if state is not None:
+        await state.update_data(admin_payment_return_callback=return_callback)
     async with async_session_maker() as session:
         conf = await session.get(PaymentConfig, 1)
     mode_labels = {
@@ -7325,14 +7716,18 @@ async def admin_pay_mode(callback: CallbackQuery, state: FSMContext | None = Non
         f"Сейчас выбран: <b>{mode_labels.get(conf.mode, conf.mode)}</b>.\n"
         "Смена режима влияет на способ доступа пользователей и требует подтверждения.",
         None,
-        kb.admin_pay_mode_keyboard(conf.mode),
+        kb.admin_pay_mode_keyboard(conf.mode, return_callback=return_callback),
     )
 
 
 @router.callback_query(F.data.startswith("confirm_set_pay_mode_"))
 async def confirm_set_pay_mode(callback: CallbackQuery, state: FSMContext | None = None):
+    raw_mode = callback.data.removeprefix("confirm_set_pay_mode_")
+    mode, separator, source = raw_mode.partition("__")
+    return_callback = _normalize_admin_payment_return(source if separator else None)
     await _clear_admin_navigation_state(state)
-    mode = callback.data.removeprefix("confirm_set_pay_mode_")
+    if state is not None:
+        await state.update_data(admin_payment_return_callback=return_callback)
     labels = {"free": "Бесплатный", "subscription": "По подписке", "token": "Оплата за сообщения"}
     if mode not in labels:
         await callback.answer("Режим не найден.", show_alert=True)
@@ -7340,22 +7735,24 @@ async def confirm_set_pay_mode(callback: CallbackQuery, state: FSMContext | None
     await _ask_admin_confirmation(
         callback,
         f"Переключить режим оплаты на «{labels[mode]}»? Это изменит доступ и способ оплаты для пользователей.",
-        f"set_pay_mode_{mode}",
-        "admin_pay_mode",
+        f"set_pay_mode_{mode}__{return_callback}",
+        f"admin_pay_mode__{return_callback}",
     )
 
 
 @router.callback_query(F.data.startswith("set_pay_mode_"))
 async def set_pay_mode(callback: CallbackQuery, state: FSMContext | None = None):
+    raw_mode = callback.data.removeprefix("set_pay_mode_")
+    mode, separator, source = raw_mode.partition("__")
+    return_callback = _normalize_admin_payment_return(source if separator else None)
     await _clear_admin_navigation_state(state)
-    mode = callback.data.split("_")[-1]
     async with async_session_maker() as session:
         conf = await session.get(PaymentConfig, 1)
         conf.mode = mode
         await session.commit()
     labels = {"free": "Бесплатный", "subscription": "По подписке", "token": "Оплата за сообщения"}
     await callback.answer(f"Режим изменён: {labels.get(mode, mode)}")
-    await admin_payment_settings(callback, state=state)
+    await _render_admin_payment_return(callback, state, return_callback)
 
 
 @router.callback_query(F.data == "admin_pay_demo")
@@ -7374,10 +7771,22 @@ async def admin_pay_demo_edit(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "admin_pay_providers")
 @router.callback_query(F.data.startswith("admin_pay_providers_"))
-async def admin_pay_providers(event, state: FSMContext | None = None):
+async def admin_pay_providers(
+    event,
+    state: FSMContext | None = None,
+    requested_page: int | None = None,
+):
+    event_data = getattr(event, "data", None)
+    state_return = await _admin_payment_state_return(state)
+    return_callback = _admin_payment_action_source(event_data, state_return)
+    base_data = event_data.split("__", 1)[0] if isinstance(event_data, str) else event_data
     await _clear_admin_navigation_state(state)
-    if isinstance(event, CallbackQuery) and event.data.startswith("admin_pay_providers_"):
-        page = int(event.data.split("_")[-1])
+    if state is not None:
+        await state.update_data(admin_payment_return_callback=return_callback)
+    if requested_page is not None:
+        page = requested_page
+    elif isinstance(event, CallbackQuery) and isinstance(base_data, str) and base_data.startswith("admin_pay_providers_"):
+        page = int(base_data.removeprefix("admin_pay_providers_") or 0)
     else:
         page = 0
     page_size = 10
@@ -7391,19 +7800,36 @@ async def admin_pay_providers(event, state: FSMContext | None = None):
     builder = InlineKeyboardBuilder()
     for p in providers:
         status = "✅" if p.is_active else "❌"
-        builder.button(text=f"{status} {p.name}", callback_data=f"toggle_prov_{p.id}")
+        builder.row(InlineKeyboardButton(
+            text=f"{status} {p.name}",
+            callback_data=_admin_payment_action_callback(
+                f"toggle_prov_{p.id}_page_{page}",
+                return_callback,
+            ),
+        ))
 
-    if total_pages > 1:
-        prev_page = page - 1 if page > 0 else total_pages - 1
-        next_page = page + 1 if page < total_pages - 1 else 0
-        builder.row(
-            InlineKeyboardButton(text="⬅️", callback_data=f"admin_pay_providers_{prev_page}"),
-            InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="ignore"),
-            InlineKeyboardButton(text="➡️", callback_data=f"admin_pay_providers_{next_page}")
+    builder.row(*kb.standard_pagination_row(
+        page,
+        total_pages,
+        lambda target: _admin_payment_action_callback(f"admin_pay_providers_{target}", return_callback),
+    ))
+    builder.row(InlineKeyboardButton(
+        text="➕ Добавить провайдера",
+        callback_data=_admin_payment_action_callback(
+            f"add_prov_start_page_{page}",
+            return_callback,
+        ),
+    ))
+    builder.row(InlineKeyboardButton(text="⬅️ Назад", callback_data=return_callback))
+
+    if state is not None:
+        await state.update_data(
+            admin_payment_return_callback=return_callback,
+            admin_payment_resume_callback=_admin_payment_action_callback(
+                f"admin_pay_providers_{page}",
+                return_callback,
+            ),
         )
-    builder.button(text="➕ Добавить провайдера", callback_data="add_prov_start")
-    builder.button(text="⬅️ Назад", callback_data="admin_payment_settings")
-    builder.adjust(1)
 
     await send_smart_content(
         event,
@@ -7415,13 +7841,35 @@ async def admin_pay_providers(event, state: FSMContext | None = None):
     )
 
 
-@router.callback_query(F.data == "add_prov_start")
+@router.callback_query(F.data.startswith("add_prov_start"))
 async def add_prov_start(callback: CallbackQuery, state: FSMContext):
+    base_data = callback.data.split("__", 1)[0]
+    page_match = re.fullmatch(r"add_prov_start_page_(\d+)", base_data)
+    requested_page = int(page_match.group(1)) if page_match else 0
+    return_callback = _admin_payment_action_source(
+        callback.data,
+        await _admin_payment_state_return(state, _ADMIN_PAYMENT_MAIN_CALLBACK),
+    )
+    resume_callback = await _admin_payment_state_resume(state, return_callback)
+    if resume_callback is None:
+        resume_action = (
+            f"admin_pay_providers_{requested_page}"
+            if page_match
+            else "admin_pay_providers"
+        )
+        resume_callback = _admin_payment_action_callback(
+            resume_action,
+            return_callback,
+        )
     await state.clear()
     await state.set_state(PaymentStates.add_provider_name)
+    await state.update_data(
+        admin_payment_return_callback=return_callback,
+        admin_payment_resume_callback=resume_callback,
+    )
     await callback.message.answer(
         "Введите название способа оплаты.\nПример: YooKassa.",
-        reply_markup=kb.back_to_previous_menu("admin_pay_providers"),
+        reply_markup=kb.back_to_previous_menu(resume_callback),
     )
     await callback.answer()
 
@@ -7436,7 +7884,13 @@ async def add_prov_name(message: Message, state: FSMContext):
     await state.set_state(PaymentStates.add_provider_token)
     await message.answer(
         "Теперь введите токен оплаты от BotFather для этого способа:",
-        reply_markup=kb.back_to_previous_menu("admin_pay_providers"),
+        reply_markup=kb.back_to_previous_menu(
+            await _admin_payment_state_resume(state)
+            or _admin_payment_action_callback(
+                "admin_pay_providers_0",
+                await _admin_payment_state_return(state),
+            )
+        ),
     )
 
 
@@ -7451,25 +7905,68 @@ async def add_prov_token(message: Message, state: FSMContext, bot: Bot):
         session.add(PaymentProvider(name=data['name'], provider_token=token))
         await session.commit()
 
+    return_callback = await _admin_payment_state_return(state)
+    resume_callback = await _admin_payment_state_resume(state, return_callback)
     await state.clear()
+    await state.update_data(
+        admin_payment_return_callback=return_callback,
+        admin_payment_resume_callback=resume_callback,
+    )
     await message.answer("✅ Провайдер добавлен.")
-    await admin_pay_providers(message)
+    await _render_admin_payment_resume(message, state, resume_callback, return_callback)
 
 
 @router.callback_query(F.data.startswith("toggle_prov_"))
 async def toggle_provider(callback: CallbackQuery, state: FSMContext | None = None):
+    base_data, _, _ = callback.data.partition("__")
+    provider_payload = base_data.removeprefix("toggle_prov_")
+    provider_id_raw, _, page_raw = provider_payload.partition("_page_")
+    try:
+        provider_id = int(provider_id_raw)
+        requested_page = int(page_raw) if page_raw else 0
+    except ValueError:
+        await callback.answer("Способ оплаты не найден.", show_alert=True)
+        return
+    return_callback = await _admin_payment_state_return(
+        state,
+        _admin_payment_action_source(callback.data),
+    )
+    resume_callback = await _admin_payment_state_resume(state, return_callback)
+    if resume_callback is None:
+        resume_callback = _admin_payment_action_callback(
+            f"admin_pay_providers_{requested_page}",
+            return_callback,
+        )
     await _clear_admin_navigation_state(state)
-    pid = int(callback.data.split("_")[-1])
+    return_callback = _admin_payment_action_source(callback.data, return_callback)
     async with async_session_maker() as session:
-        p = await session.get(PaymentProvider, pid)
+        p = await session.get(PaymentProvider, provider_id)
+        if p is None:
+            await callback.answer("Способ оплаты не найден.", show_alert=True)
+            return
         p.is_active = not p.is_active
         await session.commit()
-    await admin_pay_providers(callback, state=state)
+    if state is not None:
+        await state.update_data(
+            admin_payment_return_callback=return_callback,
+            admin_payment_resume_callback=resume_callback,
+        )
+    await _render_admin_payment_resume(callback, state, resume_callback, return_callback)
 
 
-@router.callback_query(F.data == "admin_pay_prices")
+@router.callback_query(F.data.startswith("admin_pay_prices"))
 async def admin_pay_prices(event, state: FSMContext | None = None):
+    state_return = await _admin_payment_state_return(state)
+    return_callback = _admin_payment_action_source(getattr(event, "data", None), state_return)
     await _clear_admin_navigation_state(state)
+    if state is not None:
+        await state.update_data(
+            admin_payment_return_callback=return_callback,
+            admin_payment_resume_callback=_admin_payment_action_callback(
+                "admin_pay_prices",
+                return_callback,
+            ),
+        )
     async with async_session_maker() as session:
         conf = await session.get(PaymentConfig, 1)
 
@@ -7481,8 +7978,11 @@ async def admin_pay_prices(event, state: FSMContext | None = None):
     )
 
     builder = InlineKeyboardBuilder()
-    builder.button(text="✏️ Стоимость одного ответа", callback_data="edit_msg_cost")
-    builder.button(text="⬅️ Назад", callback_data="admin_payment_settings")
+    builder.button(
+        text="✏️ Стоимость одного ответа",
+        callback_data=_admin_payment_action_callback("edit_msg_cost", return_callback),
+    )
+    builder.button(text="⬅️ Назад", callback_data=return_callback)
     builder.adjust(1)
 
     await send_smart_content(event, text, None, builder.as_markup())
@@ -7495,14 +7995,22 @@ async def edit_sub_price(callback: CallbackQuery, state: FSMContext):
     await admin_subscriptions_menu(callback)
 
 
-@router.callback_query(F.data == "edit_msg_cost")
+@router.callback_query(F.data.startswith("edit_msg_cost"))
 async def edit_msg_cost(callback: CallbackQuery, state: FSMContext):
+    return_callback = _admin_payment_action_source(callback.data)
+    resume_callback = await _admin_payment_state_resume(state, return_callback)
+    if resume_callback is None:
+        resume_callback = _admin_payment_action_callback("admin_pay_prices", return_callback)
     await state.clear()
     await state.set_state(PaymentStates.set_token_price)
+    await state.update_data(
+        admin_payment_return_callback=return_callback,
+        admin_payment_resume_callback=resume_callback,
+    )
     await callback.message.answer(
         "Сколько токенов списывать за 1 сообщение ИИ?\n"
         "Пример: 1 или 0.5. Значение должно быть неотрицательным.",
-        reply_markup=kb.back_to_previous_menu("admin_pay_prices"),
+        reply_markup=kb.back_to_previous_menu(resume_callback),
     )
     await callback.answer()
 
@@ -7517,8 +8025,14 @@ async def save_token_price(message: Message, state: FSMContext):
             conf = await session.get(PaymentConfig, 1)
             conf.cost_per_message = val
             await session.commit()
+        return_callback = await _admin_payment_state_return(state)
+        resume_callback = await _admin_payment_state_resume(state, return_callback)
         await state.clear()
-        await admin_pay_prices(message)
+        await state.update_data(
+            admin_payment_return_callback=return_callback,
+            admin_payment_resume_callback=resume_callback,
+        )
+        await _render_admin_payment_resume(message, state, resume_callback, return_callback)
     except:
         await message.answer("Введите число.")
 
@@ -8017,34 +8531,25 @@ async def admin_books_manager(event, page=0, state: FSMContext | None = None):
             page = int(data_parts[2])
 
     page_size = 10
-    offset = page * page_size
-
     async with async_session_maker() as session:
-        books = await session.execute(select(Book).limit(page_size).offset(offset).order_by(Book.id.desc()))
-        books = books.scalars().all()
         total = await session.scalar(select(func.count(Book.id))) or 0
     total_pages = max(1, math.ceil(total / page_size)) if total else 1
     page = max(0, min(page, total_pages - 1))
 
+    async with async_session_maker() as session:
+        books = await session.execute(
+            select(Book).limit(page_size).offset(page * page_size).order_by(Book.id.desc())
+        )
+        books = books.scalars().all()
+
     builder = InlineKeyboardBuilder()
 
     for b in books:
-        builder.button(text=f"🗑 {b.title}", callback_data=f"confirm_del_book_{b.id}_{page}")
+        builder.row(InlineKeyboardButton(text=f"🗑 {b.title}", callback_data=f"confirm_del_book_{b.id}_{page}"))
 
-    nav_btns = []
-    if total_pages > 1:
-        prev_page = page - 1 if page > 0 else total_pages - 1
-        next_page = page + 1 if page < total_pages - 1 else 0
-        nav_btns.append(InlineKeyboardButton(text="⬅️", callback_data=f"adm_books_pg_{prev_page}"))
-        nav_btns.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="ignore"))
-        nav_btns.append(InlineKeyboardButton(text="➡️", callback_data=f"adm_books_pg_{next_page}"))
-
-    if nav_btns:
-        builder.row(*nav_btns)
-
-    builder.button(text="➕ Добавить книгу", callback_data="add_book_start")
-    builder.button(text="⬅️ К категориям", callback_data="admin_content_list")
-    builder.adjust(1, len(nav_btns) if nav_btns else 1, 1, 1)
+    builder.row(*kb.standard_pagination_row(page, total_pages, lambda target: f"adm_books_pg_{target}"))
+    builder.row(InlineKeyboardButton(text="➕ Добавить книгу", callback_data="add_book_start"))
+    builder.row(InlineKeyboardButton(text="⬅️ К категориям", callback_data="admin_content_list"))
 
     text = f"📚 <b>Управление книгами ({total} шт)</b>\nНажмите на книгу, чтобы удалить ее."
     await send_smart_content(event, text, None, builder.as_markup())
@@ -8397,16 +8902,37 @@ async def confirmed_admin_delete_plan(callback: CallbackQuery):
 
 @router.callback_query(F.data == "admin_subscriptions")
 async def admin_subscriptions_menu(callback: CallbackQuery, state: FSMContext | None = None):
-    await admin_payment_settings(callback, state=state)
+    if not await require_permission(callback, AdminPermission.PAYMENTS, state=state):
+        return
+    await _clear_admin_navigation_state(state)
+    await callback.message.edit_text(
+        "💳 <b>Подписки и оплата</b>\n\n"
+        "Управляйте тарифами, подписчиками, промокодами, статистикой, платежами и реферальной программой.",
+        reply_markup=kb.admin_payment_keyboard(),
+        parse_mode="HTML",
+    )
+    await callback.answer()
 
 
 @router.callback_query(F.data == "admin_prodamus_settings")
 async def admin_prodamus_settings(callback: CallbackQuery, state: FSMContext | None = None):
+    if not await require_permission(callback, AdminPermission.PAYMENTS, state=state):
+        return
+    return_callback = _ADMIN_PAYMENT_MAIN_CALLBACK
     await _clear_admin_navigation_state(state)
+    if state is not None:
+        await state.update_data(
+            admin_prodamus_return=return_callback,
+        )
     async with async_session_maker() as session:
         config = await _ensure_subscription_config(session)
         await session.commit()
-    await callback.message.edit_text("⚙️ Настройки платежных систем и уведомлений", reply_markup=kb.admin_prodamus_settings_keyboard(config))
+    await callback.message.edit_text(
+        "⚙️ <b>Настройки оплаты</b>\n\n"
+        "Технические параметры оплаты, провайдеры, стоимость сообщений и уведомления.",
+        reply_markup=kb.admin_prodamus_settings_keyboard(config, return_callback),
+        parse_mode="HTML",
+    )
     await callback.answer()
 
 
@@ -8445,32 +8971,52 @@ async def admin_prodamus_keys(callback: CallbackQuery, state: FSMContext | None 
     await callback.answer()
 
 
-@router.callback_query(F.data == "admin_toggle_sub_notifs")
+@router.callback_query(F.data.startswith("admin_toggle_sub_notifs"))
 async def admin_toggle_sub_notifs(callback: CallbackQuery, state: FSMContext | None = None):
+    current_screen = _admin_payment_action_source(callback.data, _ADMIN_PAYMENT_SETTINGS_CALLBACK)
+    parent_callback = _admin_payment_settings_parent(current_screen)
     await _clear_admin_navigation_state(state)
+    if state is not None:
+        await state.update_data(
+            admin_prodamus_return=current_screen,
+        )
     async with async_session_maker() as session:
         config = await _ensure_subscription_config(session)
         config.notifications_enabled = not config.notifications_enabled
         await session.commit()
-        reply_markup = kb.admin_prodamus_settings_keyboard(config)
+        reply_markup = kb.admin_prodamus_settings_keyboard(config, parent_callback)
     await callback.message.edit_reply_markup(reply_markup=reply_markup)
     await callback.answer("Настройка обновлена")
 
 
-@router.callback_query(F.data == "admin_toggle_subscriptions")
+@router.callback_query(F.data.startswith("admin_toggle_subscriptions"))
 async def admin_toggle_subscriptions(callback: CallbackQuery, state: FSMContext | None = None):
+    current_screen = _admin_payment_action_source(callback.data, _ADMIN_PAYMENT_SETTINGS_CALLBACK)
+    parent_callback = _admin_payment_settings_parent(current_screen)
     await _clear_admin_navigation_state(state)
+    if state is not None:
+        await state.update_data(
+            admin_prodamus_return=current_screen,
+        )
     async with async_session_maker() as session:
         config = await _ensure_subscription_config(session)
         config.subscriptions_enabled = not config.subscriptions_enabled
         await session.commit()
-        reply_markup = kb.admin_prodamus_settings_keyboard(config)
+        reply_markup = kb.admin_prodamus_settings_keyboard(config, parent_callback)
     await callback.message.edit_reply_markup(reply_markup=reply_markup)
     await callback.answer("Настройка обновлена")
 
 
-@router.callback_query(F.data == "admin_payment_stats")
+@router.callback_query(F.data.startswith("admin_payment_stats"))
 async def admin_payment_stats(callback: CallbackQuery, state: FSMContext | None = None):
+    if not await require_permission(callback, AdminPermission.PAYMENTS, state=state):
+        return
+    state_back_callback = None
+    if state is not None:
+        state_back_callback = (await state.get_data()).get("admin_payment_stats_return")
+    back_callback = _normalize_admin_payment_return(state_back_callback)
+    if ":" in callback.data:
+        back_callback = _normalize_admin_payment_return(callback.data.split(":", 1)[1], back_callback)
     await _clear_admin_navigation_state(state)
     async with async_session_maker() as session:
         now = msk_now()
@@ -8566,18 +9112,26 @@ async def admin_payment_stats(callback: CallbackQuery, state: FSMContext | None 
 
     await callback.message.edit_text(
         text,
-        reply_markup=kb.back_to_previous_menu("admin_prodamus_settings"),
+        reply_markup=kb.back_to_previous_menu(back_callback),
         parse_mode="HTML",
     )
     await callback.answer()
 
 
-@router.callback_query(F.data == "admin_set_welcome_bonus")
+@router.callback_query(F.data.startswith("admin_set_welcome_bonus"))
 async def admin_set_welcome_bonus(callback: CallbackQuery, state: FSMContext):
+    return_callback = _admin_payment_action_source(callback.data, _ADMIN_PAYMENT_SETTINGS_CALLBACK)
     await state.clear()
+    await state.update_data(admin_prodamus_return=return_callback)
     await state.set_state(AdminStates.set_welcome_bonus_days)
-    await state.update_data(last_msg_id=callback.message.message_id)
-    await callback.message.edit_text("Введите количество приветственных бонусных дней:", reply_markup=kb.back_to_previous_menu("admin_prodamus_settings"))
+    await state.update_data(
+        last_msg_id=callback.message.message_id,
+        admin_prodamus_return=return_callback,
+    )
+    await callback.message.edit_text(
+        "Введите количество приветственных бонусных дней:",
+        reply_markup=kb.back_to_previous_menu(return_callback),
+    )
     await callback.answer()
 
 
@@ -8585,6 +9139,8 @@ async def admin_set_welcome_bonus(callback: CallbackQuery, state: FSMContext):
 async def process_welcome_bonus_days(message: Message, state: FSMContext, bot: Bot):
     data = await state.get_data()
     message_id_to_edit = data.get("last_msg_id")
+    current_screen = data.get("admin_prodamus_return", _ADMIN_PAYMENT_MAIN_CALLBACK)
+    parent_callback = _admin_payment_settings_parent(current_screen)
     try:
         days = int(message.text.strip())
     except ValueError:
@@ -8600,10 +9156,11 @@ async def process_welcome_bonus_days(message: Message, state: FSMContext, bot: B
     await message.delete()
     if message_id_to_edit:
         await bot.edit_message_text(
-            "⚙️ Настройки платежных систем и уведомлений",
+            "⚙️ <b>Настройки оплаты</b>",
             chat_id=message.chat.id,
             message_id=message_id_to_edit,
-            reply_markup=kb.admin_prodamus_settings_keyboard(config)
+            reply_markup=kb.admin_prodamus_settings_keyboard(config, parent_callback),
+            parse_mode="HTML",
         )
 
 
@@ -9614,17 +10171,25 @@ async def pay_prodamus(callback: CallbackQuery):
         await callback.answer("Ошибка при создании ссылки на оплату. Попробуй позже.", show_alert=True)
 
 
+@router.callback_query(F.data == "admin_subscribers")
+@router.callback_query(F.data == "admin_subs_list")
 @router.callback_query(F.data.startswith("admin_subs_"))
 @router.callback_query(F.data.startswith("admin_subs_list_"))
 async def admin_subscribers(callback: CallbackQuery, state: FSMContext | None = None):
+    if not await require_permission(callback, AdminPermission.PAYMENTS, state=state):
+        return
     await _clear_admin_navigation_state(state)
-    parts = callback.data.split("_")
-    if parts[2] == "list":
-        page = int(parts[3])
-        filter_key = parts[4] if len(parts) > 4 else "all"
+    if callback.data in {"admin_subscribers", "admin_subs_list"}:
+        page = 0
+        filter_key = "all"
     else:
-        page = int(parts[2])
-        filter_key = parts[3] if len(parts) > 3 else "all"
+        parts = callback.data.split("_")
+        if parts[2] == "list":
+            page = int(parts[3])
+            filter_key = parts[4] if len(parts) > 4 else "all"
+        else:
+            page = int(parts[2])
+            filter_key = parts[3] if len(parts) > 3 else "all"
     page_size = 10
     now = msk_now()
     filters = {"all": None, "paid": False, "bonus": True}
@@ -9638,11 +10203,12 @@ async def admin_subscribers(callback: CallbackQuery, state: FSMContext | None = 
         else:
             query = query.where(UserSubscription.end_date > now)
         total = await session.scalar(select(func.count()).select_from(query.subquery()))
+        total_pages = max(1, (total + page_size - 1) // page_size)
+        page = max(0, min(page, total_pages - 1))
         rows = (await session.execute(query.offset(page * page_size).limit(page_size))).scalars().all()
 
         users = {u.id: u for u in (await session.execute(select(User).where(User.id.in_([row.user_id for row in rows])))).scalars().all()} if rows else {}
 
-    total_pages = max(1, (total + page_size - 1) // page_size)
     lines = [f"👥 Подписчики: {total} · стр. {page + 1}/{total_pages}", ""]
     for sub in rows:
         user = users.get(sub.user_id)
@@ -9654,17 +10220,17 @@ async def admin_subscribers(callback: CallbackQuery, state: FSMContext | None = 
         lines.append("Нет активных записей.")
 
     builder = InlineKeyboardBuilder()
-    builder.button(text="Все", callback_data="admin_subs_0_all")
-    builder.button(text="Платные", callback_data="admin_subs_0_paid")
-    builder.button(text="Бонусные", callback_data="admin_subs_0_bonus")
-    if total_pages > 1:
-        prev_page = page - 1 if page > 0 else total_pages - 1
-        next_page = page + 1 if page < total_pages - 1 else 0
-        builder.button(text="⬅️", callback_data=f"admin_subs_{prev_page}_{filter_key}")
-        builder.button(text=f"{page + 1}/{total_pages}", callback_data="ignore")
-        builder.button(text="➡️", callback_data=f"admin_subs_{next_page}_{filter_key}")
-    builder.button(text="⬅️ Назад", callback_data="admin_payment_settings")
-    builder.adjust(3, 3 if total_pages > 1 else 1, 1)
+    builder.row(
+        InlineKeyboardButton(text="Все", callback_data="admin_subs_0_all"),
+        InlineKeyboardButton(text="Платные", callback_data="admin_subs_0_paid"),
+        InlineKeyboardButton(text="Бонусные", callback_data="admin_subs_0_bonus"),
+    )
+    builder.row(*kb.standard_pagination_row(
+        page,
+        total_pages,
+        lambda target: f"admin_subs_{target}_{filter_key}",
+    ))
+    builder.row(InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_payment_settings"))
     await callback.message.edit_text("\n".join(lines), reply_markup=builder.as_markup(), parse_mode="HTML")
     await callback.answer()
 
@@ -9689,6 +10255,12 @@ async def _render_payment_log(callback: CallbackQuery, page: int, filter_key: st
     if filter_key not in _PLOG_FILTERS:
         filter_key = "all"
 
+    def empty_log_keyboard():
+        builder = InlineKeyboardBuilder()
+        builder.row(*kb.standard_pagination_row(0, 1, lambda target: f"admin_plog_{target}_{filter_key}"))
+        builder.row(InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_payment_settings"))
+        return builder.as_markup()
+
     log_page_size = 10
     max_log_lines = 400
     log_path = Path("logs/payments.log")
@@ -9696,7 +10268,7 @@ async def _render_payment_log(callback: CallbackQuery, page: int, filter_key: st
     if not log_path.exists():
         await callback.message.edit_text(
             "📋 Лог пуст, платёжных событий ещё не было.",
-            reply_markup=kb.back_to_previous_menu("admin_payment_settings"),
+            reply_markup=empty_log_keyboard(),
         )
         await callback.answer()
         return
@@ -9706,7 +10278,7 @@ async def _render_payment_log(callback: CallbackQuery, page: int, filter_key: st
     except OSError:
         await callback.message.edit_text(
             "Не удалось прочитать лог платежей.",
-            reply_markup=kb.back_to_previous_menu("admin_payment_settings"),
+            reply_markup=empty_log_keyboard(),
         )
         await callback.answer()
         return
@@ -9750,37 +10322,56 @@ async def _render_payment_log(callback: CallbackQuery, page: int, filter_key: st
     if row2:
         builder.row(*row2)
 
-    if recent_lines:
-        nav_row = []
-        if total_pages > 1:
-            prev_page = page - 1 if page > 0 else total_pages - 1
-            next_page = page + 1 if page < total_pages - 1 else 0
-            nav_row.append(InlineKeyboardButton(text="⬅️", callback_data=f"admin_plog_{prev_page}_{filter_key}"))
-            nav_row.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="noop"))
-            nav_row.append(InlineKeyboardButton(text="➡️", callback_data=f"admin_plog_{next_page}_{filter_key}"))
-        builder.row(*nav_row)
+    builder.row(*kb.standard_pagination_row(
+        page,
+        total_pages,
+        lambda target: f"admin_plog_{target}_{filter_key}",
+    ))
 
     builder.row(InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_payment_settings"))
     await callback.message.edit_text(filtered_text, reply_markup=builder.as_markup(), parse_mode="HTML")
     await callback.answer()
 
 
-@router.callback_query(F.data == "noop")
+@router.callback_query(F.data.in_({"noop", "ignore"}))
 async def noop_callback(callback: CallbackQuery):
     await callback.answer()
 
 
-@router.callback_query(F.data.startswith("admin_clients_list_"))
-async def admin_clients_list(callback: CallbackQuery, state: FSMContext):
-    if not await is_admin_actor(callback.from_user.id):
-        await callback.answer("⛔️ Доступ запрещён.", show_alert=True)
+async def _render_admin_clients_list(
+    callback: CallbackQuery,
+    state: FSMContext,
+    requested_page: int,
+    context_value: str | None = None,
+    parent_callback: str | None = None,
+):
+    context = await _load_admin_client_context(callback, context_value)
+    if context_value and context is None:
+        await callback.answer("Экран списка устарел. Откройте список клиентов заново.", show_alert=True)
         return
     await state.set_state(None)
-    page = int(callback.data.split("_")[-1])
+    page = requested_page
     limit = 10
     offset = page * limit
     data = await state.get_data()
-    search_query = (data.get("client_search_query") or "").strip()
+    search_query = (
+        (context.search_query or "").strip()
+        if context is not None
+        else (data.get("client_search_query") or "").strip()
+    )
+    reset_callback = (
+        context.reset_callback
+        if context is not None
+        else _admin_client_return_callback(data.get("admin_client_search_reset_callback"))
+    )
+    reset_query = (
+        context.reset_query
+        if context is not None
+        else data.get("admin_client_search_reset_query")
+    )
+    parent_callback = _admin_client_parent_callback(
+        context.parent_callback if context is not None else parent_callback
+    )
 
     async with async_session_maker() as session:
         base_query = select(User)
@@ -9808,29 +10399,148 @@ async def admin_clients_list(callback: CallbackQuery, state: FSMContext):
         )
         users = users_result.scalars().all()
 
+    current_callback = f"admin_clients_list_{page}"
+    if not search_query or not reset_callback:
+        reset_callback = current_callback
+        reset_query = None
+    context_token = await _create_admin_client_context(
+        callback,
+        return_callback=current_callback,
+        search_query=search_query,
+        reset_callback=reset_callback,
+        reset_query=reset_query,
+        parent_callback=parent_callback,
+    )
+    await state.update_data(
+        admin_client_return_callback=current_callback,
+        admin_client_parent_callback=parent_callback,
+        client_search_query=search_query or None,
+        admin_client_search_reset_callback=reset_callback if search_query else None,
+        admin_client_search_reset_query=reset_query if search_query else None,
+        admin_client_navigation_token=context_token,
+    )
+
     if search_query:
         text = f"🔎 <b>Результаты поиска:</b> {html.escape(search_query)}\nНайдено: {total_users}\nСтраница {page + 1} из {total_pages}"
     else:
         text = f"👥 <b>Список клиентов ({total_users} чел.)</b>\nСтраница {page + 1} из {total_pages}"
 
-    await send_smart_content(
+    rendered = await send_smart_content(
         callback,
         text,
         None,
-        kb.admin_clients_keyboard(users, page, total_pages, is_searching=bool(search_query)),
+        kb.admin_clients_keyboard(
+            users,
+            page,
+            total_pages,
+            is_searching=bool(search_query),
+            navigation_token=context_token,
+        ),
+    )
+    await _bind_admin_client_context_message(context_token, callback, rendered)
+
+
+@router.callback_query(F.data.startswith("admin_clients_list_"))
+async def admin_clients_list(
+    callback: CallbackQuery,
+    state: FSMContext,
+    parent_callback: str | None = None,
+):
+    if not await is_admin_actor(callback.from_user.id):
+        await callback.answer("⛔️ Доступ запрещён.", show_alert=True)
+        return
+    parsed_callback = (0, None) if callback.data == "admin_section_clients" else _parse_admin_client_list_callback(callback.data)
+    if parsed_callback is None:
+        await callback.answer("Некорректная страница списка клиентов.", show_alert=True)
+        return
+    requested_page, context_value = parsed_callback
+    state_data = await state.get_data()
+    if parent_callback is None and callback.data in {"admin_section_clients", "admin_clients_list_0"}:
+        parent_callback = "admin_panel"
+    await _render_admin_clients_list(
+        callback,
+        state,
+        requested_page,
+        context_value,
+        parent_callback or state_data.get("admin_client_parent_callback"),
     )
 
 
-@router.callback_query(F.data == "admin_clients_start_search")
+@router.callback_query(F.data.regexp(r"^admin_clients_back:clientctx_[0-9a-f]{16}$"))
+async def admin_clients_back(callback: CallbackQuery, state: FSMContext):
+    if not await is_admin_actor(callback.from_user.id):
+        await callback.answer("⛔️ Доступ запрещён.", show_alert=True)
+        return
+    _, _, context_value = (callback.data or "").partition(":")
+    context = await _load_admin_client_context(callback, context_value)
+    if context is None:
+        await callback.answer("Экран списка устарел. Откройте список клиентов заново.", show_alert=True)
+        return
+    parent_callback = _admin_client_parent_callback(context.parent_callback)
+    await state.clear()
+    if parent_callback == "admin_panel":
+        await admin_panel_cb(callback, state=state)
+        return
+    if _parse_admin_client_list_callback(parent_callback) is not None:
+        await admin_clients_list(
+            callback.model_copy(update={"data": parent_callback}),
+            state,
+            parent_callback=parent_callback,
+        )
+        return
+    await admin_panel_cb(callback, state=state)
+
+
+@router.callback_query(F.data.startswith("view_client_"))
+async def legacy_view_client(callback: CallbackQuery, state: FSMContext | None = None):
+    try:
+        user_id = int(callback.data.removeprefix("view_client_"))
+    except (TypeError, ValueError):
+        await callback.answer("Пользователь не найден.", show_alert=True)
+        return
+    await admin_user_profile(
+        callback.model_copy(update={"data": f"admin_user_profile_{user_id}"}),
+        state=state,
+    )
+
+
+@router.callback_query(F.data.regexp(r"^admin_clients_start_search(?::clientctx_[0-9a-f]{16})?$"))
 async def start_client_search(callback: CallbackQuery, state: FSMContext):
     if not await is_admin_actor(callback.from_user.id):
         await callback.answer("⛔️ Доступ запрещён.", show_alert=True)
         return
+    _, _, context_value = (callback.data or "").partition(":")
+    context = await _load_admin_client_context(callback, context_value or None)
+    if context_value and context is None:
+        await callback.answer("Экран списка устарел. Откройте список клиентов заново.", show_alert=True)
+        return
+    state_data = await state.get_data()
+    return_callback = (
+        context.return_callback
+        if context is not None
+        else _admin_client_return_callback(state_data.get("admin_client_return_callback"))
+    ) or "admin_clients_list_0"
+    return_query = context.search_query if context is not None else (state_data.get("client_search_query") or None)
+    parent_callback = _admin_client_parent_callback(
+        context.parent_callback if context is not None else state_data.get("admin_client_parent_callback")
+    )
     await state.set_state(AdminStates.search_client)
-    await state.update_data(message_id_to_edit=callback.message.message_id)
+    await state.update_data(
+        message_id_to_edit=callback.message.message_id,
+        admin_client_search_input_return_callback=return_callback,
+        admin_client_search_input_return_query=return_query,
+        admin_client_parent_callback=parent_callback,
+    )
+    cancel_callback = (
+        f"admin_clients_cancel_search:{context_value}"
+        if context_value
+        else return_callback
+    )
     await callback.message.edit_text(
         "Введите имя, username или ID клиента для поиска:",
-        reply_markup=kb.back_to_previous_menu("admin_clients_list_0"),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="⬅️ Отмена поиска", callback_data=cancel_callback),
+        ]]),
     )
     await callback.answer()
 
@@ -9840,8 +10550,17 @@ async def process_client_search(message: Message, state: FSMContext, bot: Bot):
     if not await is_admin_actor(message.from_user.id):
         return
     query = message.text.strip()
-    await state.update_data(client_search_query=query)
-
+    data = await state.get_data()
+    return_callback = _admin_client_return_callback(
+        data.get("admin_client_search_input_return_callback")
+    ) or _admin_client_return_callback(data.get("admin_client_return_callback")) or "admin_clients_list_0"
+    return_query = data.get("admin_client_search_input_return_query")
+    parent_callback = _admin_client_parent_callback(data.get("admin_client_parent_callback"))
+    await state.update_data(
+        client_search_query=query,
+        admin_client_search_reset_callback=return_callback,
+        admin_client_search_reset_query=return_query,
+    )
     data = await state.get_data()
     message_id_to_edit = data.get("message_id_to_edit")
     await message.delete()
@@ -9861,17 +10580,85 @@ async def process_client_search(message: Message, state: FSMContext, bot: Bot):
         "answer": lambda *args, **kwargs: None,
     })()
 
-    await admin_clients_list(callback_mock, state)
+    await _render_admin_clients_list(callback_mock, state, 0, parent_callback=parent_callback)
 
 
-@router.callback_query(F.data == "admin_clients_reset_search")
+@router.callback_query(F.data.regexp(r"^admin_clients_cancel_search(?::clientctx_[0-9a-f]{16})?$"))
+async def cancel_client_search(callback: CallbackQuery, state: FSMContext):
+    if not await is_admin_actor(callback.from_user.id):
+        await callback.answer("⛔️ Доступ запрещён.", show_alert=True)
+        return
+    _, _, context_value = (callback.data or "").partition(":")
+    context = await _load_admin_client_context(callback, context_value or None)
+    if context_value and context is None:
+        await callback.answer("Экран поиска устарел. Откройте список клиентов заново.", show_alert=True)
+        return
+    state_data = await state.get_data()
+    return_callback = (
+        context.return_callback
+        if context is not None
+        else _admin_client_return_callback(state_data.get("admin_client_search_input_return_callback"))
+    ) or "admin_clients_list_0"
+    return_query = context.search_query if context is not None else state_data.get("client_search_query")
+    parent_callback = _admin_client_parent_callback(
+        context.parent_callback if context is not None else state_data.get("admin_client_parent_callback")
+    )
+    await state.clear()
+    await state.update_data(
+        client_search_query=return_query or None,
+        admin_client_search_reset_callback=(
+            context.reset_callback if context is not None else None
+        ),
+        admin_client_search_reset_query=(
+            context.reset_query if context is not None else None
+        ),
+        admin_client_parent_callback=parent_callback,
+    )
+    parsed_return = _parse_admin_client_list_callback(return_callback)
+    await _render_admin_clients_list(
+        callback,
+        state,
+        parsed_return[0] if parsed_return is not None else 0,
+        parent_callback=parent_callback,
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.regexp(r"^admin_clients_reset_search(?::clientctx_[0-9a-f]{16})?$"))
 async def reset_client_search(callback: CallbackQuery, state: FSMContext):
     if not await is_admin_actor(callback.from_user.id):
         await callback.answer("⛔️ Доступ запрещён.", show_alert=True)
         return
-    await state.update_data(client_search_query=None, message_id_to_edit=None)
-    await state.set_state(None)
-    await admin_clients_list(callback, state)
+    _, _, context_value = (callback.data or "").partition(":")
+    context = await _load_admin_client_context(callback, context_value or None)
+    if context_value and context is None:
+        await callback.answer("Экран списка устарел. Откройте список клиентов заново.", show_alert=True)
+        return
+    state_data = await state.get_data()
+    return_callback = (
+        context.reset_callback
+        if context is not None
+        else _admin_client_return_callback(state_data.get("admin_client_search_reset_callback"))
+    ) or "admin_clients_list_0"
+    return_query = context.reset_query if context is not None else None
+    parent_callback = _admin_client_parent_callback(
+        context.parent_callback if context is not None else state_data.get("admin_client_parent_callback")
+    )
+    await state.clear()
+    await state.update_data(
+        client_search_query=return_query,
+        admin_client_search_reset_callback=None,
+        admin_client_search_reset_query=None,
+        admin_client_parent_callback=parent_callback,
+    )
+    parsed_return = _parse_admin_client_list_callback(return_callback)
+    await _render_admin_clients_list(
+        callback,
+        state,
+        parsed_return[0] if parsed_return is not None else 0,
+        parent_callback=parent_callback,
+    )
+    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("admin_user_profile_"))
@@ -9879,9 +10666,63 @@ async def admin_user_profile(callback: CallbackQuery, state: FSMContext | None =
     if not await is_admin_actor(callback.from_user.id):
         await callback.answer("Недостаточно прав", show_alert=True)
         return
-    await _clear_admin_navigation_state(state)
+    payload = callback.data.removeprefix("admin_user_profile_")
+    user_id_raw, _, callback_return = payload.partition(":")
+    client_context = await _load_admin_client_context(callback, callback_return)
+    if _admin_client_context_token(callback_return) and client_context is None:
+        await callback.answer("Экран списка устарел. Откройте список клиентов заново.", show_alert=True)
+        return
+    return_callback = (
+        _admin_client_return_callback(client_context.return_callback)
+        if client_context is not None
+        else _admin_client_return_callback(callback_return)
+    ) or "admin_clients_list_0"
+    context_token = _admin_client_context_token(callback_return)
+    if state is not None:
+        state_data = await state.get_data()
+        if client_context is None and not _admin_client_return_callback(callback_return):
+            return_callback = _admin_client_return_callback(
+                state_data.get("admin_client_return_callback")
+            ) or return_callback
+        await state.set_state(None)
+        await state.update_data(
+            admin_client_return_callback=return_callback,
+            admin_client_parent_callback=_admin_client_parent_callback(
+                client_context.parent_callback
+                if client_context is not None
+                else state_data.get("admin_client_parent_callback")
+            ),
+            client_search_query=(
+                client_context.search_query
+                if client_context is not None
+                else state_data.get("client_search_query")
+            ),
+            admin_client_search_reset_callback=(
+                client_context.reset_callback if client_context is not None
+                else state_data.get("admin_client_search_reset_callback")
+            ),
+            admin_client_search_reset_query=(
+                client_context.reset_query if client_context is not None
+                else state_data.get("admin_client_search_reset_query")
+            ),
+            admin_client_navigation_token=(
+                callback_return if client_context is not None else state_data.get("admin_client_navigation_token")
+            ),
+        )
 
-    user_id = int(callback.data.split("_")[-1])
+    profile_return_callback = return_callback
+    parsed_return = _parse_admin_client_list_callback(return_callback)
+    if client_context is not None and context_token and parsed_return is not None:
+        profile_return_callback = _admin_client_list_callback(
+            parsed_return[0],
+            callback_return,
+        )
+
+    try:
+        user_id = int(user_id_raw)
+    except ValueError:
+        await callback.answer("Пользователь не найден", show_alert=True)
+        return
 
     async with async_session_maker() as session:
         user = await session.get(User, user_id)
@@ -9963,7 +10804,13 @@ async def admin_user_profile(callback: CallbackQuery, state: FSMContext | None =
         callback,
         text,
         None,
-        kb.admin_user_profile_keyboard(user_id, is_blocked, crisis_detected),
+        kb.admin_user_profile_keyboard(
+            user_id,
+            is_blocked,
+            crisis_detected,
+            profile_return_callback,
+            navigation_token=callback_return if client_context is not None else None,
+        ),
     )
 
 
@@ -9972,8 +10819,19 @@ async def admin_block_toggle(callback: CallbackQuery, state: FSMContext | None =
     if not await is_admin_actor(callback.from_user.id):
         await callback.answer("⛔️ Доступ запрещён.", show_alert=True)
         return
-    await _clear_admin_navigation_state(state)
-    user_id = int(callback.data.split("_")[-1])
+    if state is not None:
+        await state.set_state(None)
+    payload = callback.data.removeprefix("admin_block_toggle_")
+    user_id_raw, _, context_value = payload.partition(":")
+    client_context = await _load_admin_client_context(callback, context_value or None)
+    if context_value and client_context is None:
+        await callback.answer("Экран профиля устарел. Откройте список клиентов заново.", show_alert=True)
+        return
+    try:
+        user_id = int(user_id_raw)
+    except ValueError:
+        await callback.answer("Пользователь не найден.", show_alert=True)
+        return
 
     async with async_session_maker() as session:
         user = await session.get(User, user_id)
@@ -9984,7 +10842,9 @@ async def admin_block_toggle(callback: CallbackQuery, state: FSMContext | None =
             status = "заблокирован" if user.is_blocked else "разблокирован"
             await callback.answer(f"Клиент {status}")
 
-    new_cb = callback.model_copy(update={"data": f"admin_user_profile_{user_id}"})
+    new_cb = callback.model_copy(update={
+        "data": f"admin_user_profile_{user_id}{_admin_client_action_suffix(callback.data)}",
+    })
     await admin_user_profile(new_cb, state=state)
 
 
@@ -9993,14 +10853,25 @@ async def admin_crisis_clear(callback: CallbackQuery, state: FSMContext | None =
     if not await is_admin_actor(callback.from_user.id):
         await callback.answer("⛔️ Доступ запрещён.", show_alert=True)
         return
-    await _clear_admin_navigation_state(state)
+    if state is not None:
+        await state.set_state(None)
+    context_value = _admin_client_action_context(callback.data)
+    client_context = await _load_admin_client_context(callback, context_value)
+    if context_value and client_context is None:
+        await callback.answer("Экран профиля устарел. Откройте список клиентов заново.", show_alert=True)
+        return
     confirmed = callback.data.startswith("admin_crisis_clear_confirm_") or not isinstance(callback, CallbackQuery)
     prefix = (
         "admin_crisis_clear_confirm_"
         if callback.data.startswith("admin_crisis_clear_confirm_")
         else "admin_crisis_clear_"
     )
-    user_id = int(callback.data.removeprefix(prefix))
+    user_id_raw = callback.data.removeprefix(prefix).split(":", 1)[0]
+    try:
+        user_id = int(user_id_raw)
+    except ValueError:
+        await callback.answer("Пользователь не найден.", show_alert=True)
+        return
     async with async_session_maker() as session:
         user = await session.get(User, user_id)
         if not user:
@@ -10010,14 +10881,19 @@ async def admin_crisis_clear(callback: CallbackQuery, state: FSMContext | None =
             await _ask_admin_confirmation(
                 callback,
                 "Кризисный флаг будет снят вручную. После нового кризисного сигнала защита снова включится.",
-                f"admin_crisis_clear_confirm_{user_id}",
-                f"admin_user_profile_{user_id}",
+                f"admin_crisis_clear_confirm_{user_id}{_admin_client_action_suffix(callback.data)}",
+                f"admin_user_profile_{user_id}{_admin_client_action_suffix(callback.data)}",
             )
             return
         user.crisis_detected_at = None
         await session.commit()
     await callback.answer("Кризисный флаг снят вручную")
-    await admin_user_profile(callback.model_copy(update={"data": f"admin_user_profile_{user_id}"}), state=state)
+    await admin_user_profile(
+        callback.model_copy(update={
+            "data": f"admin_user_profile_{user_id}{_admin_client_action_suffix(callback.data)}",
+        }),
+        state=state,
+    )
 
 
 # ───── Меню сбросов клиента (для тестирования) ─────
@@ -10041,7 +10917,7 @@ async def _ensure_user_reset_confirmed(
     user_id: int,
     state: FSMContext | None = None,
 ) -> bool:
-    await _clear_admin_navigation_state(state)
+    await _clear_admin_navigation_state(state, preserve_client_context=True)
     if callback.data.startswith("ureset_confirmed_") or not isinstance(callback, CallbackQuery):
         return True
     await _ask_admin_confirmation(
@@ -10057,9 +10933,27 @@ async def admin_user_resets(callback: CallbackQuery, state: FSMContext | None = 
     if not await is_admin_actor(callback.from_user.id):
         await callback.answer("Недостаточно прав", show_alert=True)
         return
-    await _clear_admin_navigation_state(state)
+    context_value = _admin_client_action_context(callback.data)
+    client_context = await _load_admin_client_context(callback, context_value)
+    if context_value and client_context is None:
+        await callback.answer("Экран профиля устарел. Откройте список клиентов заново.", show_alert=True)
+        return
+    await _clear_admin_navigation_state(state, preserve_client_context=True)
 
-    user_id = int(callback.data.split("_")[-1])
+    try:
+        user_id = int(callback.data.removeprefix("admin_user_resets_").split(":", 1)[0])
+    except ValueError:
+        await callback.answer("Пользователь не найден.", show_alert=True)
+        return
+    if state is not None and client_context is not None:
+        await state.update_data(
+            admin_client_return_callback=client_context.return_callback,
+            admin_client_parent_callback=_admin_client_parent_callback(client_context.parent_callback),
+            client_search_query=client_context.search_query,
+            admin_client_search_reset_callback=client_context.reset_callback,
+            admin_client_search_reset_query=client_context.reset_query,
+            admin_client_navigation_token=context_value,
+        )
 
     text = (
         f"🔄 <b>Сбросы для клиента</b> <code>{user_id}</code>\n\n"
@@ -10085,22 +10979,25 @@ async def admin_user_resets(callback: CallbackQuery, state: FSMContext | None = 
 
     builder = InlineKeyboardBuilder()
     reset_buttons = [
-        ("🌀 Сбросить воронку", f"confirm_ureset_funnel_{user_id}"),
-        ("💬 Очистить диалог", f"confirm_ureset_dialog_{user_id}"),
-        ("📅 Сбросить подписку", f"confirm_ureset_sub_{user_id}"),
-        ("💰 Обнулить баланс", f"confirm_ureset_balance_{user_id}"),
-        ("🎗 Удалить привычки", f"confirm_ureset_habits_{user_id}"),
-        ("🔔 Сбросить напоминания", f"confirm_ureset_remind_{user_id}"),
-        ("🌐 Очистить лендинг", f"confirm_ureset_landing_{user_id}"),
-        ("👤 Сбросить имя и пол", f"confirm_ureset_name_{user_id}"),
-        ("⚡️ ПОЛНЫЙ СБРОС", f"confirm_ureset_full_{user_id}"),
+        ("🌀 Сбросить воронку", f"confirm_ureset_funnel_{user_id}{_admin_client_action_suffix(callback.data)}"),
+        ("💬 Очистить диалог", f"confirm_ureset_dialog_{user_id}{_admin_client_action_suffix(callback.data)}"),
+        ("📅 Сбросить подписку", f"confirm_ureset_sub_{user_id}{_admin_client_action_suffix(callback.data)}"),
+        ("💰 Обнулить баланс", f"confirm_ureset_balance_{user_id}{_admin_client_action_suffix(callback.data)}"),
+        ("🎗 Удалить привычки", f"confirm_ureset_habits_{user_id}{_admin_client_action_suffix(callback.data)}"),
+        ("🔔 Сбросить напоминания", f"confirm_ureset_remind_{user_id}{_admin_client_action_suffix(callback.data)}"),
+        ("🌐 Очистить лендинг", f"confirm_ureset_landing_{user_id}{_admin_client_action_suffix(callback.data)}"),
+        ("👤 Сбросить имя и пол", f"confirm_ureset_name_{user_id}{_admin_client_action_suffix(callback.data)}"),
+        ("⚡️ ПОЛНЫЙ СБРОС", f"confirm_ureset_full_{user_id}{_admin_client_action_suffix(callback.data)}"),
     ]
     role = await get_admin_role(callback.from_user.id)
     for text, callback_data in reset_buttons:
         permission = permission_for_callback(callback_data)
         if role is None or permission is None or role_has_permission(role, permission):
             builder.button(text=text, callback_data=callback_data)
-    builder.button(text="⬅️ Назад", callback_data=f"admin_user_profile_{user_id}")
+    builder.button(
+        text="⬅️ Назад",
+        callback_data=f"admin_user_profile_{user_id}{_admin_client_action_suffix(callback.data)}",
+    )
     builder.adjust(1)
 
     await send_smart_content(callback, text, None, builder.as_markup())
@@ -10111,9 +11008,10 @@ async def confirm_user_reset(callback: CallbackQuery, state: FSMContext | None =
     if not await is_admin_actor(callback.from_user.id):
         await callback.answer("Недостаточно прав", show_alert=True)
         return
-    await _clear_admin_navigation_state(state)
+    await _clear_admin_navigation_state(state, preserve_client_context=True)
     payload = callback.data.removeprefix("confirm_ureset_")
-    kind, separator, user_id_raw = payload.rpartition("_")
+    payload_without_context = payload.split(":", 1)[0]
+    kind, separator, user_id_raw = payload_without_context.rpartition("_")
     if not separator or kind not in _USER_RESET_LABELS:
         await callback.answer("Некорректный сброс.", show_alert=True)
         return
@@ -10125,8 +11023,8 @@ async def confirm_user_reset(callback: CallbackQuery, state: FSMContext | None =
     await _ask_admin_confirmation(
         callback,
         f"Будет сброшено: <b>{_USER_RESET_LABELS[kind]}</b>. Действие нельзя отменить.",
-        f"ureset_confirmed_{kind}_{user_id}",
-        f"admin_user_resets_{user_id}",
+        f"ureset_confirmed_{kind}_{user_id}{_admin_client_action_suffix(callback.data)}",
+        f"admin_user_resets_{user_id}{_admin_client_action_suffix(callback.data)}",
     )
 
 
@@ -10135,9 +11033,10 @@ async def execute_confirmed_user_reset(callback: CallbackQuery, state: FSMContex
     if not await is_admin_actor(callback.from_user.id):
         await callback.answer("Недостаточно прав", show_alert=True)
         return
-    await _clear_admin_navigation_state(state)
+    await _clear_admin_navigation_state(state, preserve_client_context=True)
     payload = callback.data.removeprefix("ureset_confirmed_")
-    kind, separator, user_id_raw = payload.rpartition("_")
+    payload_without_context = payload.split(":", 1)[0]
+    kind, separator, user_id_raw = payload_without_context.rpartition("_")
     reset_handlers = {
         "funnel": ureset_funnel,
         "dialog": ureset_dialog,
@@ -10157,7 +11056,9 @@ async def execute_confirmed_user_reset(callback: CallbackQuery, state: FSMContex
     except ValueError:
         await callback.answer("Некорректный клиент.", show_alert=True)
         return
-    confirmed_callback = callback.model_copy(update={"data": f"ureset_confirmed_{kind}_{user_id}"})
+    confirmed_callback = callback.model_copy(update={
+        "data": f"ureset_confirmed_{kind}_{user_id}{_admin_client_action_suffix(callback.data)}",
+    })
     await reset_handlers[kind](confirmed_callback, state=state)
 
 
@@ -10166,7 +11067,7 @@ async def ureset_funnel(callback: CallbackQuery, state: FSMContext | None = None
     if not await is_admin_actor(callback.from_user.id):
         await callback.answer("Недостаточно прав", show_alert=True)
         return
-    user_id = int(callback.data.split("_")[-1])
+    user_id = _admin_client_action_user_id(callback.data, "ureset_funnel_")
     if not await _ensure_user_reset_confirmed(callback, "funnel", user_id, state):
         return
     async with async_session_maker() as session:
@@ -10182,7 +11083,9 @@ async def ureset_funnel(callback: CallbackQuery, state: FSMContext | None = None
             fs.started_at = None
         await session.commit()
     await callback.answer("🌀 Воронка сброшена")
-    new_cb = callback.model_copy(update={"data": f"admin_user_resets_{user_id}"})
+    new_cb = callback.model_copy(update={
+        "data": f"admin_user_resets_{user_id}{_admin_client_action_suffix(callback.data)}",
+    })
     await admin_user_resets(new_cb, state=state)
 
 
@@ -10190,7 +11093,7 @@ async def ureset_funnel(callback: CallbackQuery, state: FSMContext | None = None
 async def ureset_dialog(callback: CallbackQuery, state: FSMContext | None = None):
     if not await require_permission(callback, AdminPermission.SYSTEM):
         return
-    user_id = int(callback.data.split("_")[-1])
+    user_id = _admin_client_action_user_id(callback.data, "ureset_dialog_")
     if not await _ensure_user_reset_confirmed(callback, "dialog", user_id, state):
         return
     async with async_session_maker() as session:
@@ -10238,7 +11141,9 @@ async def ureset_dialog(callback: CallbackQuery, state: FSMContext | None = None
         )
         await session.commit()
     await callback.answer("💬 Диалог очищен")
-    new_cb = callback.model_copy(update={"data": f"admin_user_resets_{user_id}"})
+    new_cb = callback.model_copy(update={
+        "data": f"admin_user_resets_{user_id}{_admin_client_action_suffix(callback.data)}",
+    })
     await admin_user_resets(new_cb, state=state)
 
 
@@ -10247,7 +11152,7 @@ async def ureset_sub(callback: CallbackQuery, state: FSMContext | None = None):
     if not await is_admin_actor(callback.from_user.id):
         await callback.answer("Недостаточно прав", show_alert=True)
         return
-    user_id = int(callback.data.split("_")[-1])
+    user_id = _admin_client_action_user_id(callback.data, "ureset_sub_")
     if not await _ensure_user_reset_confirmed(callback, "sub", user_id, state):
         return
     async with async_session_maker() as session:
@@ -10256,7 +11161,9 @@ async def ureset_sub(callback: CallbackQuery, state: FSMContext | None = None):
             user.subscription_end = None
         await session.commit()
     await callback.answer("📅 Подписка сброшена")
-    new_cb = callback.model_copy(update={"data": f"admin_user_resets_{user_id}"})
+    new_cb = callback.model_copy(update={
+        "data": f"admin_user_resets_{user_id}{_admin_client_action_suffix(callback.data)}",
+    })
     await admin_user_resets(new_cb, state=state)
 
 
@@ -10265,7 +11172,7 @@ async def ureset_balance(callback: CallbackQuery, state: FSMContext | None = Non
     if not await is_admin_actor(callback.from_user.id):
         await callback.answer("Недостаточно прав", show_alert=True)
         return
-    user_id = int(callback.data.split("_")[-1])
+    user_id = _admin_client_action_user_id(callback.data, "ureset_balance_")
     if not await _ensure_user_reset_confirmed(callback, "balance", user_id, state):
         return
     async with async_session_maker() as session:
@@ -10275,7 +11182,9 @@ async def ureset_balance(callback: CallbackQuery, state: FSMContext | None = Non
             user.low_balance_notified = False
         await session.commit()
     await callback.answer("💰 Баланс обнулён")
-    new_cb = callback.model_copy(update={"data": f"admin_user_resets_{user_id}"})
+    new_cb = callback.model_copy(update={
+        "data": f"admin_user_resets_{user_id}{_admin_client_action_suffix(callback.data)}",
+    })
     await admin_user_resets(new_cb, state=state)
 
 
@@ -10283,14 +11192,16 @@ async def ureset_balance(callback: CallbackQuery, state: FSMContext | None = Non
 async def ureset_habits(callback: CallbackQuery, state: FSMContext | None = None):
     if not await require_permission(callback, AdminPermission.SYSTEM):
         return
-    user_id = int(callback.data.split("_")[-1])
+    user_id = _admin_client_action_user_id(callback.data, "ureset_habits_")
     if not await _ensure_user_reset_confirmed(callback, "habits", user_id, state):
         return
     async with async_session_maker() as session:
         await session.execute(delete(Habit).where(Habit.user_id == user_id))
         await session.commit()
     await callback.answer("🎗 Привычки удалены")
-    new_cb = callback.model_copy(update={"data": f"admin_user_resets_{user_id}"})
+    new_cb = callback.model_copy(update={
+        "data": f"admin_user_resets_{user_id}{_admin_client_action_suffix(callback.data)}",
+    })
     await admin_user_resets(new_cb, state=state)
 
 
@@ -10299,7 +11210,7 @@ async def ureset_remind(callback: CallbackQuery, state: FSMContext | None = None
     if not await is_admin_actor(callback.from_user.id):
         await callback.answer("Недостаточно прав", show_alert=True)
         return
-    user_id = int(callback.data.split("_")[-1])
+    user_id = _admin_client_action_user_id(callback.data, "ureset_remind_")
     if not await _ensure_user_reset_confirmed(callback, "remind", user_id, state):
         return
     async with async_session_maker() as session:
@@ -10309,7 +11220,9 @@ async def ureset_remind(callback: CallbackQuery, state: FSMContext | None = None
             user.next_main_reminder_at = None
         await session.commit()
     await callback.answer("🔔 Напоминания сброшены")
-    new_cb = callback.model_copy(update={"data": f"admin_user_resets_{user_id}"})
+    new_cb = callback.model_copy(update={
+        "data": f"admin_user_resets_{user_id}{_admin_client_action_suffix(callback.data)}",
+    })
     await admin_user_resets(new_cb, state=state)
 
 
@@ -10318,14 +11231,16 @@ async def ureset_landing(callback: CallbackQuery, state: FSMContext | None = Non
     if not await is_admin_actor(callback.from_user.id):
         await callback.answer("Недостаточно прав", show_alert=True)
         return
-    user_id = int(callback.data.split("_")[-1])
+    user_id = _admin_client_action_user_id(callback.data, "ureset_landing_")
     if not await _ensure_user_reset_confirmed(callback, "landing", user_id, state):
         return
     async with async_session_maker() as session:
         await session.execute(delete(FunnelLanding).where(FunnelLanding.user_id == user_id))
         await session.commit()
     await callback.answer("🌐 Лендинг очищен")
-    new_cb = callback.model_copy(update={"data": f"admin_user_resets_{user_id}"})
+    new_cb = callback.model_copy(update={
+        "data": f"admin_user_resets_{user_id}{_admin_client_action_suffix(callback.data)}",
+    })
     await admin_user_resets(new_cb, state=state)
 
 
@@ -10334,7 +11249,7 @@ async def ureset_name(callback: CallbackQuery, state: FSMContext | None = None):
     if not await is_admin_actor(callback.from_user.id):
         await callback.answer("Недостаточно прав", show_alert=True)
         return
-    user_id = int(callback.data.split("_")[-1])
+    user_id = _admin_client_action_user_id(callback.data, "ureset_name_")
     if not await _ensure_user_reset_confirmed(callback, "name", user_id, state):
         return
     async with async_session_maker() as session:
@@ -10344,7 +11259,9 @@ async def ureset_name(callback: CallbackQuery, state: FSMContext | None = None):
             user.gender = None
         await session.commit()
     await callback.answer("👤 Имя и пол сброшены")
-    new_cb = callback.model_copy(update={"data": f"admin_user_resets_{user_id}"})
+    new_cb = callback.model_copy(update={
+        "data": f"admin_user_resets_{user_id}{_admin_client_action_suffix(callback.data)}",
+    })
     await admin_user_resets(new_cb, state=state)
 
 
@@ -10353,7 +11270,7 @@ async def ureset_full(callback: CallbackQuery, state: FSMContext | None = None):
     if not await is_admin_actor(callback.from_user.id):
         await callback.answer("Недостаточно прав", show_alert=True)
         return
-    user_id = int(callback.data.split("_")[-1])
+    user_id = _admin_client_action_user_id(callback.data, "ureset_full_")
     if not await _ensure_user_reset_confirmed(callback, "full", user_id, state):
         return
     async with async_session_maker() as session:
@@ -10403,7 +11320,9 @@ async def ureset_full(callback: CallbackQuery, state: FSMContext | None = None):
 
         await session.commit()
     await callback.answer("⚡️ Полный сброс выполнен!")
-    new_cb = callback.model_copy(update={"data": f"admin_user_resets_{user_id}"})
+    new_cb = callback.model_copy(update={
+        "data": f"admin_user_resets_{user_id}{_admin_client_action_suffix(callback.data)}",
+    })
     await admin_user_resets(new_cb, state=state)
 
 
@@ -10412,33 +11331,44 @@ async def admin_history_view(callback: CallbackQuery, state: FSMContext | None =
     if not await is_admin_actor(callback.from_user.id):
         await callback.answer("⛔️ Доступ запрещён.", show_alert=True)
         return
-    await _clear_admin_navigation_state(state)
-    parts = callback.data.split("_")
+    context_value = _admin_client_action_context(callback.data)
+    client_context = await _load_admin_client_context(callback, context_value)
+    if context_value and client_context is None:
+        await callback.answer("Экран истории устарел. Откройте список клиентов заново.", show_alert=True)
+        return
+    await _clear_admin_navigation_state(state, preserve_client_context=True)
+    parts = callback.data.split(":", 1)[0].split("_")
     user_id = int(parts[3])
-    page = int(parts[4])
+    requested_page = int(parts[4])
+    if state is not None and client_context is not None:
+        await state.update_data(
+            admin_client_return_callback=client_context.return_callback,
+            admin_client_parent_callback=_admin_client_parent_callback(client_context.parent_callback),
+            client_search_query=client_context.search_query,
+            admin_client_search_reset_callback=client_context.reset_callback,
+            admin_client_search_reset_query=client_context.reset_query,
+            admin_client_navigation_token=context_value,
+        )
 
     limit = 5
-    offset = page * limit
-
     async with async_session_maker() as session:
         user = await session.get(User, user_id)
-
+        if user is None:
+            await callback.answer("Пользователь не найден.", show_alert=True)
+            return
         total_msgs = await session.scalar(
             select(func.count(DBMessage.id)).where(DBMessage.user_id == user_id)
         )
-
+        total_pages = max(1, (total_msgs + limit - 1) // limit)
+        page = max(0, min(requested_page, total_pages - 1))
         messages_res = await session.execute(
             select(DBMessage)
             .where(DBMessage.user_id == user_id)
             .order_by(DBMessage.id.asc())
             .limit(limit)
-            .offset(offset)
+            .offset(page * limit)
         )
         messages = messages_res.scalars().all()
-
-    total_pages = (total_msgs + limit - 1) // limit
-    if total_pages == 0: total_pages = 1
-
     text_header = f"📜 <b>История клиента:</b> {user.first_name} ({user.id})\n\n"
     content_text = text_header
 
@@ -10464,7 +11394,12 @@ async def admin_history_view(callback: CallbackQuery, state: FSMContext | None =
     if not messages:
         content_text += "История пуста."
 
-    await send_smart_content(callback, content_text, None, kb.admin_history_keyboard(user_id, page, total_pages))
+    await send_smart_content(
+        callback,
+        content_text,
+        None,
+        kb.admin_history_keyboard(user_id, page, total_pages, navigation_token=context_value),
+    )
 
 
 @router.callback_query(F.data.startswith("admin_history_download_"))
@@ -10472,11 +11407,28 @@ async def admin_history_download(callback: CallbackQuery, state: FSMContext | No
     if not await is_admin_actor(callback.from_user.id):
         await callback.answer("⛔️ Доступ запрещён.", show_alert=True)
         return
-    await _clear_admin_navigation_state(state)
-    user_id = int(callback.data.split("_")[-1])
+    context_value = _admin_client_action_context(callback.data)
+    client_context = await _load_admin_client_context(callback, context_value)
+    if context_value and client_context is None:
+        await callback.answer("Экран истории устарел. Откройте список клиентов заново.", show_alert=True)
+        return
+    await _clear_admin_navigation_state(state, preserve_client_context=True)
+    user_id = _admin_client_action_user_id(callback.data, "admin_history_download_")
+    if state is not None and client_context is not None:
+        await state.update_data(
+            admin_client_return_callback=client_context.return_callback,
+            admin_client_parent_callback=_admin_client_parent_callback(client_context.parent_callback),
+            client_search_query=client_context.search_query,
+            admin_client_search_reset_callback=client_context.reset_callback,
+            admin_client_search_reset_query=client_context.reset_query,
+            admin_client_navigation_token=context_value,
+        )
 
     async with async_session_maker() as session:
         user = await session.get(User, user_id)
+        if user is None:
+            await callback.answer("Пользователь не найден.", show_alert=True)
+            return
         messages_res = await session.execute(
             select(DBMessage).where(DBMessage.user_id == user_id).order_by(DBMessage.id.asc())
         )
@@ -10574,7 +11526,7 @@ async def admin_reminders_settings(event, state: FSMContext | None = None):
         text="✏️ Текст повторного напоминания",
         callback_data="edit_cont_main:main_reminder_common",
     )
-    builder.button(text="⬅️ Назад", callback_data="admin_panel")
+    builder.button(text="⬅️ Назад", callback_data="admin_section_automation")
     builder.adjust(1)
 
     await send_smart_content(event, text, None, builder.as_markup())
@@ -10683,12 +11635,16 @@ async def save_reminder_next_hours(message: Message, state: FSMContext, bot: Bot
 
 # ───── Настройки Webhook лендинга ─────
 
-@router.callback_query(F.data == "admin_webhook_settings")
+@router.callback_query(F.data.startswith("admin_webhook_settings"))
 async def admin_webhook_settings(event, state: FSMContext | None = None):
     if not await is_admin_actor(event.from_user.id):
         await event.answer("Недостаточно прав", show_alert=True)
         return
+    state_return = await _admin_payment_state_return(state)
+    return_callback = _admin_payment_action_source(getattr(event, "data", None), state_return)
     await _clear_admin_navigation_state(state)
+    if state is not None:
+        await state.update_data(admin_payment_return_callback=return_callback)
 
     async with async_session_maker() as session:
         conf = await session.get(BotConfig, 1)
@@ -10732,21 +11688,25 @@ async def admin_webhook_settings(event, state: FSMContext | None = None):
 
     builder = InlineKeyboardBuilder()
     toggle_text = "❌ Выключить" if conf.webhook_enabled else "✅ Включить"
-    builder.button(text=toggle_text, callback_data="admin_toggle_webhook")
-    builder.button(text="🔑 Задать секрет вручную", callback_data="admin_set_webhook_secret")
-    builder.button(text="🎲 Сгенерировать новый секрет", callback_data="admin_confirm_gen_webhook_secret")
-    builder.button(text="🔌 Изменить порт", callback_data="admin_set_webhook_port")
-    builder.button(text="⬅️ Назад", callback_data="admin_payment_settings")
+    builder.button(text=toggle_text, callback_data=_admin_payment_action_callback("admin_toggle_webhook", return_callback))
+    builder.button(text="🔑 Задать секрет вручную", callback_data=_admin_payment_action_callback("admin_set_webhook_secret", return_callback))
+    builder.button(text="🎲 Сгенерировать новый секрет", callback_data=_admin_payment_action_callback("admin_confirm_gen_webhook_secret", return_callback))
+    builder.button(text="🔌 Изменить порт", callback_data=_admin_payment_action_callback("admin_set_webhook_port", return_callback))
+    builder.button(text="⬅️ Назад", callback_data=return_callback)
     builder.adjust(1)
 
     await send_smart_content(event, text, None, builder.as_markup())
 
 
-@router.callback_query(F.data == "admin_toggle_webhook")
+@router.callback_query(F.data.startswith("admin_toggle_webhook"))
 async def admin_toggle_webhook(callback: CallbackQuery, state: FSMContext | None = None):
     if not await is_admin_actor(callback.from_user.id):
         await callback.answer("Недостаточно прав", show_alert=True)
         return
+    return_callback = await _admin_payment_state_return(
+        state,
+        _admin_payment_action_source(callback.data),
+    )
     await _clear_admin_navigation_state(state)
     async with async_session_maker() as session:
         conf = await session.get(BotConfig, 1)
@@ -10755,10 +11715,16 @@ async def admin_toggle_webhook(callback: CallbackQuery, state: FSMContext | None
         await session.commit()
     status = "✅ Включён" if new_state else "❌ Выключен"
     await callback.answer(f"{status}. Перезапустите бота!")
+    if state is not None:
+        await state.update_data(admin_payment_return_callback=return_callback)
     await admin_webhook_settings(callback, state=state)
 
 
 async def _execute_generate_webhook_secret(callback: CallbackQuery, state: FSMContext | None = None):
+    return_callback = await _admin_payment_state_return(
+        state,
+        _admin_payment_action_source(getattr(callback, "data", None)),
+    )
     await _clear_admin_navigation_state(state)
     import secrets as _secrets
     new_secret = _secrets.token_urlsafe(32)
@@ -10767,58 +11733,69 @@ async def _execute_generate_webhook_secret(callback: CallbackQuery, state: FSMCo
         conf.webhook_secret = new_secret
         await session.commit()
     await callback.answer("🎲 Секрет сгенерирован! Перезапустите бота.")
+    if state is not None:
+        await state.update_data(admin_payment_return_callback=return_callback)
     await admin_webhook_settings(callback, state=state)
 
 
-@router.callback_query(F.data == "admin_gen_webhook_secret")
+@router.callback_query(F.data.startswith("admin_gen_webhook_secret"))
 async def admin_gen_webhook_secret(callback: CallbackQuery, state: FSMContext | None = None):
     if not await is_admin_actor(callback.from_user.id):
         await callback.answer("Недостаточно прав", show_alert=True)
         return
     if isinstance(callback, CallbackQuery):
+        return_callback = _admin_payment_action_source(callback.data)
         await _ask_admin_confirmation(
             callback,
             "Старый секрет перестанет работать после применения нового. Продолжить?",
-            "confirmed_admin_gen_webhook_secret",
-            "admin_webhook_settings",
+            _admin_payment_action_callback("confirmed_admin_gen_webhook_secret", return_callback),
+            _admin_payment_action_callback("admin_webhook_settings", return_callback),
         )
         return
     await _execute_generate_webhook_secret(callback, state)
 
 
-@router.callback_query(F.data == "admin_confirm_gen_webhook_secret")
+@router.callback_query(F.data.startswith("admin_confirm_gen_webhook_secret"))
 async def admin_confirm_gen_webhook_secret(callback: CallbackQuery, state: FSMContext | None = None):
     if not await is_admin_actor(callback.from_user.id):
         await callback.answer("Недостаточно прав", show_alert=True)
         return
+    return_callback = _admin_payment_action_source(callback.data)
     await _clear_admin_navigation_state(state)
+    if state is not None:
+        await state.update_data(admin_payment_return_callback=return_callback)
     await _ask_admin_confirmation(
         callback,
         "Старый секрет перестанет работать после применения нового. Продолжить?",
-        "confirmed_admin_gen_webhook_secret",
-        "admin_webhook_settings",
+        f"confirmed_admin_gen_webhook_secret__{return_callback}",
+        _admin_payment_action_callback("admin_webhook_settings", return_callback),
     )
 
 
-@router.callback_query(F.data == "confirmed_admin_gen_webhook_secret")
+@router.callback_query(F.data.startswith("confirmed_admin_gen_webhook_secret"))
 async def confirmed_admin_gen_webhook_secret(callback: CallbackQuery, state: FSMContext | None = None):
     if not await is_admin_actor(callback.from_user.id):
         await callback.answer("Недостаточно прав", show_alert=True)
         return
+    return_callback = _admin_payment_action_source(callback.data)
+    if state is not None:
+        await state.update_data(admin_payment_return_callback=return_callback)
     await _execute_generate_webhook_secret(callback, state)
 
 
-@router.callback_query(F.data == "admin_set_webhook_secret")
+@router.callback_query(F.data.startswith("admin_set_webhook_secret"))
 async def admin_set_webhook_secret(callback: CallbackQuery, state: FSMContext):
     if not await is_admin_actor(callback.from_user.id):
         await callback.answer("Недостаточно прав", show_alert=True)
         return
+    return_callback = _admin_payment_action_source(callback.data)
     await state.clear()
     await state.set_state(AdminStates.set_webhook_secret)
+    await state.update_data(admin_payment_return_callback=return_callback)
     await callback.answer()
 
     builder = InlineKeyboardBuilder()
-    builder.button(text="❌ Отмена", callback_data="admin_webhook_settings")
+    builder.button(text="❌ Отмена", callback_data=_admin_payment_action_callback("admin_webhook_settings", return_callback))
     await callback.message.answer(
         "🔑 <b>Секретный код для уведомлений</b>\n\n"
         "Секрет используется как часть URL, чтобы посторонние не могли отправлять ложные уведомления об оплате.\n\n"
@@ -10833,6 +11810,7 @@ async def save_webhook_secret(message: Message, state: FSMContext, bot: Bot):
     if not await is_admin_actor(message.from_user.id):
         await state.clear()
         return
+    return_callback = await _admin_payment_state_return(state)
     secret = message.text.strip()
     if not secret:
         await message.answer("Секрет не может быть пустым. Введите строку или нажмите «Отмена»:")
@@ -10845,21 +11823,24 @@ async def save_webhook_secret(message: Message, state: FSMContext, bot: Bot):
         conf.webhook_secret = secret
         await session.commit()
     await state.clear()
+    await state.update_data(admin_payment_return_callback=return_callback)
     asyncio.create_task(send_temp_notification(bot, message.chat.id, "✅ Секрет сохранён. Перезапустите бота для применения."))
-    await admin_webhook_settings(message)
+    await admin_webhook_settings(message, state=state)
 
 
-@router.callback_query(F.data == "admin_set_webhook_port")
+@router.callback_query(F.data.startswith("admin_set_webhook_port"))
 async def admin_set_webhook_port(callback: CallbackQuery, state: FSMContext):
     if not await is_admin_actor(callback.from_user.id):
         await callback.answer("Недостаточно прав", show_alert=True)
         return
+    return_callback = _admin_payment_action_source(callback.data)
     await state.clear()
     await state.set_state(AdminStates.set_webhook_port)
+    await state.update_data(admin_payment_return_callback=return_callback)
     await callback.answer()
 
     builder = InlineKeyboardBuilder()
-    builder.button(text="❌ Отмена", callback_data="admin_webhook_settings")
+    builder.button(text="❌ Отмена", callback_data=_admin_payment_action_callback("admin_webhook_settings", return_callback))
     await callback.message.answer(
         "🔌 <b>Порт для приема уведомлений</b>\n\n"
         "На этом порту бот будет слушать входящие уведомления об оплатах с лендинга.\n\n"
@@ -10876,6 +11857,7 @@ async def save_webhook_port(message: Message, state: FSMContext, bot: Bot):
     if not await is_admin_actor(message.from_user.id):
         await state.clear()
         return
+    return_callback = await _admin_payment_state_return(state)
     try:
         port = int(message.text.strip())
         if port < 1 or port > 65535:
@@ -10886,8 +11868,9 @@ async def save_webhook_port(message: Message, state: FSMContext, bot: Bot):
             conf.webhook_port = port
             await session.commit()
         await state.clear()
+        await state.update_data(admin_payment_return_callback=return_callback)
         asyncio.create_task(send_temp_notification(bot, message.chat.id, f"✅ Порт: {port}. Перезапустите бота для применения."))
-        await admin_webhook_settings(message)
+        await admin_webhook_settings(message, state=state)
     except ValueError:
         await message.answer("Нужно целое число. Попробуйте ещё раз:")
 

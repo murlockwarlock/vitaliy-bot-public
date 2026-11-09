@@ -166,3 +166,20 @@ jobs:
           python-version: "3.12"
       - name: Evaluate mandatory check results
         run: python scripts/ci_gate.py "$CI_MODE" "${{ needs.fast-ci.result }}" "${{ needs.preflight.result }}" "${{ needs.sqlite.result }}" "${{ needs.postgres.result }}"
+      - name: Build admin navigation map
+        if: always()
+        env:
+          CI_PREFLIGHT_RESULT: ${{ needs.preflight.result }}
+          CI_SQLITE_RESULT: ${{ needs.sqlite.result }}
+          CI_POSTGRES_RESULT: ${{ needs.postgres.result }}
+        run: python scripts/admin_navigation_map.py --output admin-navigation-map.md
+      - name: Publish admin navigation map to summary
+        if: always()
+        run: cat admin-navigation-map.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload admin navigation map artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: admin-navigation-map
+          path: admin-navigation-map.md
+          if-no-files-found: error

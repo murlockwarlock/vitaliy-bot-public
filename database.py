@@ -227,6 +227,21 @@ class MenuAnchor(Base):
     updated_at = Column(DateTime, default=msk_now, onupdate=msk_now, nullable=False)
 
 
+class AdminNavigationContext(Base):
+    __tablename__ = 'admin_navigation_contexts'
+
+    token = Column(String(32), primary_key=True)
+    admin_id = Column(BigInteger, nullable=False, index=True)
+    chat_id = Column(BigInteger, nullable=False, index=True)
+    message_id = Column(Integer, nullable=False)
+    return_callback = Column(String(255), nullable=False)
+    parent_callback = Column(String(255), nullable=True, default="admin_panel")
+    search_query = Column(Text, nullable=True)
+    reset_callback = Column(String(255), nullable=False)
+    reset_query = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=msk_now, nullable=False, index=True)
+
+
 class ReferralConfig(Base):
     __tablename__ = 'referral_config'
     id = Column(Integer, primary_key=True, default=1)
@@ -870,6 +885,15 @@ class JournalSettings(Base):
     updated_at = Column(DateTime, default=msk_now, onupdate=msk_now)
 
 
+class QuickNote(Base):
+    __tablename__ = 'quick_notes'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(BigInteger, ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
+    text = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=msk_now, nullable=False, index=True)
+    operation_key = Column(String(64), nullable=True, unique=True, index=True)
+
+
 class JournalQuestion(Base):
     __tablename__ = 'journal_questions'
     id = Column(Integer, primary_key=True, autoincrement=True)
@@ -1230,6 +1254,10 @@ async def _ensure_postgresql_compat_schema(conn):
     if conn.dialect.name != "postgresql":
         return
     await conn.execute(text(
+        'ALTER TABLE "admin_navigation_contexts" ADD COLUMN IF NOT EXISTS '
+        '"parent_callback" VARCHAR(255) NULL'
+    ))
+    await conn.execute(text(
         'ALTER TABLE "test_questions" ADD COLUMN IF NOT EXISTS "question_type" VARCHAR(32) NULL'
     ))
     await conn.execute(text(
@@ -1249,6 +1277,13 @@ async def _ensure_postgresql_compat_schema(conn):
     ))
     await conn.execute(text(
         'ALTER TABLE "journal_answers" ADD COLUMN IF NOT EXISTS "is_skipped" BOOLEAN NOT NULL DEFAULT FALSE'
+    ))
+    await conn.execute(text(
+        'ALTER TABLE "quick_notes" ADD COLUMN IF NOT EXISTS "operation_key" VARCHAR(64) NULL'
+    ))
+    await conn.execute(text(
+        'CREATE UNIQUE INDEX IF NOT EXISTS "ix_quick_notes_operation_key" '
+        'ON "quick_notes" ("operation_key") WHERE "operation_key" IS NOT NULL'
     ))
     await conn.execute(text(
         'ALTER TABLE "users" ADD COLUMN IF NOT EXISTS "welcome_shown_at" TIMESTAMP NULL'

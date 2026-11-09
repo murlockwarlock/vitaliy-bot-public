@@ -76,13 +76,11 @@ async def test_ai_logs_ux_inventory_and_labels_match_psychobot():
     btn_fallback_text = kb.format_ai_log_button(mock_log_fallback)
     assert btn_fallback_text.startswith("↪️ ❌ [F] "), "Fallback error followup marker must be '↪️ ❌ [F] '"
 
-    # 3. Two-row stable pagination
+    # 3. Stable single-row pagination
     page_rows = kb.fixed_pagination_rows(1, 3, lambda p: f"page_{p}")
-    assert len(page_rows) == 2, "Pagination must be exactly 2 rows"
-    row1 = [b.text for b in page_rows[0]]
-    assert row1 == ["⬅️ Назад", "2/3", "Вперёд ➡️"], "Row 1 must be [⬅️ Назад, X/Y, Вперёд ➡️]"
-    row2 = [b.text for b in page_rows[1]]
-    assert row2 == ["⏮ В начало", "В конец ⏭"], "Row 2 must be [⏮ В начало, В конец ⏭]"
+    assert len(page_rows) == 1, "Pagination must be exactly one row"
+    row = [b.text for b in page_rows[0]]
+    assert row == ["⬅️", "2/3", "➡️"], "Pagination must be [⬅️, X/Y, ➡️]"
 
     # 4. Detail keyboard buttons
     detail_markup = kb.admin_ai_log_detail_keyboard(1, page=0)
@@ -160,7 +158,7 @@ async def test_ai_logs_e2e_saving_and_admin_view_walkthrough():
     assert "Админ-панель" in msg_admin.answer.call_args[0][0]
     admin_markup = msg_admin.answer.call_args.kwargs.get("reply_markup") or msg_admin.answer.call_args[1].get("reply_markup")
     admin_btn_cbs = [b.callback_data for row in admin_markup.inline_keyboard for b in row]
-    assert "admin_ai_settings" in admin_btn_cbs, "Admin panel must have button to AI settings"
+    assert "admin_section_ai" in admin_btn_cbs, "Admin panel must have button to the AI and knowledge section"
 
     # --- Step 2: Admin clicks '🤖 Настройки ИИ' ---
     cb_ai_settings = _make_mock_cb(admin_id, "admin_ai_settings")
@@ -183,7 +181,7 @@ async def test_ai_logs_e2e_saving_and_admin_view_walkthrough():
     markup_p0 = cb_list_p0.message.edit_text.call_args.kwargs.get("reply_markup")
     p0_buttons = [b.text for row in markup_p0.inline_keyboard for b in row]
     assert any("1/" in b for b in p0_buttons), "Must show page 1 indicator"
-    assert "Вперёд ➡️" in p0_buttons, "Must show forward pagination button"
+    assert "➡️" in p0_buttons, "Must show forward pagination button"
 
     # --- Step 4: Admin clicks 'Вперёд ➡️' (Pagination to Page 1) ---
     cb_list_p1 = _make_mock_cb(admin_id, "admin_ai_logs_1_all")
@@ -256,7 +254,7 @@ async def test_ai_logs_e2e_saving_and_admin_view_walkthrough():
     assert "Настройки ИИ" in ai_back_text
     back_ai_markup = ai_back_call.call_args.kwargs.get("reply_markup")
     ai_back_btn = next(b for row in back_ai_markup.inline_keyboard for b in row if b.text == "⬅️ Назад")
-    assert ai_back_btn.callback_data == "admin_panel"
+    assert ai_back_btn.callback_data == "admin_section_ai"
 
     # --- Step 10: Admin clicks '⬅️ Назад' -> back to Admin Panel ---
     cb_back_panel = _make_mock_cb(admin_id, "admin_panel")

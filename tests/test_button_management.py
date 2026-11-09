@@ -756,9 +756,19 @@ class ButtonManagementTests(unittest.IsolatedAsyncioTestCase):
                 for markup in (page_one, page_two)
                 for row in markup.inline_keyboard
                 for item in row
-                if item.callback_data == "ignore"
+                if item.text in {"1/2", "2/2"}
             ]
             self.assertEqual(page_indicators, ["1/2", "2/2"])
+            page_rows = [
+                row
+                for markup in (page_one, page_two)
+                for row in markup.inline_keyboard
+                if any(item.text in {"1/2", "2/2"} for item in row)
+            ]
+            self.assertEqual([[item.text for item in row] for row in page_rows], [
+                ["⬅️", "1/2", "➡️"],
+                ["⬅️", "2/2", "➡️"],
+            ])
         finally:
             async with async_session_maker() as session:
                 for button_id in menu_button_ids:

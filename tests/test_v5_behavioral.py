@@ -815,7 +815,7 @@ class BehavioralV5Tests(unittest.IsolatedAsyncioTestCase):
             "user_id": 1050,
             "name": "Тестовый",
             "email": "test@example.invalid",
-            "phone": "TEST_PHONE
+            "phone": "TEST_PHONE"
         }
         with patch("landing_webhook.get_all_admin_ids", new=AsyncMock(return_value=[admin_id])):
             await landing_webhook.handle_incoming_webhook(payload_form, bot)
@@ -1481,7 +1481,7 @@ class BehavioralV5Tests(unittest.IsolatedAsyncioTestCase):
             "user_id": user_id,
             "landing_token": "tok_lead",
             "name": "Lead User",
-            "phone": "TEST_PHONE,
+            "phone": "TEST_PHONE",
             "email": "test@example.invalid"
         }
         with patch("landing_webhook.get_all_admin_ids", new=AsyncMock(return_value=[admin_id])):
@@ -1522,7 +1522,7 @@ class BehavioralV5Tests(unittest.IsolatedAsyncioTestCase):
             "user_id": user_id,
             "landing_token": "tok_dedup",
             "name": "Dedup User",
-            "phone": "TEST_PHONE,
+            "phone": "TEST_PHONE",
             "email": "test@example.invalid"
         }
 
@@ -1560,7 +1560,7 @@ class BehavioralV5Tests(unittest.IsolatedAsyncioTestCase):
             "event": "form_submitted",
             "user_id": user_id,
             "name": "Cool User",
-            "phone": "TEST_PHONE,
+            "phone": "TEST_PHONE",
             "email": "test@example.invalid",
             "landing_token": "tok_cool"
         }
@@ -1573,7 +1573,7 @@ class BehavioralV5Tests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("@cool_user_tg", text)
         self.assertIn(str(user_id), text)
         self.assertIn("Cool User", text)
-        self.assertIn("TEST_PHONE, text)
+        self.assertIn("TEST_PHONE", text)
         self.assertIn("test@example.invalid", text)
         self.assertIn("tok_cool", text)
 
@@ -4821,7 +4821,7 @@ class BehavioralV5Tests(unittest.IsolatedAsyncioTestCase):
 
     async def test_walkthrough_test_name_traceability_verification(self):
         walkthrough_paths = [
-            "/Users/ivankorakin/.gemini/antigravity-ide/brain/4fc0380a-d8e2-433b-bc5e-d1aa638da9bc/walkthrough.md",
+            "/tmp/test_user/path",
             os.path.join(os.path.dirname(os.path.dirname(__file__)), "walkthrough.md"),
         ]
 

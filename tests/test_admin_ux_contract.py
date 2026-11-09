@@ -14,19 +14,14 @@ from database import User, async_session_maker, init_db, Topic, AIConfig, Paymen
 from automation_admin import automation_menu
 
 
-# Exact contract table matching PsychoBot and Vitaliy
-PSYCHOBOT_TO_VITALIY_UX_CONTRACT = {
-    "clients": ("👥 Клиенты", "👥 Клиенты"),
-    "automations": ("⚙️ Автоматизации", "⚙️ Автоматизации"),
-    "ai_settings": ("🤖 Настройки ИИ", "🤖 Настройки ИИ"),
-    "knowledge_base": ("📚 База знаний", "📚 База знаний"),
-    "content": ("✏️ Контент", "✏️ Контент"),
-    "mailing": ("✉️ Рассылка", "✉️ Рассылка"),
-    "admins": ("👮\u200d♂️ Администраторы", "👮\u200d♂️ Администраторы"),
-    "topics": ("💬 Темы диалогов", "💬 Темы диалогов"),
-    "providers_and_models": ("⚙️ Провайдеры и модели", "⚙️ Провайдеры и модели"),
-    "ai_logs": ("📜 Логи запросов ИИ", "📜 Логи запросов ИИ"),
-    "subscriptions": ("⭐️ Подписки", "⭐️ Подписки"),
+ADMIN_SECTION_CONTRACT = {
+    "clients": ("👥 Клиенты", "admin_clients_list_0"),
+    "ai": ("🤖 ИИ и знания", "admin_section_ai"),
+    "content": ("✏️ Контент и программы", "admin_section_content"),
+    "automation": ("⚙️ Автоматизации", "admin_section_automation"),
+    "payments": ("💳 Подписки и оплата", "admin_payment_settings"),
+    "logs": ("📋 Логи", "admin_section_logs"),
+    "admins": ("👮 Администраторы", "admin_manage_admins"),
 }
 
 
@@ -82,30 +77,25 @@ class AdminUXContractTests(unittest.IsolatedAsyncioTestCase):
         return cb
 
     def test_ux_contract_admin_panel_labels(self):
-        """Assert all 1:1 common buttons in admin_panel_keyboard match PsychoBot exactly."""
+        """The root admin screen contains exactly the seven agreed sections."""
         admin_kb = kb.admin_panel_keyboard()
-        button_texts = [btn.text for row in admin_kb.inline_keyboard for btn in row]
-
-        for feature_key, (psycho_label, vitaliy_label) in PSYCHOBOT_TO_VITALIY_UX_CONTRACT.items():
-            if feature_key == "providers_and_models":
-                continue  # This is inside ai_settings_keyboard, verified below
-            self.assertEqual(
-                psycho_label, vitaliy_label,
-                f"Contract mismatch: {feature_key} has divergent specifications"
-            )
-            self.assertIn(
-                vitaliy_label, button_texts,
-                f"UX CONTRACT VIOLATION: Button '{vitaliy_label}' for feature '{feature_key}' "
-                f"is missing from admin_panel_keyboard!"
-            )
+        buttons = [
+            (button.text, button.callback_data)
+            for row in admin_kb.inline_keyboard
+            for button in row
+        ]
+        self.assertEqual(
+            buttons,
+            list(ADMIN_SECTION_CONTRACT.values()),
+        )
 
     def test_ux_contract_ai_settings_labels(self):
         """Assert AI settings sub-menu labels match PsychoBot exactly."""
         ai_kb = kb.ai_settings_keyboard("OpenAI")
         button_texts = [btn.text for row in ai_kb.inline_keyboard for btn in row]
 
-        expected_provider_btn = PSYCHOBOT_TO_VITALIY_UX_CONTRACT["providers_and_models"][1]
-        expected_logs_btn = PSYCHOBOT_TO_VITALIY_UX_CONTRACT["ai_logs"][1]
+        expected_provider_btn = "⚙️ Провайдеры и модели"
+        expected_logs_btn = "📜 Логи запросов ИИ"
 
         self.assertIn(
             expected_provider_btn, button_texts,
@@ -117,33 +107,24 @@ class AdminUXContractTests(unittest.IsolatedAsyncioTestCase):
         )
 
     def test_ux_contract_fails_if_any_common_button_renamed(self):
-        """Proof that the contract test strictly rejects renames or missing unified buttons."""
+        """The root labels are protected against accidental renames."""
         real_texts = [btn.text for row in kb.admin_panel_keyboard().inline_keyboard for btn in row]
-        for feature_key, (_, vitaliy_label) in PSYCHOBOT_TO_VITALIY_UX_CONTRACT.items():
-            if feature_key == "providers_and_models":
-                continue
+        for vitaliy_label, _ in ADMIN_SECTION_CONTRACT.values():
             # If the button were renamed in the keyboard:
             mutated_texts = [t if t != vitaliy_label else "❌ Случайное переименование" for t in real_texts]
             with self.assertRaises(AssertionError):
                 self.assertIn(vitaliy_label, mutated_texts)
 
-    async def test_admin_routes_entry_and_back_to_admin(self):
-        """Verify navigation loop: /admin -> each common button -> screen -> Назад -> /admin."""
+    async def test_admin_routes_entry_and_back_to_parent_section(self):
+        """Verify real screens return to their current parent section."""
         # 1. Start from /admin
         root_kb = kb.admin_panel_keyboard()
         cb_map = {btn.text: btn.callback_data for row in root_kb.inline_keyboard for btn in row}
 
-        # Check all core entries have registered callbacks
-        self.assertIn("👥 Клиенты", cb_map)
-        self.assertIn("⚙️ Автоматизации", cb_map)
-        self.assertIn("🤖 Настройки ИИ", cb_map)
-        self.assertIn("⭐️ Подписки", cb_map)
-        self.assertIn("📚 База знаний", cb_map)
-        self.assertIn("✏️ Контент", cb_map)
-        self.assertIn("💬 Темы диалогов", cb_map)
-        self.assertIn("👮\u200d♂️ Администраторы", cb_map)
-        self.assertIn("✉️ Рассылка", cb_map)
-        self.assertIn("📜 Логи запросов ИИ", cb_map)
+        self.assertEqual(
+            {label: cb_map[label] for label, _ in ADMIN_SECTION_CONTRACT.values()},
+            dict(ADMIN_SECTION_CONTRACT.values()),
+        )
 
         # 2. Test each screen's back navigation to admin_panel
         # Clients
@@ -154,7 +135,7 @@ class AdminUXContractTests(unittest.IsolatedAsyncioTestCase):
             mock_send.assert_called_once()
             markup = mock_send.call_args[0][3]
             back_buttons = [b.callback_data for row in markup.inline_keyboard for b in row]
-            self.assertIn("admin_panel", back_buttons)
+            self.assertTrue(any(value.startswith("admin_clients_back:") for value in back_buttons))
 
         # Automations
         cb = self.create_mock_callback(self.admin_id, "automation_menu")
@@ -164,7 +145,7 @@ class AdminUXContractTests(unittest.IsolatedAsyncioTestCase):
             called_markup = (cb.message.edit_text.call_args[1].get("reply_markup")
                              if cb.message.edit_text.called else mock_send.call_args[0][3])
             back_buttons = [b.callback_data for row in called_markup.inline_keyboard for b in row]
-            self.assertIn("admin_panel", back_buttons)
+            self.assertIn("admin_section_automation", back_buttons)
 
         # AI Settings
         cb = self.create_mock_callback(self.admin_id, "admin_ai_settings")
@@ -173,17 +154,23 @@ class AdminUXContractTests(unittest.IsolatedAsyncioTestCase):
             mock_send.assert_called_once()
             markup = mock_send.call_args[0][3]
             back_buttons = [b.callback_data for row in markup.inline_keyboard for b in row]
+            self.assertIn("admin_section_ai", back_buttons)
+
+        # Subscriptions / Payments, including the old dedicated subscriptions route
+        cb = self.create_mock_callback(self.admin_id, "admin_payment_settings")
+        with patch("handlers.send_smart_content", new_callable=AsyncMock) as mock_send:
+            await handlers.admin_payment_settings(cb)
+            mock_send.assert_called_once()
+            markup = mock_send.call_args[0][3]
+            back_buttons = [b.callback_data for row in markup.inline_keyboard for b in row]
             self.assertIn("admin_panel", back_buttons)
 
-        # Subscriptions / Payments (both aliases)
-        for sub_cb_str in ["admin_payment_settings", "admin_subscriptions"]:
-            cb = self.create_mock_callback(self.admin_id, sub_cb_str)
-            with patch("handlers.send_smart_content", new_callable=AsyncMock) as mock_send:
-                await handlers.admin_payment_settings(cb)
-                mock_send.assert_called_once()
-                markup = mock_send.call_args[0][3]
-                back_buttons = [b.callback_data for row in markup.inline_keyboard for b in row]
-                self.assertIn("admin_panel", back_buttons)
+        cb = self.create_mock_callback(self.admin_id, "admin_subscriptions")
+        await handlers.admin_subscriptions_menu(cb)
+        legacy_markup = cb.message.edit_text.call_args.kwargs["reply_markup"]
+        legacy_callbacks = [b.callback_data for row in legacy_markup.inline_keyboard for b in row]
+        self.assertIn("admin_manage_plans", legacy_callbacks)
+        self.assertIn("admin_prodamus_settings", legacy_callbacks)
 
         # Knowledge Base
         cb = self.create_mock_callback(self.admin_id, "admin_kb_page_0")
@@ -192,7 +179,7 @@ class AdminUXContractTests(unittest.IsolatedAsyncioTestCase):
             mock_send.assert_called_once()
             markup = mock_send.call_args[0][3]
             back_buttons = [b.callback_data for row in markup.inline_keyboard for b in row]
-            self.assertIn("admin_panel", back_buttons)
+            self.assertIn("admin_section_ai", back_buttons)
 
         # Content editor
         cb = self.create_mock_callback(self.admin_id, "admin_content_list")
@@ -201,7 +188,7 @@ class AdminUXContractTests(unittest.IsolatedAsyncioTestCase):
             mock_send.assert_called_once()
             markup = mock_send.call_args[0][3]
             back_buttons = [b.callback_data for row in markup.inline_keyboard for b in row]
-            self.assertIn("admin_panel", back_buttons)
+            self.assertIn("admin_section_content", back_buttons)
 
         # Topics (both aliases)
         for topic_cb_str in ["admin_topics_list", "admin_topics_page_0"]:
@@ -211,7 +198,7 @@ class AdminUXContractTests(unittest.IsolatedAsyncioTestCase):
                 mock_send.assert_called_once()
                 markup = mock_send.call_args[0][3]
                 back_buttons = [b.callback_data for row in markup.inline_keyboard for b in row]
-                self.assertIn("admin_panel", back_buttons)
+                self.assertIn("admin_section_ai", back_buttons)
 
         # Legacy menu-buttons callback remains an alias, while the visible entry
         # is the unified Content editor.
@@ -237,7 +224,7 @@ class AdminUXContractTests(unittest.IsolatedAsyncioTestCase):
         await handlers.mailing_start(cb, fsm)
         sent_markup = cb.message.answer.call_args[1].get("reply_markup")
         back_buttons = [b.callback_data for row in sent_markup.inline_keyboard for b in row]
-        self.assertIn("admin_panel", back_buttons)
+        self.assertIn("admin_section_automation", back_buttons)
 
         # Providers and models (sub-screen of AI settings)
         cb = self.create_mock_callback(self.admin_id, "admin_ai_keys")
@@ -247,6 +234,34 @@ class AdminUXContractTests(unittest.IsolatedAsyncioTestCase):
             markup = mock_send.call_args[0][3]
             back_buttons = [b.callback_data for row in markup.inline_keyboard for b in row]
             self.assertIn("admin_ai_settings", back_buttons)
+
+    def test_payment_menu_contains_only_direct_management_actions(self):
+        markup = kb.admin_payment_keyboard()
+        callbacks = [
+            button.callback_data
+            for row in markup.inline_keyboard
+            for button in row
+            if button.callback_data
+        ]
+        assert callbacks == [
+            "admin_manage_plans",
+            "admin_subs_list_0_all",
+            "admin_promocodes",
+            "admin_payment_stats:admin_payment_settings",
+            "admin_plog_0_all",
+            "admin_referral_settings",
+            "admin_prodamus_settings",
+            "admin_panel",
+        ]
+
+    def test_one_button_section_callbacks_are_not_visible_root_menus(self):
+        root_callbacks = [
+            button.callback_data
+            for row in kb.admin_panel_keyboard().inline_keyboard
+            for button in row
+        ]
+        assert "admin_section_clients" not in root_callbacks
+        assert "admin_section_admins" not in root_callbacks
 
     async def test_admin_manage_buttons_workflow_and_back_routing(self):
         """The unified Content editor exposes sections and human button actions."""

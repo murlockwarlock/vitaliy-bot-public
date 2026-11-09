@@ -3,6 +3,7 @@
 import html
 import json
 import logging
+import math
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -37,6 +38,59 @@ class JournalAdminStates(StatesGroup):
     new_question_text = State()
     edit_question_text = State()
     edit_points = State()
+
+
+_JOURNAL_QUESTION_PAGE_SIZE = 10
+
+
+def _journal_question_id(data: str) -> int:
+    return int(data.split(":")[1])
+
+
+def _journal_question_page(data: str) -> int:
+    parts = data.split(":")
+    if len(parts) < 3:
+        return 0
+    try:
+        return max(0, int(parts[2]))
+    except (TypeError, ValueError):
+        return 0
+
+
+async def _journal_question_page_data(page: int) -> tuple[list[JournalQuestion], int, int]:
+    async with async_session_maker() as session:
+        total = await session.scalar(select(func.count(JournalQuestion.id))) or 0
+        total_pages = max(1, math.ceil(total / _JOURNAL_QUESTION_PAGE_SIZE)) if total else 1
+        page = max(0, min(int(page or 0), total_pages - 1))
+        questions = list(
+            (
+                await session.execute(
+                    select(JournalQuestion)
+                    .order_by(JournalQuestion.order_num.asc(), JournalQuestion.id.asc())
+                    .offset(page * _JOURNAL_QUESTION_PAGE_SIZE)
+                    .limit(_JOURNAL_QUESTION_PAGE_SIZE)
+                )
+            ).scalars().all()
+        )
+    return questions, page, total_pages
+
+
+async def _send_journal_question_list(target, page: int = 0):
+    questions, page, total_pages = await _journal_question_page_data(page)
+    text = (
+        "📝 <b>Вопросы Дневника саморефлексии</b>\n\n"
+        f"Страница {page + 1} из {total_pages}.\n"
+        "Здесь вы можете добавлять, редактировать, включать/выключать, "
+        "менять порядок и удалять вопросы. Для обычного вопроса достаточно текста; "
+        "для шкалы и вариантов ответа доступны расширенные настройки.\n"
+        "<i>Активные вопросы в текущем порядке задаются пользователям при рефлексии.</i>"
+    )
+    markup = journal_admin_questions_keyboard(questions, page, total_pages)
+    if isinstance(target, CallbackQuery) or hasattr(target, "data"):
+        await send_smart_content(target, text, None, markup)
+    else:
+        await target.answer(text, reply_markup=markup, parse_mode="HTML")
+    return page
 
 
 def _journal_type_label(question_type: str) -> str:
@@ -140,39 +194,60 @@ async def admin_journal_menu_handler(callback: CallbackQuery, state: FSMContext)
 
 
 @router.callback_query(F.data == "j_adm_q_list")
+@router.callback_query(F.data.startswith("j_adm_q_list_page:"))
 async def admin_journal_q_list_handler(callback: CallbackQuery, state: FSMContext):
     if not await _ensure_admin(callback):
         return
     await state.clear()
+    try:
+        page = int(callback.data.rsplit(":", 1)[1]) if ":" in callback.data else 0
+    except ValueError:
+        page = 0
+    page_size = 10
     async with async_session_maker() as session:
+        total = await session.scalar(select(func.count(JournalQuestion.id))) or 0
+        total_pages = max(1, math.ceil(total / page_size)) if total else 1
+        page = max(0, min(page, total_pages - 1))
         questions = (
             await session.execute(
-                select(JournalQuestion).order_by(JournalQuestion.order_num.asc(), JournalQuestion.id.asc())
+                select(JournalQuestion)
+                .order_by(JournalQuestion.order_num.asc(), JournalQuestion.id.asc())
+                .offset(page * page_size)
+                .limit(page_size)
             )
         ).scalars().all()
 
     text = (
         "📝 <b>Вопросы Дневника саморефлексии</b>\n\n"
+        f"Страница {page + 1} из {total_pages}.\n"
         "Здесь вы можете добавлять, редактировать, включать/выключать, "
         "менять порядок и удалять вопросы. Для обычного вопроса достаточно текста; "
         "для шкалы и вариантов ответа доступны расширенные настройки.\n"
         "<i>Активные вопросы в текущем порядке задаются пользователям при рефлексии.</i>"
     )
-    await send_smart_content(callback, text, None, journal_admin_questions_keyboard(list(questions)))
+    await send_smart_content(
+        callback,
+        text,
+        None,
+        journal_admin_questions_keyboard(list(questions), page, total_pages),
+    )
     await callback.answer()
 
 
 @router.callback_query(F.data == "j_adm_q_add")
+@router.callback_query(F.data.startswith("j_adm_q_add:"))
 async def admin_journal_q_add_handler(callback: CallbackQuery, state: FSMContext):
     if not await _ensure_admin(callback):
         return
+    page = _journal_question_page(callback.data)
     await state.set_state(JournalAdminStates.new_question_text)
+    await state.update_data(journal_questions_page=page)
     text = (
         "➕ <b>Добавление нового вопроса</b>\n\n"
         "Отправь текст нового вопроса. Для обычного вопроса достаточно одной фразы.\n"
         "Если нужно настроить шкалу или варианты ответа, дополнительные параметры можно передать в расширенном формате."
     )
-    await send_smart_content(callback, text, None, journal_admin_cancel_keyboard("j_adm_q_list"))
+    await send_smart_content(callback, text, None, journal_admin_cancel_keyboard(f"j_adm_q_list_page:{page}"))
     await callback.answer()
 
 
@@ -186,6 +261,8 @@ async def admin_journal_q_add_submit(message: Message, state: FSMContext):
         await message.answer(f"⚠️ Не удалось разобрать вопрос: {html.escape(str(exc))}")
         return
 
+    data = await state.get_data()
+    page = data.get("journal_questions_page", 0)
     async with async_session_maker() as session:
         max_order = (await session.scalar(select(func.coalesce(func.max(JournalQuestion.order_num), 0)))) or 0
         new_q = JournalQuestion(
@@ -209,16 +286,9 @@ async def admin_journal_q_add_submit(message: Message, state: FSMContext):
             q.order_num = idx
         await session.commit()
 
-        refreshed = (
-            await session.execute(
-                select(JournalQuestion).order_by(JournalQuestion.order_num.asc(), JournalQuestion.id.asc())
-            )
-        ).scalars().all()
-
     await state.clear()
     await message.answer("✅ Вопрос успешно добавлен!")
-    text = "📝 <b>Вопросы Дневника саморефлексии</b>\n\nТекущий список вопросов:"
-    await message.answer(text, reply_markup=journal_admin_questions_keyboard(list(refreshed)), parse_mode="HTML")
+    await _send_journal_question_list(message, page)
 
 
 @router.callback_query(F.data.startswith("j_adm_q_ed:"))
@@ -226,7 +296,7 @@ async def admin_journal_q_edit_handler(callback: CallbackQuery, state: FSMContex
     if not await _ensure_admin(callback):
         return
     try:
-        qid = int(callback.data.split(":")[1])
+        qid = _journal_question_id(callback.data)
     except (IndexError, ValueError):
         await callback.answer("Ошибка параметров.", show_alert=True)
         return
@@ -238,14 +308,19 @@ async def admin_journal_q_edit_handler(callback: CallbackQuery, state: FSMContex
         return
 
     await state.set_state(JournalAdminStates.edit_question_text)
-    await state.update_data(question_id=qid)
+    await state.update_data(question_id=qid, journal_questions_page=_journal_question_page(callback.data))
     text = (
         f"✏️ <b>Редактирование вопроса #{q.order_num}</b>\n\n"
         f"Текущий текст:\n<i>{html.escape(q.text)}</i>\n\n"
         "Отправь новый текст вопроса. Текущий тип ответа и варианты сохранятся.\n"
         "Для расширенной настройки можно использовать дополнительный формат:"
     )
-    await send_smart_content(callback, text, None, journal_admin_cancel_keyboard("j_adm_q_list"))
+    await send_smart_content(
+        callback,
+        text,
+        None,
+        journal_admin_cancel_keyboard(f"j_adm_q_list_page:{_journal_question_page(callback.data)}"),
+    )
     await callback.answer()
 
 
@@ -255,6 +330,7 @@ async def admin_journal_q_edit_submit(message: Message, state: FSMContext):
         return
     data = await state.get_data()
     qid = data.get("question_id")
+    page = data.get("journal_questions_page", 0)
 
     async with async_session_maker() as session:
         q = await session.get(JournalQuestion, qid)
@@ -284,16 +360,9 @@ async def admin_journal_q_edit_submit(message: Message, state: FSMContext):
                 for index, item in enumerate(all_q, start=1):
                     item.order_num = index
             await session.commit()
-        refreshed = (
-            await session.execute(
-                select(JournalQuestion).order_by(JournalQuestion.order_num.asc(), JournalQuestion.id.asc())
-            )
-        ).scalars().all()
-
     await state.clear()
     await message.answer("✅ Вопрос обновлён!")
-    text = "📝 <b>Вопросы Дневника саморефлексии</b>\n\nТекущий список вопросов:"
-    await message.answer(text, reply_markup=journal_admin_questions_keyboard(list(refreshed)), parse_mode="HTML")
+    await _send_journal_question_list(message, page)
 
 
 @router.callback_query(F.data.startswith("j_adm_q_tog:"))
@@ -303,7 +372,8 @@ async def admin_journal_q_tog_handler(callback: CallbackQuery, state: FSMContext
     if state is not None:
         await state.clear()
     try:
-        qid = int(callback.data.split(":")[1])
+        qid = _journal_question_id(callback.data)
+        page = _journal_question_page(callback.data)
     except (IndexError, ValueError):
         await callback.answer("Ошибка параметров.", show_alert=True)
         return
@@ -313,14 +383,14 @@ async def admin_journal_q_tog_handler(callback: CallbackQuery, state: FSMContext
         if q:
             q.is_active = not q.is_active
             await session.commit()
-        refreshed = (
-            await session.execute(
-                select(JournalQuestion).order_by(JournalQuestion.order_num.asc(), JournalQuestion.id.asc())
-            )
-        ).scalars().all()
-
     text = "📝 <b>Вопросы Дневника саморефлексии</b>\n\nТекущий список вопросов:"
-    await send_smart_content(callback, text, None, journal_admin_questions_keyboard(list(refreshed)))
+    questions, page, total_pages = await _journal_question_page_data(page)
+    await send_smart_content(
+        callback,
+        text,
+        None,
+        journal_admin_questions_keyboard(questions, page, total_pages),
+    )
     await callback.answer("Статус вопроса изменен.")
 
 
@@ -331,7 +401,8 @@ async def admin_journal_q_up_handler(callback: CallbackQuery, state: FSMContext 
     if state is not None:
         await state.clear()
     try:
-        qid = int(callback.data.split(":")[1])
+        qid = _journal_question_id(callback.data)
+        page = _journal_question_page(callback.data)
     except (IndexError, ValueError):
         await callback.answer("Ошибка параметров.", show_alert=True)
         return
@@ -348,14 +419,14 @@ async def admin_journal_q_up_handler(callback: CallbackQuery, state: FSMContext 
         if idx > 0:
             reorder_questions(questions, qid, idx)
             await session.commit()
-        refreshed = (
-            await session.execute(
-                select(JournalQuestion).order_by(JournalQuestion.order_num.asc(), JournalQuestion.id.asc())
-            )
-        ).scalars().all()
-
     text = "📝 <b>Вопросы Дневника саморефлексии</b>\n\nТекущий список вопросов:"
-    await send_smart_content(callback, text, None, journal_admin_questions_keyboard(list(refreshed)))
+    questions, page, total_pages = await _journal_question_page_data(page)
+    await send_smart_content(
+        callback,
+        text,
+        None,
+        journal_admin_questions_keyboard(questions, page, total_pages),
+    )
     await callback.answer()
 
 
@@ -366,7 +437,8 @@ async def admin_journal_q_dn_handler(callback: CallbackQuery, state: FSMContext 
     if state is not None:
         await state.clear()
     try:
-        qid = int(callback.data.split(":")[1])
+        qid = _journal_question_id(callback.data)
+        page = _journal_question_page(callback.data)
     except (IndexError, ValueError):
         await callback.answer("Ошибка параметров.", show_alert=True)
         return
@@ -383,14 +455,14 @@ async def admin_journal_q_dn_handler(callback: CallbackQuery, state: FSMContext 
         if 0 <= idx < len(questions) - 1:
             reorder_questions(questions, qid, idx + 2)
             await session.commit()
-        refreshed = (
-            await session.execute(
-                select(JournalQuestion).order_by(JournalQuestion.order_num.asc(), JournalQuestion.id.asc())
-            )
-        ).scalars().all()
-
     text = "📝 <b>Вопросы Дневника саморефлексии</b>\n\nТекущий список вопросов:"
-    await send_smart_content(callback, text, None, journal_admin_questions_keyboard(list(refreshed)))
+    questions, page, total_pages = await _journal_question_page_data(page)
+    await send_smart_content(
+        callback,
+        text,
+        None,
+        journal_admin_questions_keyboard(questions, page, total_pages),
+    )
     await callback.answer()
 
 
@@ -401,7 +473,8 @@ async def admin_journal_q_del_confirm_handler(callback: CallbackQuery, state: FS
     if state is not None:
         await state.clear()
     try:
-        qid = int(callback.data.split(":")[1])
+        qid = _journal_question_id(callback.data)
+        page = _journal_question_page(callback.data)
     except (IndexError, ValueError):
         await callback.answer("Ошибка параметров.", show_alert=True)
         return
@@ -417,8 +490,8 @@ async def admin_journal_q_del_confirm_handler(callback: CallbackQuery, state: FS
             "Связанные ответы пользователей сохранятся, но вопрос исчезнет из будущих рефлексий.",
             reply_markup=InlineKeyboardMarkup(
                 inline_keyboard=[
-                    [InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"j_adm_q_del_execute:{qid}")],
-                    [InlineKeyboardButton(text="⬅️ Отмена", callback_data="j_adm_q_list")],
+                    [InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"j_adm_q_del_execute:{qid}:{page}")],
+                    [InlineKeyboardButton(text="⬅️ Отмена", callback_data=f"j_adm_q_list_page:{page}")],
                 ]
             ),
             parse_mode="HTML",
@@ -426,7 +499,12 @@ async def admin_journal_q_del_confirm_handler(callback: CallbackQuery, state: FS
     await callback.answer()
 
 
-async def _execute_journal_question_delete(callback: CallbackQuery, state: FSMContext | None, qid: int):
+async def _execute_journal_question_delete(
+    callback: CallbackQuery,
+    state: FSMContext | None,
+    qid: int,
+    page: int = 0,
+):
     if state is not None:
         await state.clear()
     async with async_session_maker() as session:
@@ -443,14 +521,14 @@ async def _execute_journal_question_delete(callback: CallbackQuery, state: FSMCo
         for idx, q in enumerate(remaining, start=1):
             q.order_num = idx
         await session.commit()
-        refreshed = (
-            await session.execute(
-                select(JournalQuestion).order_by(JournalQuestion.order_num.asc(), JournalQuestion.id.asc())
-            )
-        ).scalars().all()
-
     text = "📝 <b>Вопросы Дневника саморефлексии</b>\n\nТекущий список вопросов:"
-    await send_smart_content(callback, text, None, journal_admin_questions_keyboard(list(refreshed)))
+    questions, page, total_pages = await _journal_question_page_data(page)
+    await send_smart_content(
+        callback,
+        text,
+        None,
+        journal_admin_questions_keyboard(questions, page, total_pages),
+    )
     await callback.answer("Вопрос удален.")
 
 
@@ -461,7 +539,8 @@ async def admin_journal_q_del_handler(callback: CallbackQuery, state: FSMContext
     if state is not None:
         await state.clear()
     try:
-        qid = int(callback.data.split(":")[1])
+        qid = _journal_question_id(callback.data)
+        page = _journal_question_page(callback.data)
     except (IndexError, ValueError):
         await callback.answer("Ошибка параметров.", show_alert=True)
         return
@@ -472,7 +551,7 @@ async def admin_journal_q_del_handler(callback: CallbackQuery, state: FSMContext
             state,
         )
         return
-    await _execute_journal_question_delete(callback, state, qid)
+    await _execute_journal_question_delete(callback, state, qid, page)
 
 
 @router.callback_query(F.data.startswith("j_adm_q_del_execute:"))
@@ -480,11 +559,12 @@ async def admin_journal_q_del_execute_handler(callback: CallbackQuery, state: FS
     if not await _ensure_admin(callback):
         return
     try:
-        qid = int(callback.data.split(":")[1])
+        qid = _journal_question_id(callback.data)
+        page = _journal_question_page(callback.data)
     except (IndexError, ValueError):
         await callback.answer("Ошибка параметров.", show_alert=True)
         return
-    await _execute_journal_question_delete(callback, state, qid)
+    await _execute_journal_question_delete(callback, state, qid, page)
 
 
 @router.callback_query(F.data == "j_adm_pts_edit")

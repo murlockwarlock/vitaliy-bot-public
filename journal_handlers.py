@@ -21,6 +21,7 @@ from database import (
     JournalEntry,
     JournalQuestion,
     JournalSettings,
+    QuickNote,
     User,
     async_session_maker,
 )
@@ -37,6 +38,9 @@ from journal_keyboards import (
     journal_question_keyboard,
     journal_reminder_time_keyboard,
     journal_snooze_menu_keyboard,
+    quick_note_detail_keyboard,
+    quick_note_input_keyboard,
+    quick_notes_keyboard,
 )
 from journal_service import (
     build_questions_snapshot,
@@ -48,6 +52,8 @@ from time_utils import msk_now
 from universal_tests import QUESTION_TYPE_TEXT, normalize_question_type
 
 logger = logging.getLogger("journal_handlers")
+_quick_note_save_locks: dict[int, asyncio.Lock] = {}
+_QUICK_NOTE_PAGE_SIZE = 10
 
 router = Router(name="journal")
 
@@ -55,6 +61,7 @@ router = Router(name="journal")
 class JournalStates(StatesGroup):
     answering_question = State()
     setting_reminder_time = State()
+    quick_note_input = State()
 
 
 def _snapshot_question(snapshot: list[dict[str, Any]], position: int) -> dict[str, Any] | None:
@@ -288,8 +295,14 @@ async def cb_journal_open_stats(callback: CallbackQuery, bot: Bot) -> None:
 
 
 @router.callback_query(F.data == "mode_journal")
-async def cb_mode_journal(callback: CallbackQuery, bot: Bot) -> None:
+async def cb_mode_journal(
+    callback: CallbackQuery,
+    bot: Bot,
+    state: FSMContext | None = None,
+) -> None:
     """Root entry point for Journal feature."""
+    if state is not None:
+        await state.clear()
     if not await check_paid_access(callback, bot, topic_slug="journal"):
         return
 
@@ -300,6 +313,236 @@ async def cb_mode_journal(callback: CallbackQuery, bot: Bot) -> None:
 
     await show_journal_menu(callback, bot)
     await callback.answer()
+
+
+def _quick_note_page_from_callback(data: str) -> int:
+    try:
+        return max(0, int(data.rsplit(":", 1)[1]))
+    except (TypeError, ValueError):
+        return 0
+
+
+async def _render_quick_notes(
+    target: Any,
+    bot: Bot,
+    page: int = 0,
+    *,
+    notice: str | None = None,
+) -> None:
+    user_id = target.from_user.id
+    async with async_session_maker() as session:
+        total_count = await session.scalar(
+            select(func.count(QuickNote.id)).where(QuickNote.user_id == user_id)
+        ) or 0
+        total_pages = max(1, (total_count + _QUICK_NOTE_PAGE_SIZE - 1) // _QUICK_NOTE_PAGE_SIZE)
+        page = max(0, min(int(page or 0), total_pages - 1))
+        notes = (await session.scalars(
+            select(QuickNote)
+            .where(QuickNote.user_id == user_id)
+            .order_by(QuickNote.created_at.desc(), QuickNote.id.desc())
+            .offset(page * _QUICK_NOTE_PAGE_SIZE)
+            .limit(_QUICK_NOTE_PAGE_SIZE)
+        )).all()
+
+    lines = []
+    if notice:
+        lines.extend([notice, ""])
+    lines.extend([
+        "📝 <b>Оперативные записи</b>",
+        f"Страница {page + 1} из {total_pages}",
+        "",
+    ])
+    if notes:
+        lines.append("Выберите запись, чтобы открыть полный текст:")
+        for note in notes:
+            created_at = note.created_at.strftime("%d.%m.%Y %H:%M") if note.created_at else "дата неизвестна"
+            preview = " ".join((note.text or "").split())
+            if len(preview) > 120:
+                preview = preview[:117] + "..."
+            lines.append(f"• {html.escape(created_at)} — {html.escape(preview or 'Без текста')}")
+    else:
+        lines.append("Здесь можно сохранить мысль отдельно от ежедневного дневника, серии и наград.")
+
+    markup = quick_notes_keyboard(page, total_pages, notes)
+    is_callback = isinstance(target, CallbackQuery) or (
+        hasattr(target, "data") and hasattr(target, "message")
+    )
+    if is_callback:
+        await send_smart_content(target, "\n".join(lines), None, markup, bot=bot)
+    else:
+        await target.answer("\n".join(lines), parse_mode="HTML", reply_markup=markup)
+
+
+@router.callback_query(F.data == "quick_notes")
+@router.callback_query(F.data.startswith("quick_notes_page:"))
+async def cb_quick_notes(
+    callback: CallbackQuery,
+    bot: Bot,
+    state: FSMContext | None = None,
+) -> None:
+    if state is not None:
+        await state.clear()
+    if not await check_paid_access(callback, bot, topic_slug="journal"):
+        return
+    page = _quick_note_page_from_callback(callback.data) if ":" in callback.data else 0
+    await _render_quick_notes(callback, bot, page)
+    await callback.answer()
+
+
+def _split_quick_note_text(text: str, limit: int = 3000) -> list[str]:
+    text = text or ""
+    if not text:
+        return [""]
+
+    chunks = []
+    current = []
+    current_size = 0
+    for character in text:
+        escaped_size = len(html.escape(character))
+        if current and current_size + escaped_size > limit:
+            chunks.append("".join(current))
+            current = []
+            current_size = 0
+        current.append(character)
+        current_size += escaped_size
+    if current:
+        chunks.append("".join(current))
+    return chunks
+
+
+@router.callback_query(F.data.startswith("quick_note_view:"))
+async def cb_quick_note_view(
+    callback: CallbackQuery,
+    bot: Bot,
+    state: FSMContext | None = None,
+) -> None:
+    if state is not None:
+        await state.clear()
+    if not await check_paid_access(callback, bot, topic_slug="journal"):
+        return
+
+    parts = callback.data.split(":")
+    try:
+        note_id = int(parts[1])
+        page = max(0, int(parts[2])) if len(parts) > 2 else 0
+    except (TypeError, ValueError):
+        await callback.answer("Запись не найдена.", show_alert=True)
+        return
+
+    async with async_session_maker() as session:
+        note = await session.scalar(
+            select(QuickNote).where(
+                QuickNote.id == note_id,
+                QuickNote.user_id == callback.from_user.id,
+            )
+        )
+    if note is None:
+        await callback.answer("Запись не найдена или принадлежит другому пользователю.", show_alert=True)
+        return
+
+    created_at = note.created_at.strftime("%d.%m.%Y %H:%M") if note.created_at else "дата неизвестна"
+    chunks = _split_quick_note_text(note.text)
+    for index, chunk in enumerate(chunks):
+        detail_text = (
+            "📝 <b>Оперативная запись</b>\n"
+            f"📅 <b>Дата и время:</b> {html.escape(created_at)}\n\n"
+            f"{html.escape(chunk)}"
+        )
+        markup = quick_note_detail_keyboard(page) if index == len(chunks) - 1 else None
+        if index == 0:
+            await send_smart_content(callback, detail_text, None, markup, bot=bot)
+        else:
+            await bot.send_message(
+                callback.message.chat.id,
+                detail_text,
+                parse_mode="HTML",
+                reply_markup=markup,
+            )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("quick_note_new"))
+async def cb_quick_note_new(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+    if not await check_paid_access(callback, bot, topic_slug="journal"):
+        return
+    if await state.get_state() == JournalStates.quick_note_input.state:
+        await callback.answer("Я уже жду текст записи.")
+        return
+
+    page = _quick_note_page_from_callback(callback.data) if ":" in callback.data else 0
+    await state.set_state(JournalStates.quick_note_input)
+    await state.update_data(
+        quick_note_page=page,
+        quick_note_operation_key=uuid.uuid4().hex,
+    )
+    await send_smart_content(
+        callback,
+        "📝 <b>Новая оперативная запись</b>\n\nНапиши одну мысль. Она сохранится отдельно от дневника, серии и наград.",
+        None,
+        quick_note_input_keyboard(page),
+        bot=bot,
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("quick_note_cancel"))
+async def cb_quick_note_cancel(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+    data = await state.get_data()
+    page = data.get("quick_note_page", _quick_note_page_from_callback(callback.data))
+    await state.clear()
+    await callback.answer("Запись отменена.")
+    if await check_paid_access(callback, bot, topic_slug="journal"):
+        await _render_quick_notes(callback, bot, page)
+
+
+@router.message(JournalStates.quick_note_input, F.text)
+async def msg_quick_note_save(message: Message, state: FSMContext, bot: Bot) -> None:
+    text = (message.text or "").strip()
+    if not text:
+        await message.answer("Запись не может быть пустой.")
+        return
+
+    user_id = message.from_user.id
+    lock = _quick_note_save_locks.setdefault(user_id, asyncio.Lock())
+    async with lock:
+        if await state.get_state() != JournalStates.quick_note_input.state:
+            return
+        if not await check_paid_access(message, bot, topic_slug="journal"):
+            await state.clear()
+            return
+        data = await state.get_data()
+        operation_key = data.get("quick_note_operation_key")
+        if not operation_key:
+            await state.clear()
+            return
+
+        async with async_session_maker() as session:
+            existing = await session.scalar(
+                select(QuickNote).where(QuickNote.operation_key == operation_key)
+            )
+            if existing is None:
+                session.add(QuickNote(
+                    user_id=user_id,
+                    text=text,
+                    operation_key=operation_key,
+                ))
+                if not await check_paid_access(message, bot, topic_slug="journal"):
+                    await session.rollback()
+                    await state.clear()
+                    return
+                try:
+                    await session.commit()
+                except IntegrityError:
+                    await session.rollback()
+                    existing = await session.scalar(
+                        select(QuickNote).where(QuickNote.operation_key == operation_key)
+                    )
+                    if existing is None:
+                        raise
+
+        page = data.get("quick_note_page", 0)
+        await state.clear()
+        await _render_quick_notes(message, bot, page, notice="✅ Оперативная запись сохранена.")
 
 
 @router.callback_query(F.data == "j_video")

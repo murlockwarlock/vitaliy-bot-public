@@ -93,20 +93,21 @@ class AdminRolesTests(unittest.IsolatedAsyncioTestCase):
         assert not await user_has_permission(SUPPORT_ID, AdminPermission.SYSTEM)
 
         content_callbacks = _callbacks(kb.admin_panel_keyboard(AdminRole.CONTENT_EDITOR))
-        assert "admin_content_list" in content_callbacks
-        assert "admin_topics_list" in content_callbacks
-        assert "admin_test_sets_list" in content_callbacks
-        assert "admin_payment_settings" not in content_callbacks
-        assert "admin_mailing" not in content_callbacks
+        assert "admin_section_content" in content_callbacks
+        assert "admin_section_ai" in content_callbacks
+        assert "admin_section_payments" not in content_callbacks
         assert "admin_clients_list_0" not in content_callbacks
+        assert "admin_topics_list" in _callbacks(kb.admin_ai_section_keyboard(AdminRole.CONTENT_EDITOR))
+        assert "admin_kb_page_0" in _callbacks(kb.admin_ai_section_keyboard(AdminRole.CONTENT_EDITOR))
+        assert "admin_ai_settings" not in _callbacks(kb.admin_ai_section_keyboard(AdminRole.CONTENT_EDITOR))
 
         support_callbacks = _callbacks(kb.admin_panel_keyboard(AdminRole.SUPPORT))
         assert "admin_clients_list_0" in support_callbacks
-        assert "admin_ai_logs_0_all" in support_callbacks
-        assert "admin_content_list" not in support_callbacks
-        assert "admin_payment_settings" not in support_callbacks
-        assert "admin_mailing" not in support_callbacks
-        assert "automation_menu" not in support_callbacks
+        assert "admin_section_ai" not in support_callbacks
+        assert "admin_section_content" not in support_callbacks
+        assert "admin_section_payments" not in support_callbacks
+        assert "admin_section_automation" not in support_callbacks
+        assert "admin_section_logs" not in support_callbacks
 
     async def test_legacy_admin_migration_keeps_full_access(self):
         await _save_admin(FULL_ADMIN_ID, None)

@@ -235,7 +235,7 @@ class AdminNavigationAuditTests(IsolatedAsyncioTestCase):
             for button in row
             if button.callback_data
         ]
-        self.assertIn("admin_reminders_settings", callbacks)
+        self.assertIn("admin_section_automation", callbacks)
         self.assertEqual(
             permission_for_callback("confirm_admin_delete_plan_1"),
             AdminPermission.PAYMENTS,
@@ -385,7 +385,7 @@ class AdminNavigationAuditTests(IsolatedAsyncioTestCase):
     async def test_navigation_labels_hide_internal_followup_name(self):
         labels = [
             button.text
-            for row in kb.admin_panel_keyboard().inline_keyboard
+            for row in kb.admin_automation_section_keyboard().inline_keyboard
             for button in row
             if button.text
         ]

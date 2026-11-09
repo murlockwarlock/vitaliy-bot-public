@@ -143,7 +143,7 @@ def permission_for_callback(callback_data: str | None) -> AdminPermission | None
         return AdminPermission.PANEL
 
     if data == "admin_funnel_settings":
-        return AdminPermission.PANEL
+        return AdminPermission.CONTENT
     if data.startswith((
         "ureset_sub_",
         "ureset_balance_",
@@ -163,7 +163,7 @@ def permission_for_callback(callback_data: str | None) -> AdminPermission | None
     )):
         return AdminPermission.CLIENTS
     if data.startswith(("confirm_ureset_", "ureset_confirmed_")):
-        kind = data.split("_", 2)[-1].rsplit("_", 1)[0]
+        kind = data.split("_", 2)[-1].split(":", 1)[0].rsplit("_", 1)[0]
         if kind in {"sub", "balance", "landing", "full"}:
             return AdminPermission.PAYMENTS
         if kind in {"dialog", "habits"}:
@@ -224,10 +224,7 @@ def permission_for_callback(callback_data: str | None) -> AdminPermission | None
             "admin_crisis_clear_",
             "admin_history_",
             "view_client_",
-            "admin_ai_logs",
             "admin_user_ai_logs_",
-            "admin_ai_log_",
-            "export_ai_logs_",
         ))
     ):
         return AdminPermission.CLIENTS
@@ -238,6 +235,22 @@ def permission_for_callback(callback_data: str | None) -> AdminPermission | None
         "mailing_",
     )):
         return AdminPermission.MAILING
+
+    if data.startswith("admin_ai_log_file_"):
+        parts = data.split("_")
+        if len(parts) > 5 and parts[5].isdigit() and int(parts[5]) > 0:
+            return AdminPermission.CLIENTS
+        return AdminPermission.SYSTEM
+    if data.startswith("admin_ai_log_"):
+        parts = data.split("_")
+        if len(parts) > 5 and parts[5].isdigit() and int(parts[5]) > 0:
+            return AdminPermission.CLIENTS
+        return AdminPermission.SYSTEM
+    if data.startswith("export_ai_logs_"):
+        parts = data.split("_")
+        if len(parts) > 3 and parts[3].isdigit() and int(parts[3]) > 0:
+            return AdminPermission.CLIENTS
+        return AdminPermission.SYSTEM
 
     if data.startswith((
         "admin_payment",
@@ -331,13 +344,15 @@ def permission_for_callback(callback_data: str | None) -> AdminPermission | None
         "admin_automation_",
         "admin_followup",
         "admin_fu_",
-        "admin_referral",
         "admin_reminders",
         "admin_webhook",
         "confirmed_admin_gen_webhook_secret",
         "admin_logs",
         "admin_ai_",
         "admin_logs",
+        "admin_ai_logs",
+        "admin_ai_log_",
+        "export_ai_logs_",
         "ai_provider_",
         "set_mem_",
         "set_prov_",
@@ -357,6 +372,8 @@ def permission_for_callback(callback_data: str | None) -> AdminPermission | None
     if data.startswith((
         "confirm_set_pay_mode_",
         "set_pay_mode_",
+        "admin_referral",
+        "admin_ref_",
         "add_prov_start",
         "toggle_prov_",
         "edit_sub_price",
@@ -380,6 +397,19 @@ def permission_for_callback(callback_data: str | None) -> AdminPermission | None
         "promo_toggle_all_plans_",
     )):
         return AdminPermission.PAYMENTS
+
+    if data == "admin_section_clients":
+        return AdminPermission.CLIENTS
+    if data in {"admin_section_logs", "admin_section_automation"}:
+        return AdminPermission.SYSTEM
+    if data == "admin_section_ai":
+        return AdminPermission.CONTENT
+    if data == "admin_section_content":
+        return AdminPermission.CONTENT
+    if data == "admin_section_payments":
+        return AdminPermission.PAYMENTS
+    if data == "admin_section_admins":
+        return AdminPermission.ADMIN_MANAGEMENT
 
     if data.startswith("admin_"):
         return AdminPermission.SYSTEM

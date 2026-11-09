@@ -927,22 +927,13 @@ class BehavioralSystemE2ETests(unittest.IsolatedAsyncioTestCase):
         admin_kb = kb.admin_panel_keyboard()
         self.assertIsNotNone(admin_kb)
         expected_callbacks = [
-            "admin_funnel_settings",
-            "admin_logs",
-            "admin_ai_settings",
-            "admin_payment_settings",
             "admin_clients_list_0",
-            "admin_topics_list",
-            "admin_content_list",
-            "admin_habit_settings",
-            "admin_referral_settings",
-            "admin_kb_page_0",
+            "admin_section_ai",
+            "admin_section_content",
+            "admin_section_automation",
+            "admin_payment_settings",
+            "admin_section_logs",
             "admin_manage_admins",
-            "admin_mailing",
-            "admin_reminders_settings",
-            "admin_test_system",
-            "admin_test_sets_list",
-            "admin_followup_list",
         ]
         actual_callbacks = []
         for row in admin_kb.inline_keyboard:
