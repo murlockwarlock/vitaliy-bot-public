@@ -693,6 +693,9 @@ class TestAttempt(Base):
     started_at = Column(DateTime, default=msk_now, nullable=False)
     completed_at = Column(DateTime, nullable=True)
     status = Column(String, default='in_progress', nullable=False)  # 'in_progress', 'completed', 'abandoned'
+    # Immutable effective TestSet configuration captured when the attempt starts.
+    # Nullable for compatibility with historical attempts created before v3 snapshots.
+    configuration_snapshot_json = Column(Text, nullable=True)
 
     test_set = relationship("TestSet")
 
@@ -1259,6 +1262,9 @@ async def _ensure_postgresql_compat_schema(conn):
     ))
     await conn.execute(text(
         'ALTER TABLE "test_questions" ADD COLUMN IF NOT EXISTS "question_type" VARCHAR(32) NULL'
+    ))
+    await conn.execute(text(
+        'ALTER TABLE "test_attempts" ADD COLUMN IF NOT EXISTS "configuration_snapshot_json" TEXT NULL'
     ))
     await conn.execute(text(
         'ALTER TABLE "test_questions" ADD COLUMN IF NOT EXISTS "is_active" BOOLEAN NOT NULL DEFAULT TRUE'

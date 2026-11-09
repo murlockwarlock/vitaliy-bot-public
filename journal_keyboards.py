@@ -248,6 +248,10 @@ def journal_admin_questions_keyboard(
             InlineKeyboardButton(text="⬇️", callback_data=f"j_adm_q_dn:{q.id}:{page}"),
             InlineKeyboardButton(text="🗑", callback_data=f"j_adm_q_del_confirm:{q.id}:{page}"),
         )
+        builder.row(InlineKeyboardButton(
+            text="⚙️ Настроить тип ответа",
+            callback_data=f"j_adm_q_type:{q.id}:{page}",
+        ))
 
     builder.row(*standard_pagination_row(
         page,

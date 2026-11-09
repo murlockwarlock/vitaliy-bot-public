@@ -8,6 +8,7 @@ from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 from sqlalchemy import delete, func, select, update
 
 from admin_roles import AdminPermission, require_permission
@@ -38,9 +39,29 @@ class JournalAdminStates(StatesGroup):
     new_question_text = State()
     edit_question_text = State()
     edit_points = State()
+    guided_question_options = State()
 
 
 _JOURNAL_QUESTION_PAGE_SIZE = 10
+
+
+def _journal_type_keyboard(question_id: int, page: int) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✍️ Текстовый ответ", callback_data=f"j_adm_q_settype:{question_id}:{page}:text")
+    builder.button(text="🔢 Шкала 1–10", callback_data=f"j_adm_q_settype:{question_id}:{page}:scale")
+    builder.button(text="🔘 Варианты ответа", callback_data=f"j_adm_q_settype:{question_id}:{page}:choice")
+    builder.button(text="❌ Отмена", callback_data=f"j_adm_q_list_page:{page}")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def _journal_custom_keyboard(question_id: int, page: int) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ Разрешить свой ответ", callback_data=f"j_adm_q_custom:{question_id}:{page}:yes")
+    builder.button(text="🚫 Только варианты", callback_data=f"j_adm_q_custom:{question_id}:{page}:no")
+    builder.button(text="❌ Отмена", callback_data=f"j_adm_q_list_page:{page}")
+    builder.adjust(1)
+    return builder.as_markup()
 
 
 def _journal_question_id(data: str) -> int:
@@ -288,7 +309,131 @@ async def admin_journal_q_add_submit(message: Message, state: FSMContext):
 
     await state.clear()
     await message.answer("✅ Вопрос успешно добавлен!")
+    await message.answer(
+        "При необходимости выберите тип ответа и настройте варианты:",
+        reply_markup=_journal_type_keyboard(new_q.id, page),
+    )
     await _send_journal_question_list(message, page)
+
+
+@router.callback_query(F.data.startswith("j_adm_q_type:"))
+async def admin_journal_q_type_handler(callback: CallbackQuery, state: FSMContext):
+    if not await _ensure_admin(callback):
+        return
+    parts = callback.data.split(":")
+    if len(parts) < 3:
+        await callback.answer("Ошибка параметров.", show_alert=True)
+        return
+    qid, page = int(parts[1]), int(parts[2])
+    async with async_session_maker() as session:
+        question = await session.get(JournalQuestion, qid)
+    if not question:
+        await callback.answer("Вопрос не найден.", show_alert=True)
+        return
+    await state.set_state(JournalAdminStates.guided_question_options)
+    await state.update_data(guided_question_id=qid, journal_questions_page=page)
+    await callback.message.edit_text(
+        f"⚙️ <b>Тип ответа для вопроса #{question.order_num}</b>\n\n"
+        f"<i>{html.escape(question.text)}</i>\n\n"
+        "Выберите один вариант:",
+        reply_markup=_journal_type_keyboard(qid, page),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("j_adm_q_settype:"))
+async def admin_journal_q_set_type_handler(callback: CallbackQuery, state: FSMContext):
+    if not await _ensure_admin(callback):
+        return
+    parts = callback.data.split(":")
+    if len(parts) < 4:
+        await callback.answer("Ошибка параметров.", show_alert=True)
+        return
+    qid, page, question_type = int(parts[1]), int(parts[2]), parts[3]
+    if question_type not in {QUESTION_TYPE_TEXT, QUESTION_TYPE_SCALE, QUESTION_TYPE_CHOICE}:
+        await callback.answer("Неизвестный тип ответа.", show_alert=True)
+        return
+    if question_type == QUESTION_TYPE_CHOICE:
+        await state.set_state(JournalAdminStates.guided_question_options)
+        await state.update_data(
+            guided_question_id=qid,
+            journal_questions_page=page,
+            guided_question_type=question_type,
+        )
+        await callback.message.edit_text(
+            "Введите варианты ответа, каждый с новой строки.\n"
+            "Следующим шагом можно будет разрешить свой ответ.",
+            reply_markup=journal_admin_cancel_keyboard(f"j_adm_q_list_page:{page}"),
+        )
+        await callback.answer()
+        return
+
+    async with async_session_maker() as session:
+        question = await session.get(JournalQuestion, qid)
+        if not question:
+            await callback.answer("Вопрос не найден.", show_alert=True)
+            return
+        question.question_type = question_type
+        question.answer_options_json = None
+        question.allow_custom_answer = False
+        await session.commit()
+    await state.clear()
+    await callback.answer("Сохранено")
+    await callback.message.edit_text("✅ Тип ответа сохранён.")
+    await _send_journal_question_list(callback, page)
+
+
+@router.message(JournalAdminStates.guided_question_options, F.text, ~F.text.startswith("/"))
+async def admin_journal_q_guided_options_submit(message: Message, state: FSMContext):
+    if not await _ensure_admin(message):
+        return
+    data = await state.get_data()
+    if data.get("guided_question_type") != QUESTION_TYPE_CHOICE:
+        return
+    options = [line.strip(" •-\t") for line in (message.text or "").splitlines() if line.strip()]
+    if not options:
+        await message.answer("⚠️ Добавьте хотя бы один вариант, каждый с новой строки.")
+        return
+    if len({item.casefold() for item in options}) != len(options):
+        await message.answer("⚠️ Варианты должны быть уникальными.")
+        return
+    qid = data.get("guided_question_id")
+    page = data.get("journal_questions_page", 0)
+    await state.update_data(guided_options=[{"text": item, "value": None} for item in options])
+    await message.answer(
+        "Разрешить пользователю написать свой ответ?",
+        reply_markup=_journal_custom_keyboard(qid, page),
+    )
+
+
+@router.callback_query(F.data.startswith("j_adm_q_custom:"))
+async def admin_journal_q_custom_answer_handler(callback: CallbackQuery, state: FSMContext):
+    if not await _ensure_admin(callback):
+        return
+    parts = callback.data.split(":")
+    if len(parts) < 4:
+        await callback.answer("Ошибка параметров.", show_alert=True)
+        return
+    qid, page, flag = int(parts[1]), int(parts[2]), parts[3]
+    data = await state.get_data()
+    options = data.get("guided_options") or []
+    if not options:
+        await callback.answer("Варианты не найдены. Начните настройку заново.", show_alert=True)
+        return
+    async with async_session_maker() as session:
+        question = await session.get(JournalQuestion, qid)
+        if not question:
+            await callback.answer("Вопрос не найден.", show_alert=True)
+            return
+        question.question_type = QUESTION_TYPE_CHOICE
+        question.answer_options_json = json_dumps(options)
+        question.allow_custom_answer = flag == "yes"
+        await session.commit()
+    await state.clear()
+    await callback.answer("Сохранено")
+    await callback.message.edit_text("✅ Варианты ответа сохранены.")
+    await _send_journal_question_list(callback, page)
 
 
 @router.callback_query(F.data.startswith("j_adm_q_ed:"))

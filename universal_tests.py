@@ -5,6 +5,7 @@ import html
 import json
 import re
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any
 
 
@@ -159,6 +160,131 @@ def json_loads(value: str | None, default: Any) -> Any:
 
 def json_dumps(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False)
+
+
+_TEST_ATTEMPT_SNAPSHOT_VERSION = 1
+
+
+def build_test_attempt_snapshot(test_set: Any, questions: list[Any]) -> str:
+    """Serialize the effective TestSet configuration used by one attempt."""
+    question_fields = (
+        "id",
+        "text",
+        "category",
+        "is_reverse",
+        "order_num",
+        "comment",
+        "variable_name",
+        "allow_custom_answer",
+        "buttons_layout",
+        "answer_options_json",
+        "question_type",
+        "is_active",
+    )
+    question_snapshot = []
+    for question in questions:
+        item = {
+            field: getattr(question, field, None)
+            for field in question_fields
+        }
+        item["is_active"] = bool(item.get("is_active", True))
+        question_snapshot.append(item)
+
+    formulas = json_loads(getattr(test_set, "formulas_json", None), [])
+    if not isinstance(formulas, list):
+        formulas = []
+
+    config = {
+        "id": getattr(test_set, "id", None),
+        "title": getattr(test_set, "title", None) or getattr(test_set, "name", ""),
+        "slug": getattr(test_set, "slug", None),
+        "show_progress": bool(getattr(test_set, "show_progress", True)),
+        "calculation_enabled": bool(
+            getattr(test_set, "calculation_enabled", getattr(test_set, "formulas_enabled", False))
+        ),
+        "formulas": formulas,
+        "separate_interpretation_prompt": bool(
+            getattr(
+                test_set,
+                "separate_interpretation_prompt",
+                getattr(test_set, "separate_result_prompt_enabled", False),
+            )
+        ),
+        "interpretation_prompt": getattr(
+            test_set,
+            "interpretation_prompt",
+            getattr(test_set, "result_system_prompt", None),
+        ),
+        "system_prompt": getattr(test_set, "system_prompt", None),
+        "preliminary_results_mode": getattr(test_set, "preliminary_results_mode", "simple"),
+        "handoff_mode": getattr(test_set, "handoff_mode", "prompt"),
+        "interpretation_input_mode": getattr(test_set, "interpretation_input_mode", "all"),
+        "interpretation_selected_variables": json_loads(
+            getattr(test_set, "interpretation_selected_variables", None), []
+        ),
+    }
+    return json_dumps(
+        {
+            "version": _TEST_ATTEMPT_SNAPSHOT_VERSION,
+            "test_set": config,
+            "questions": question_snapshot,
+        }
+    )
+
+
+def load_test_attempt_snapshot(raw_snapshot: str | None) -> dict[str, Any] | None:
+    if not raw_snapshot:
+        return None
+    try:
+        snapshot = json.loads(raw_snapshot)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(snapshot, dict):
+        return None
+    if snapshot.get("version") != _TEST_ATTEMPT_SNAPSHOT_VERSION:
+        return None
+    if not isinstance(snapshot.get("test_set"), dict) or not isinstance(snapshot.get("questions"), list):
+        return None
+    return snapshot
+
+
+def snapshot_questions(snapshot: dict[str, Any]) -> list[Any]:
+    questions = []
+    for item in snapshot.get("questions", []):
+        if not isinstance(item, dict):
+            continue
+        questions.append(SimpleNamespace(**item))
+    questions.sort(key=lambda question: (getattr(question, "order_num", 0), getattr(question, "id", 0) or 0))
+    return questions
+
+
+def snapshot_test_set(snapshot: dict[str, Any], fallback: Any | None = None) -> Any:
+    data = snapshot.get("test_set", {})
+    formulas = data.get("formulas") if isinstance(data.get("formulas"), list) else []
+    selected_variables = data.get("interpretation_selected_variables")
+    if not isinstance(selected_variables, list):
+        selected_variables = []
+    values = {
+        "id": data.get("id") or getattr(fallback, "id", None),
+        "title": data.get("title") or getattr(fallback, "title", ""),
+        "name": data.get("title") or getattr(fallback, "name", ""),
+        "slug": data.get("slug") or getattr(fallback, "slug", None),
+        "show_progress": bool(data.get("show_progress", True)),
+        "calculation_enabled": bool(data.get("calculation_enabled", False)),
+        "formulas_enabled": bool(data.get("calculation_enabled", False)),
+        "formulas_json": json_dumps(formulas) if formulas else None,
+        "separate_interpretation_prompt": bool(data.get("separate_interpretation_prompt", False)),
+        "separate_result_prompt_enabled": bool(data.get("separate_interpretation_prompt", False)),
+        "interpretation_prompt": data.get("interpretation_prompt"),
+        "result_system_prompt": data.get("interpretation_prompt"),
+        "system_prompt": data.get("system_prompt"),
+        "preliminary_results_mode": data.get("preliminary_results_mode", "simple"),
+        "handoff_mode": data.get("handoff_mode", "prompt"),
+        "interpretation_input_mode": data.get("interpretation_input_mode", "all"),
+        "interpretation_selected_variables": json_dumps(selected_variables),
+        "expected_question_count": getattr(fallback, "expected_question_count", None),
+    }
+    return SimpleNamespace(**values)
 
 
 def normalize_question_type(value: Any, fallback: str | None = None) -> str | None:
