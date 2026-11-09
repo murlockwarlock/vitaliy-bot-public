@@ -18,6 +18,7 @@ import content_service
 import database as database_module
 import funnel
 import handlers
+import journal_keyboards
 import keyboards
 import menu_service
 from database import (
@@ -306,6 +307,28 @@ class ButtonManagementTests(unittest.IsolatedAsyncioTestCase):
             async with async_session_maker() as session:
                 current = await session.get(MenuButton, button.id)
                 current.label, current.enabled, current.label_override = original
+                await session.commit()
+
+    async def test_internal_dynamic_screen_keeps_manager_action_override(self):
+        button = await self._button("journal_menu", 1)
+        original = (button.action_type, button.action_value)
+        state = await self._state(self.admin_id)
+        await state.update_data(menu_button_id=button.id)
+        await state.set_state(handlers.AdminStates.menu_button_action)
+        message = SimpleNamespace(
+            from_user=SimpleNamespace(id=self.admin_id),
+            text="menu_books",
+            answer=AsyncMock(),
+        )
+        try:
+            await handlers.admin_menu_button_action_save(message, state)
+            markup = await journal_keyboards.configured_journal_menu_keyboard()
+            actions = [item.callback_data for row in markup.inline_keyboard for item in row]
+            self.assertIn("menu_books", actions)
+        finally:
+            async with async_session_maker() as session:
+                current = await session.get(MenuButton, button.id)
+                current.action_type, current.action_value = original
                 await session.commit()
 
     async def test_non_admin_cannot_change_button(self):

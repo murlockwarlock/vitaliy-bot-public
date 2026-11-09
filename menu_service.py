@@ -236,9 +236,13 @@ async def configured_internal_menu_markup(
 
     rows = []
     for button in buttons:
-        action_value = getattr(button, "_resolved_action_value", None) or button.action_value or button.legacy_callback
-        action_value = _resolve_menu_action(action_value, substitutions)
-        if allowed_actions is not None and action_value not in allowed_actions:
+        resolved_action_value = getattr(button, "_resolved_action_value", None) or button.action_value or button.legacy_callback
+        action_value = _resolve_menu_action(resolved_action_value, substitutions)
+        if (
+            allowed_actions is not None
+            and action_value not in allowed_actions
+            and resolved_action_value == button.legacy_callback
+        ):
             continue
         label = None
         if dynamic_labels and not button.label_override:
