@@ -249,6 +249,7 @@ async def test_funnel_marker_reaches_funnel_handler_for_later_dialogue():
     await init_db()
     user_id = 98261011
     recipient_id = 98261012
+    scenario_text = "Не вижу смысла продолжать. Сил больше нет"
     await _ensure_user(user_id, crisis_detected_at=None, username="funnel_marker_user")
     await _set_marker_config(True, ["хочу покончить с собой"])
 
@@ -282,7 +283,7 @@ async def test_funnel_marker_reaches_funnel_handler_for_later_dialogue():
          patch("ai_integration._generate_chat_response", new=AsyncMock(return_value=model_response)):
         answer = await get_ai_response_for_topic(
             user_id,
-            "Я хочу покончить с собой",
+            scenario_text,
             "Пользователь",
             topic_slug="funnel_demo",
             dialogue_id=7,
