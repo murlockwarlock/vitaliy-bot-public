@@ -211,6 +211,50 @@ async def test_funnel_prompt_variables_preserve_json_examples():
             topic = await session.scalar(select(Topic).where(Topic.slug == "funnel_demo"))
             topic.system_prompt = original_prompt
             await session.commit()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("reflection_text", "flag", "user_id"),
+    [
+        ("Не знаю", "is_empty", 94000131),
+        ("Похоже на развод", "is_skeptic", 94000132),
+    ],
+)
+async def test_funnel_empty_or_skeptic_response_has_no_bridge_or_offer(reflection_text, flag, user_id):
+    await _prepare_user(user_id)
+    bot = CaptureBot()
+    flags = {
+        "has_experience": False,
+        "has_question": False,
+        "is_skeptic": flag == "is_skeptic",
+        "is_empty": flag == "is_empty",
+        "show_offer": True,
+    }
+    raw = (
+        '{"mode":"normal",'
+        + ",".join(f'"{key}":{str(value).lower()}' for key, value in flags.items())
+        + ',"reply":"Спасибо, что поделился(ась).","bridge":"Разберёмся глубже"}'
+    )
+
+    await funnel.render_funnel_analysis(
+        bot=bot,
+        user_id=user_id,
+        chat_id=user_id,
+        raw_response=raw,
+        reflection_text=reflection_text,
+        meditation_id=None,
+    )
+
+    assert len(bot.sent) == 1
+    assert "Разберёмся глубже" not in [item.text for item in bot.sent]
+    assert all(
+        button.callback_data != "funnel_offer_requested"
+        for row in (bot.sent[0].reply_markup.inline_keyboard if bot.sent[0].reply_markup else [])
+        for button in row
+    )
+
+
 @pytest.mark.asyncio
 async def test_malformed_funnel_response_uses_fallback_and_records_event():
     user_id = 94000102
