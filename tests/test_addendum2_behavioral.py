@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 from database import Book, MenuButton
 from funnel import build_strategy_offer_keyboard, objection_response_keyboard
+from handlers import book_card_text, habit_delete_confirmation_keyboard, habit_delete_confirmation_text
 from keyboards import topic_finish_actions_keyboard
 from md_utils import markdown_to_html, split_html_message
 from universal_tests import calculate_formulas, expected_test_set_question_count, validate_test_definition
@@ -55,6 +56,24 @@ def test_objection_screen_has_back_and_main_menu_actions():
 def test_new_persistent_fields_are_additive():
     assert Book.__table__.c.description.nullable is True
     assert MenuButton.__table__.c.topic_slug.nullable is True
+
+
+def test_book_card_and_habit_confirmation_keep_user_visible_fields_and_callbacks():
+    book = SimpleNamespace(
+        title="Книга <проверка>",
+        description="Описание книги",
+        url="https://example.test/book?a=1&b=2",
+    )
+    card = book_card_text(book)
+    assert "Книга &lt;проверка&gt;" in card
+    assert "Описание книги" in card
+    assert "https://example.test/book?a=1&amp;b=2" in card
+
+    assert habit_delete_confirmation_text("Название") == "Удалить привычку „Название“?"
+    assert [button.callback_data for button in _buttons(habit_delete_confirmation_keyboard(17))] == [
+        "habit_confirm_delete:17",
+        "habit_cancel_delete",
+    ]
 
 
 def test_diagnostics_formula_validation_and_disabled_calculation_are_safe():

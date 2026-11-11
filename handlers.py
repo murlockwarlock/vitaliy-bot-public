@@ -3367,6 +3367,18 @@ async def habit_my_list(callback: CallbackQuery, bot: Bot):
     await send_smart_content(callback, text, None, builder.as_markup(), bot)
 
 
+def habit_delete_confirmation_text(name: str) -> str:
+    return f"Удалить привычку „{html.escape(name)}“?"
+
+
+def habit_delete_confirmation_keyboard(habit_id: int):
+    builder = InlineKeyboardBuilder()
+    builder.button(text="Да, удалить", callback_data=f"habit_confirm_delete:{habit_id}")
+    builder.button(text="Нет, отмена", callback_data="habit_cancel_delete")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
 @router.callback_query(F.data.startswith("habit_delete_"))
 async def habit_delete(callback: CallbackQuery, bot: Bot):
     try:
@@ -3379,13 +3391,9 @@ async def habit_delete(callback: CallbackQuery, bot: Bot):
     if not habit or habit.user_id != callback.from_user.id:
         await callback.answer("❌ Привычка не найдена.", show_alert=True)
         return
-    builder = InlineKeyboardBuilder()
-    builder.button(text="Да, удалить", callback_data=f"habit_confirm_delete:{h_id}")
-    builder.button(text="Нет, отмена", callback_data="habit_cancel_delete")
-    builder.adjust(1)
     await callback.message.edit_text(
-        f"Удалить привычку „{html.escape(habit.name)}“?",
-        reply_markup=builder.as_markup(),
+        habit_delete_confirmation_text(habit.name),
+        reply_markup=habit_delete_confirmation_keyboard(h_id),
         parse_mode="HTML",
     )
     await callback.answer()
@@ -8843,6 +8851,16 @@ async def admin_books_manager(event, page=0, state: FSMContext | None = None):
     await send_smart_content(event, text, None, builder.as_markup())
 
 
+def book_card_text(book: Book) -> str:
+    description = html.escape(book.description or "Описание не заполнено.")
+    safe_url = html.escape(book.url, quote=True)
+    return (
+        f"📖 <b>{html.escape(book.title)}</b>\n\n"
+        f"<b>Описание:</b>\n{description}\n\n"
+        f"<b>Ссылка:</b> {safe_url}"
+    )
+
+
 async def _book_card(callback: CallbackQuery, book_id: int, page: int = 0):
     if not await is_admin_actor(callback.from_user.id):
         await callback.answer("⛔️ Доступ запрещён.", show_alert=True)
@@ -8853,13 +8871,7 @@ async def _book_card(callback: CallbackQuery, book_id: int, page: int = 0):
         await callback.answer("Книга уже удалена.", show_alert=True)
         await admin_books_manager(callback, page)
         return
-    description = html.escape(book.description or "Описание не заполнено.")
-    safe_url = html.escape(book.url, quote=True)
-    text = (
-        f"📖 <b>{html.escape(book.title)}</b>\n\n"
-        f"<b>Описание:</b>\n{description}\n\n"
-        f"<b>Ссылка:</b> {safe_url}"
-    )
+    text = book_card_text(book)
     builder = InlineKeyboardBuilder()
     builder.button(text="✏️ Изменить название", callback_data=f"admin_book_edit_title:{book_id}:{page}")
     builder.button(text="✏️ Изменить описание", callback_data=f"admin_book_edit_description:{book_id}:{page}")
