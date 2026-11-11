@@ -2659,11 +2659,6 @@ async def _resume_ai_dialogue(target, state: FSMContext, bot: Bot, topic_slug: s
         return False
     async with async_session_maker() as session:
         user = await session.get(User, user_id)
-        topic = await session.scalar(select(Topic).where(Topic.slug == topic_slug))
-        if topic is None:
-            if hasattr(target, "answer"):
-                await target.answer("⚠️ Эта ИИ-тема больше недоступна.", show_alert=True)
-            return False
         latest_dialogue = await session.scalar(
             select(func.max(DBMessage.dialogue_id)).where(
                 DBMessage.user_id == user_id,

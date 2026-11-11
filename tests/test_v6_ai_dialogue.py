@@ -61,6 +61,7 @@ from database import (
     Topic,
     TopicDialogueConfig,
     TopicPrerecordedDelivery,
+    MenuButton,
     User,
     UserTopicSession,
     async_session_maker,
@@ -1142,6 +1143,13 @@ class AiDialoguePlatformV6Tests(unittest.IsolatedAsyncioTestCase):
         user_id = 20080
         async with async_session_maker() as session:
             session.add(User(id=user_id, first_name="ThematicUser", ai_disclaimer_accepted_at=msk_now(), ai_disclaimer_version=1))
+            thematic_button = await session.scalar(
+                select(MenuButton).where(
+                    MenuButton.section_key == "thematic",
+                    MenuButton.legacy_callback == "thematic_sleep_recovery",
+                )
+            )
+            thematic_button.topic_slug = "sleep_recovery"
             await session.commit()
 
         # 1. Main menu button triggers menu_thematic_sessions
