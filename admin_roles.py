@@ -316,6 +316,8 @@ def permission_for_callback(callback_data: str | None) -> AdminPermission | None
         "adm_books_pg_",
         "add_book_start",
         "del_book_",
+        "admin_book:",
+        "admin_book_",
         "confirm_del_book_",
         "confirmed_del_book_",
         "admin_journal",
@@ -450,6 +452,7 @@ def permission_for_state(state_name: str | None) -> AdminPermission | None:
     if state_value.startswith((
         "edit_content",
         "edit_url",
+        "edit_book",
         "edit_topic_prompt",
         "upload_kb",
         "add_habit",

@@ -61,6 +61,7 @@ from database import (
     Topic,
     TopicDialogueConfig,
     TopicPrerecordedDelivery,
+    MenuButton,
     User,
     UserTopicSession,
     async_session_maker,
@@ -77,6 +78,7 @@ from time_utils import msk_now
 class MockBot:
     def __init__(self):
         self.sent_messages = []
+        self.sent_photos = []
         self.edited_messages = []
         self.edited_reply_markups = []
         self.deleted_messages = []
@@ -91,6 +93,22 @@ class MockBot:
             reply_markup=kwargs.get("reply_markup"),
             delete=AsyncMock(),
         )
+        self.sent_messages.append(msg)
+        return msg
+
+    async def send_photo(self, chat_id, photo, caption=None, **kwargs):
+        msg = SimpleNamespace(
+            chat_id=chat_id,
+            chat=SimpleNamespace(id=chat_id),
+            message_id=len(self.sent_messages) + 1,
+            text=caption,
+            caption=caption,
+            photo=photo,
+            kwargs=kwargs,
+            reply_markup=kwargs.get("reply_markup"),
+            delete=AsyncMock(),
+        )
+        self.sent_photos.append(msg)
         self.sent_messages.append(msg)
         return msg
 
@@ -1125,6 +1143,13 @@ class AiDialoguePlatformV6Tests(unittest.IsolatedAsyncioTestCase):
         user_id = 20080
         async with async_session_maker() as session:
             session.add(User(id=user_id, first_name="ThematicUser", ai_disclaimer_accepted_at=msk_now(), ai_disclaimer_version=1))
+            thematic_button = await session.scalar(
+                select(MenuButton).where(
+                    MenuButton.section_key == "thematic",
+                    MenuButton.legacy_callback == "thematic_sleep_recovery",
+                )
+            )
+            thematic_button.topic_slug = "sleep_recovery"
             await session.commit()
 
         # 1. Main menu button triggers menu_thematic_sessions
@@ -1155,7 +1180,7 @@ class AiDialoguePlatformV6Tests(unittest.IsolatedAsyncioTestCase):
     # =========================================================================
 
     async def test_pre_dialogue_lifecycle_gate_order_and_reentry(self):
-        """P0-2: Gate order: welcome -> pre-test -> Start button -> prerecorded -> chatting.
+        """P0-2: Gate order: pre-test -> welcome/Start button -> prerecorded -> chatting.
 
         Pre-test does not rerun upon completed claim. Abandoned/failed test does not brick topic.
         """
@@ -1165,9 +1190,14 @@ class AiDialoguePlatformV6Tests(unittest.IsolatedAsyncioTestCase):
         async with async_session_maker() as session:
             session.add(User(id=user_id, first_name="GateUser", ai_disclaimer_accepted_at=msk_now(), ai_disclaimer_version=1))
             session.add(Topic(slug=slug, name="Gate Topic"))
+            session.add(Content(key="gate_topic_welcome_media"))
+            session.add(ContentMedia(content_key="gate_topic_welcome_media", file_type="photo", file_id="gate-photo"))
+            await session.flush()
+            welcome_media = (await session.scalars(select(ContentMedia).where(ContentMedia.content_key == "gate_topic_welcome_media"))).first()
             session.add(TopicDialogueConfig(
                 topic_slug=slug,
                 welcome_text="Добро пожаловать в гейт-тест",
+                welcome_media_id=str(welcome_media.id),
                 start_dialogue_button_enabled=True,
                 start_dialogue_button_text="Старт диалога",
                 pre_dialogue_test_enabled=True,
@@ -1240,9 +1270,17 @@ class AiDialoguePlatformV6Tests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(claim.status, "completed")
             self.assertEqual(claim.attempt_id, attempt_id)
 
-        # After completion: Start Dialogue button appears!
-        start_btns = [m for m in self.bot.sent_messages if m.text and "Тестирование пройдено" in m.text]
+        # After completion: the configured topic welcome is shown with the
+        # Start Dialogue button, without a technical invitation.
+        start_btns = [m for m in self.bot.sent_messages if m.text and "Добро пожаловать в гейт-тест" in m.text]
         self.assertTrue(len(start_btns) >= 1)
+        self.assertFalse(any(m.text and "Тестирование пройдено" in m.text for m in self.bot.sent_messages))
+        self.assertEqual(len(self.bot.sent_photos), 1)
+        self.assertEqual(self.bot.sent_photos[0].caption, "Добро пожаловать в гейт-тест")
+        self.assertEqual(
+            start_btns[-1].reply_markup.inline_keyboard[0][0].callback_data,
+            f"ai_start_dialogue:{slug}:{did}",
+        )
 
         # 3. Click Start button: activate_ai_mode(from_start_button=True)
         cb_start = SimpleNamespace(
@@ -1268,6 +1306,46 @@ class AiDialoguePlatformV6Tests(unittest.IsolatedAsyncioTestCase):
             await session.commit()
             reacquired, _ = await acquire_pre_test_claim(session, user_id, slug, did, 1)
             self.assertTrue(reacquired)
+
+    async def test_resume_checks_current_topic_access_before_restoring_fsm(self):
+        user_id = 20106
+        slug = "paid_resume_review_topic"
+        async with async_session_maker() as session:
+            user = User(
+                id=user_id,
+                first_name="ExpiredUser",
+                current_dialogue_id=1,
+                subscription_end=msk_now() - timedelta(days=1),
+            )
+            session.add_all([
+                user,
+                Topic(slug=slug, name="Платная тема", system_prompt="Ответь кратко.", is_paid=True),
+                UserTopicSession(user_id=user_id, topic_slug=slug, active_dialogue_id=1),
+                DBMessage(user_id=user_id, topic_slug=slug, dialogue_id=1, role="user", content="Старый вопрос"),
+            ])
+            payment = await session.get(PaymentConfig, 1)
+            payment.mode = "subscription"
+            await session.commit()
+
+        state = StateStore()
+        target = SimpleNamespace(
+            from_user=SimpleNamespace(id=user_id, first_name="ExpiredUser"),
+            message=SimpleNamespace(chat=SimpleNamespace(id=user_id)),
+            answer=AsyncMock(),
+        )
+        resumed = await handlers._resume_ai_dialogue(
+            target,
+            state,
+            self.bot,
+            slug,
+            1,
+            explicit=True,
+        )
+
+        self.assertFalse(resumed)
+        self.assertIsNone(await state.get_state())
+        self.assertIn("доступ", target.answer.await_args.args[0])
+        self.assertFalse(any(message.text and message.text.startswith("Продолжаем") for message in self.bot.sent_messages))
 
     async def test_immutable_topic_context_snapshot_race_barrier_chat(self):
         """P0-3: TopicContextSnapshot frozen before await; switching topic mid-generation stores response in original topic."""

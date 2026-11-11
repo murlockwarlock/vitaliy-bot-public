@@ -33,6 +33,7 @@ from database import (
     TestSession,
     TestSet,
     User,
+    ContentMedia,
     async_session_maker,
 )
 from file_parser import parse_formulas_file, parse_questions_file
@@ -67,6 +68,54 @@ TEST_START_DIRECTIVE_RE = re.compile(
     r"\[(?:START_TEST|RUN_TEST|ЗАПУСТИТЬ_ТЕСТ)\]",
     re.IGNORECASE,
 )
+
+
+async def _send_topic_welcome(bot, user_id: int, cfg, reply_markup=None):
+    welcome_prompt = (cfg.welcome_text if cfg and cfg.welcome_text else None) or (
+        "Добро пожаловать в сессию. Напиши, что хочешь обсудить."
+    )
+    media_row = None
+    if cfg and cfg.welcome_media_id:
+        async with async_session_maker() as session:
+            media_row = await session.get(ContentMedia, cfg.welcome_media_id)
+    if media_row and media_row.file_type == "photo":
+        return await bot.send_photo(
+            user_id,
+            media_row.file_id,
+            caption=welcome_prompt,
+            parse_mode="HTML",
+            reply_markup=reply_markup,
+        )
+    if media_row and media_row.file_type == "video":
+        return await bot.send_video(
+            user_id,
+            media_row.file_id,
+            caption=welcome_prompt,
+            parse_mode="HTML",
+            reply_markup=reply_markup,
+        )
+    if media_row and media_row.file_type == "animation":
+        return await bot.send_animation(
+            user_id,
+            media_row.file_id,
+            caption=welcome_prompt,
+            parse_mode="HTML",
+            reply_markup=reply_markup,
+        )
+    if media_row and media_row.file_type == "document":
+        return await bot.send_document(
+            user_id,
+            media_row.file_id,
+            caption=welcome_prompt,
+            parse_mode="HTML",
+            reply_markup=reply_markup,
+        )
+    return await bot.send_message(
+        user_id,
+        welcome_prompt,
+        reply_markup=reply_markup,
+        parse_mode="HTML",
+    )
 
 
 class UniversalTestStates(StatesGroup):
@@ -702,10 +751,13 @@ async def _finish_test(bot: Bot, user_id: int, state: FSMContext, answers: list[
     async with async_session_maker() as session:
         crisis_active = await is_crisis_active(session, user_id)
 
+    from md_utils import markdown_to_html
+
     await _send_long(
         bot,
         user_id,
-        result_text,
+        markdown_to_html(result_text),
+        parse_mode="HTML",
         include_finish_markup=not crisis_active,
     )
     if crisis_detected_now:
@@ -728,8 +780,7 @@ async def _finish_test(bot: Bot, user_id: int, state: FSMContext, answers: list[
         if start_btn_enabled:
             btn_text = (cfg.start_dialogue_button_text if cfg and cfg.start_dialogue_button_text else None) or "Начать диалог"
             keyboard = kb.topic_start_dialogue_keyboard(topic_slug, dialogue_id, btn_text)
-            prompt = "Тестирование пройдено! Нажмите кнопку, чтобы начать диалог:"
-            await bot.send_message(user_id, prompt, reply_markup=keyboard)
+            await _send_topic_welcome(bot, user_id, cfg, reply_markup=keyboard)
             await state.clear()
             return
 
@@ -741,9 +792,8 @@ async def _finish_test(bot: Bot, user_id: int, state: FSMContext, answers: list[
 
         await state.set_state("UserStates:chatting")
         await state.update_data(current_topic_slug=topic_slug, dialogue_id=dialogue_id)
-        welcome_prompt = (cfg.welcome_text if cfg and cfg.welcome_text else None) or "🤖 Режим активирован. Напиши свой запрос."
         markup = await kb.ai_response_keyboard_for_topic(topic_slug, dialogue_id)
-        sent_message = await bot.send_message(user_id, welcome_prompt, reply_markup=markup)
+        sent_message = await _send_topic_welcome(bot, user_id, cfg, reply_markup=markup)
         if isinstance(getattr(sent_message, "message_id", None), int):
             await state.update_data(ai_last_response_message_id=sent_message.message_id)
         return

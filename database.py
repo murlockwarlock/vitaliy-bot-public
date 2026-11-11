@@ -207,6 +207,7 @@ class MenuButton(Base):
     action_type = Column(String(16), default='callback', nullable=False)
     action_value = Column(Text, nullable=True)
     content_key = Column(String(128), nullable=True)
+    topic_slug = Column(String(128), ForeignKey('topics.slug', ondelete='SET NULL'), nullable=True, index=True)
     source_type = Column(String(32), default='static', nullable=False)
     source_id = Column(Integer, nullable=True, index=True)
     legacy_callback = Column(String(255), nullable=True, index=True)
@@ -471,6 +472,7 @@ class Book(Base):
     __tablename__ = 'books'
     id = Column(Integer, primary_key=True, autoincrement=True)
     title = Column(String, nullable=False)
+    description = Column(Text, nullable=True)
     url = Column(String, nullable=False)
 
 
@@ -536,6 +538,7 @@ class FunnelState(Base):
     followup_sequence_anchor = Column(DateTime, nullable=True)
     stage_timeout_at = Column(DateTime, nullable=True)
     stage_timeout_sent = Column(Boolean, default=False, nullable=False)
+    strategy_origin = Column(String(32), nullable=True)
 
 
 class FunnelEvent(Base):
@@ -1323,6 +1326,15 @@ async def _ensure_postgresql_compat_schema(conn):
         'ALTER TABLE "funnel_landings" ADD COLUMN IF NOT EXISTS "origin_stage" VARCHAR(64) NULL'
     ))
     await conn.execute(text(
+        'ALTER TABLE "books" ADD COLUMN IF NOT EXISTS "description" TEXT NULL'
+    ))
+    await conn.execute(text(
+        'ALTER TABLE "funnel_states" ADD COLUMN IF NOT EXISTS "strategy_origin" VARCHAR(32) NULL'
+    ))
+    await conn.execute(text(
+        'ALTER TABLE "menu_buttons" ADD COLUMN IF NOT EXISTS "topic_slug" VARCHAR(128) NULL'
+    ))
+    await conn.execute(text(
         'ALTER TABLE "funnel_config" ADD COLUMN IF NOT EXISTS "meditation_timeouts_enabled" BOOLEAN NOT NULL DEFAULT TRUE'
     ))
     await conn.execute(text(
@@ -1891,15 +1903,15 @@ async def _seed_menu_configuration(session: AsyncSession) -> None:
             ("⬅️ В главное меню", "callback", "back_to_main_menu", None),
         ],
         "vitaly": [
-            ("📅 Записаться на консультацию", "web_app", None, "btn_vitaly_consult"),
-            ("🎤 Спикерство / Пригласить", "web_app", None, "btn_vitaly_speaker"),
+            ("📅 Записаться на консультацию", "url", None, "btn_vitaly_consult"),
+            ("🎤 Спикерство / Пригласить", "url", None, "btn_vitaly_speaker"),
             ("⬅️ Назад", "callback", "open_extended_menu", None),
         ],
         "club": [
             ("📚 Полезные материалы", "url", None, "btn_club_materials"),
             ("📰 Полезные статьи", "url", None, "btn_club_articles"),
             ("💬 Присоединиться к чату", "url", None, "btn_club_chat"),
-            ("📅 Записаться на сессию", "web_app", None, "btn_club_session"),
+            ("📅 Записаться на сессию", "url", None, "btn_club_session"),
             ("❓ Задать вопрос", "url", None, "btn_club_question"),
             ("🎭 Афиша мастер-классов", "url", None, "btn_club_masterclass"),
             ("⬅️ Назад", "callback", "open_extended_menu", None),
@@ -1962,7 +1974,7 @@ async def _seed_menu_configuration(session: AsyncSession) -> None:
         "funnel_objection": [
             ("🎯 Записаться на сессию", "callback", "funnel_open_landing", None),
             ("⬅️ Вернуться назад", "callback", "funnel_show_sales", None),
-            ("Главное меню", "callback", "funnel_to_main", None),
+            ("🏠 Главное меню", "callback", "funnel_to_main", None),
         ],
         "funnel_faq": [
             ("Да, записываюсь на сессию", "callback", "funnel_open_landing", None),
@@ -2133,6 +2145,13 @@ async def sync_book_menu_buttons(session: AsyncSession, *, commit: bool = True) 
 
         for book in books:
             if book.id in existing:
+                row = existing[book.id]
+                if row.action_type == "url" and row.action_value != book.url:
+                    row.action_value = book.url
+                    changed = True
+                if not row.label_override and row.label != book.title:
+                    row.label = book.title
+                    changed = True
                 continue
             session.add(MenuButton(
                 section_key="books",
@@ -2162,6 +2181,17 @@ async def sync_book_menu_buttons(session: AsyncSession, *, commit: bool = True) 
 async def run_data_migrations(session: AsyncSession):
     import logging
     log = logging.getLogger("database")
+
+    # These links are normal Telegram URL buttons. Preserve their configured
+    # Content.link_url values and only change the Telegram button type.
+    await session.execute(
+        update(MenuButton)
+        .where(
+            MenuButton.content_key.in_(("btn_vitaly_consult", "btn_vitaly_speaker", "btn_club_session")),
+            MenuButton.action_type == "web_app",
+        )
+        .values(action_type="url")
+    )
 
     # 1. Promo codes normalization with collision detection
     promos = (await session.execute(select(PromoCode))).scalars().all()
@@ -2467,4 +2497,12 @@ async def run_data_migrations(session: AsyncSession):
 
     await _seed_menu_configuration(session)
     await _migrate_investor_menu_defaults(session)
+    await session.execute(
+        update(MenuButton)
+        .where(
+            MenuButton.content_key.in_(("btn_vitaly_consult", "btn_vitaly_speaker", "btn_club_session")),
+            MenuButton.action_type == "web_app",
+        )
+        .values(action_type="url")
+    )
     await session.commit()

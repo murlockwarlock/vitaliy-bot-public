@@ -205,7 +205,13 @@ def button_to_telegram(
     action_value: str | None = None,
     label: str | None = None,
 ) -> InlineKeyboardButton:
-    action_value = action_value or getattr(button, "_resolved_action_value", None) or button.action_value
+    if button.section_key == "thematic" and button.action_type == "callback":
+        # The six public thematic callbacks are stable identifiers.  The
+        # currently selected topic is resolved only when Telegram sends the
+        # callback, so old messages keep following the current binding.
+        action_value = action_value or button.legacy_callback or button.action_value
+    else:
+        action_value = action_value or getattr(button, "_resolved_action_value", None) or button.action_value
     if button.action_type == "url":
         return InlineKeyboardButton(text=label or button.label, url=action_value or "https://example.invalid")
     if button.action_type == "web_app":

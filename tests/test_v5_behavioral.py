@@ -416,7 +416,7 @@ class BehavioralV5Tests(unittest.IsolatedAsyncioTestCase):
             st = await session.get(FunnelState, user_id)
             self.assertEqual(st.stage, "objection_chat")
 
-    async def test_path_objection_intro_zero_buttons(self):
+    async def test_path_objection_intro_has_navigation_buttons(self):
         bot = MockBot()
         user_id = 1013
         async with async_session_maker() as session:
@@ -431,9 +431,13 @@ class BehavioralV5Tests(unittest.IsolatedAsyncioTestCase):
         )
         state = AsyncMock()
         await funnel.start_objection_dialogue(cb, state=state, bot=bot)
-        # Assert zero buttons
+        # The objection intro keeps the user in the strategic-session flow.
         self.assertEqual(len(bot.sent_messages), 1)
-        self.assertIsNone(bot.sent_messages[0].reply_markup)
+        markup = bot.sent_messages[0].reply_markup
+        self.assertIsNotNone(markup)
+        callbacks = [button.callback_data for row in markup.inline_keyboard for button in row]
+        self.assertIn("funnel_show_sales", callbacks)
+        self.assertIn("funnel_to_main", callbacks)
 
     async def test_path_objection_ai_result_exactly_two_buttons(self):
         bot = MockBot()
@@ -468,7 +472,7 @@ class BehavioralV5Tests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(buttons[0].callback_data, "funnel_open_landing")
         self.assertEqual(buttons[1].text, "⬅️ Вернуться назад")
         self.assertEqual(buttons[1].callback_data, "funnel_show_sales")
-        self.assertEqual(buttons[2].text, "Главное меню")
+        self.assertEqual(buttons[2].text, "🏠 Главное меню")
         self.assertEqual(buttons[2].callback_data, "funnel_to_main")
 
     async def test_path_objection_result_to_offer(self):
@@ -1136,7 +1140,7 @@ class BehavioralV5Tests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(buttons[0].callback_data, "funnel_open_landing")
         self.assertEqual(buttons[1].text, "⬅️ Вернуться назад")
         self.assertEqual(buttons[1].callback_data, "funnel_show_sales")
-        self.assertEqual(buttons[2].text, "Главное меню")
+        self.assertEqual(buttons[2].text, "🏠 Главное меню")
         self.assertEqual(buttons[2].callback_data, "funnel_to_main")
 
     async def test_objection_generation_ux_typing_action_and_wait_text(self):

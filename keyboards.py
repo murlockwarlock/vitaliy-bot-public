@@ -11,6 +11,7 @@ from database import (
     SubscriptionConfig,
     MenuButton,
     User,
+    UserTopicSession,
     Message as DBMessage,
     sync_book_menu_buttons,
 )
@@ -31,11 +32,18 @@ async def main_menu_keyboard(user_id: int | None = None):
         user = await session.get(User, user_id) if user_id else None
         has_dialogue_history = False
         if user and user.current_topic_slug and user.current_dialogue_id:
+            active_dialogue_id = await session.scalar(
+                select(UserTopicSession.active_dialogue_id).where(
+                    UserTopicSession.user_id == user_id,
+                    UserTopicSession.topic_slug == user.current_topic_slug,
+                )
+            )
+            active_dialogue_id = active_dialogue_id or user.current_dialogue_id
             has_dialogue_history = bool(await session.scalar(
                 select(func.count(DBMessage.id)).where(
                     DBMessage.user_id == user_id,
                     DBMessage.topic_slug == user.current_topic_slug,
-                    DBMessage.dialogue_id == user.current_dialogue_id,
+                    DBMessage.dialogue_id == active_dialogue_id,
                     DBMessage.role == "user",
                 )
             ))
@@ -149,6 +157,7 @@ def topic_finish_actions_keyboard(topic_slug: str, dialogue_id: int, summary_ena
     builder = InlineKeyboardBuilder()
     if summary_enabled:
         builder.button(text="📝 Выводы по сессии", callback_data=f"ai_gen_summary:{topic_slug}:{dialogue_id}")
+    builder.button(text="▶️ Продолжить диалог", callback_data=f"ai_continue_dialogue:{topic_slug}:{dialogue_id}")
     builder.button(text="🔄 Новый разговор", callback_data=f"ai_new_dialogue:{topic_slug}")
     builder.button(text="🎯 Записаться на сессию", callback_data="funnel_open_landing")
     builder.button(text="🏠 Главное меню", callback_data="main_menu_action")
@@ -164,6 +173,7 @@ async def configured_topic_finish_actions_keyboard(
 ) -> InlineKeyboardMarkup:
     fallback = topic_finish_actions_keyboard(topic_slug, dialogue_id, summary_enabled, has_summary)
     allowed_actions = {
+        f"ai_continue_dialogue:{topic_slug}:{dialogue_id}",
         f"ai_new_dialogue:{topic_slug}",
         "funnel_open_landing",
         "main_menu_action",
@@ -172,12 +182,25 @@ async def configured_topic_finish_actions_keyboard(
         summary_enabled = has_summary
     if summary_enabled:
         allowed_actions.add(f"ai_gen_summary:{topic_slug}:{dialogue_id}")
-    return await configured_internal_menu_markup(
+    markup = await configured_internal_menu_markup(
         "ai_completed",
         fallback,
         substitutions={"topic_slug": topic_slug, "dialogue_id": dialogue_id},
         allowed_actions=allowed_actions,
     )
+    continuation_callback = f"ai_continue_dialogue:{topic_slug}:{dialogue_id}"
+    if not any(
+        button.callback_data == continuation_callback
+        for row in markup.inline_keyboard
+        for button in row
+    ):
+        markup = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="▶️ Продолжить диалог", callback_data=continuation_callback)],
+                *markup.inline_keyboard,
+            ]
+        )
+    return markup
 
 
 def topic_summary_result_keyboard(topic_slug: str, dialogue_id: int) -> InlineKeyboardMarkup:
@@ -306,7 +329,7 @@ async def closed_club_keyboard():
         ("btn_club_materials", "📚 Полезные материалы", None),
         ("btn_club_articles", "📰 Полезные статьи", None),
         ("btn_club_chat", "💬 Присоединиться к чату", None),
-        ("btn_club_session", "📅 Записаться на сессию", "webapp"),
+        ("btn_club_session", "📅 Записаться на сессию", None),
         ("btn_club_question", "❓ Задать вопрос", None),
         ("btn_club_masterclass", "🎭 Афиша мастер классов", None)
     ]
@@ -317,10 +340,7 @@ async def closed_club_keyboard():
         text = content.button_text if content and content.button_text else default_text
         url = content.link_url if content and content.link_url else "https://google.com"
 
-        if type_ == "webapp":
-            builder.button(text=text, web_app=WebAppInfo(url=url))
-        else:
-            builder.button(text=text, url=url)
+        builder.button(text=text, url=url)
 
     builder.button(text="⬅️ Назад", callback_data="open_extended_menu")
     builder.adjust(1)
@@ -369,8 +389,8 @@ async def vitaly_keyboard():
     url2 = c2.link_url if c2 and c2.link_url else "https://google.com"
 
     builder = InlineKeyboardBuilder()
-    builder.button(text="📅 Записаться на консультацию", web_app=WebAppInfo(url=url1))
-    builder.button(text="🎤 Спикерство / Пригласить", web_app=WebAppInfo(url=url2))
+    builder.button(text="📅 Записаться на консультацию", url=url1)
+    builder.button(text="🎤 Спикерство / Пригласить", url=url2)
     builder.button(text="⬅️ Назад", callback_data="open_extended_menu")
     builder.adjust(1)
     return builder.as_markup()

@@ -19,6 +19,7 @@ from database import (
     AILog,
     AdminNavigationContext,
     FunnelEvent,
+    FunnelState,
     FunnelLanding,
     JournalQuestion,
     TestQuestion,
@@ -153,6 +154,39 @@ async def test_real_section_route_clears_fsm_and_returns_to_admin_root():
     assert _callbacks(markup)[-1] == "admin_panel"
     assert "automation_menu" in _callbacks(markup)
     await _cleanup_users(ADMIN_ID)
+
+
+@pytest.mark.asyncio
+async def test_strategy_practice_switch_is_origin_scoped_on_refusal_and_other_screens():
+    await init_db()
+    user_id = 98273901
+    await _cleanup_users(user_id)
+    async with async_session_maker() as session:
+        session.add(User(id=user_id, first_name="Direct strategy"))
+        session.add(FunnelState(user_id=user_id, strategy_origin="main"))
+        await session.commit()
+
+    try:
+        direct_markups = [
+            await funnel.configured_no_strategy_keyboard(user_id=user_id),
+            await funnel.configured_faq_keyboard(user_id=user_id),
+            await funnel.configured_objection_response_keyboard(user_id=user_id),
+        ]
+        for markup in direct_markups:
+            assert "menu_funnel_start" not in _callbacks(markup)
+
+        async with async_session_maker() as session:
+            state = await session.get(FunnelState, user_id)
+            state.strategy_origin = "funnel"
+            await session.commit()
+
+        funnel_origin_markup = await funnel.configured_no_strategy_keyboard(user_id=user_id)
+        assert "menu_funnel_start" in _callbacks(funnel_origin_markup)
+    finally:
+        async with async_session_maker() as session:
+            await session.execute(delete(FunnelState).where(FunnelState.user_id == user_id))
+            await session.commit()
+        await _cleanup_users(user_id)
 
 
 @pytest.mark.asyncio

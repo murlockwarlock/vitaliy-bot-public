@@ -109,6 +109,7 @@ def markdown_to_html(text: str) -> str:
 
     # Списки
     text = re.sub(r'^\s*[-*]\s+', '• ', text, flags=re.MULTILINE)
+    text = re.sub(r'^\s*\d+[.)]\s+', '• ', text, flags=re.MULTILINE)
 
     # Заголовки → жирный текст
     text = re.sub(

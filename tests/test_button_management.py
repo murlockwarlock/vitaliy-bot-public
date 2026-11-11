@@ -5,7 +5,7 @@ import os
 import tempfile
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.base import StorageKey
@@ -26,6 +26,7 @@ from database import (
     Content,
     MenuButton,
     MenuSection,
+    Topic,
     User,
     async_session_maker,
     init_db,
@@ -1056,43 +1057,216 @@ class ButtonManagementTests(unittest.IsolatedAsyncioTestCase):
                     await session.delete(book)
                 await session.commit()
 
-    async def test_deleted_book_cannot_leave_or_restore_a_ghost_button(self):
+    async def test_book_delete_requires_confirmation_for_legacy_and_new_callbacks(self):
+        book_ids = []
+        menu_button_ids = []
+        try:
+            async with async_session_maker() as session:
+                books = [
+                    Book(title="Книга старого callback", url="https://example.test/legacy-delete"),
+                    Book(title="Книга новой карточки", url="https://example.test/card-delete"),
+                ]
+                session.add_all(books)
+                await session.commit()
+                book_ids = [book.id for book in books]
+
+            async with async_session_maker() as session:
+                await sync_book_menu_buttons(session)
+                menu_button_ids = [row.id for row in (await session.scalars(select(MenuButton).where(
+                    MenuButton.section_key == "books",
+                    MenuButton.source_type == "book",
+                    MenuButton.source_id.in_(book_ids),
+                ))).all()]
+
+            legacy_callback = FakeCallback(self.admin_id, f"del_book_{book_ids[0]}_0")
+            await handlers.delete_book(legacy_callback)
+
+            async with async_session_maker() as session:
+                self.assertIsNotNone(await session.get(Book, book_ids[0]))
+            legacy_markup = legacy_callback.message.edit_text.await_args.kwargs["reply_markup"]
+            legacy_actions = [
+                button.callback_data
+                for row in legacy_markup.inline_keyboard
+                for button in row
+            ]
+            self.assertIn(f"confirmed_del_book_{book_ids[0]}_0", legacy_actions)
+            self.assertIn("admin_cat_books", legacy_actions)
+
+            await handlers.admin_content_category(FakeCallback(self.admin_id, "admin_cat_books"))
+            async with async_session_maker() as session:
+                self.assertIsNotNone(await session.get(Book, book_ids[0]))
+
+            await handlers.confirmed_delete_book(
+                FakeCallback(self.admin_id, f"confirmed_del_book_{book_ids[0]}_0")
+            )
+            async with async_session_maker() as session:
+                self.assertIsNone(await session.get(Book, book_ids[0]))
+                legacy_button = await session.scalar(select(MenuButton).where(
+                    MenuButton.source_type == "book",
+                    MenuButton.source_id == book_ids[0],
+                ))
+                self.assertFalse(legacy_button.enabled)
+
+            restore_attempt = FakeCallback(self.admin_id, f"admin_menu_button_toggle:{menu_button_ids[0]}")
+            await handlers.admin_menu_button_toggle(restore_attempt)
+            restore_attempt.answer.assert_awaited_once_with(
+                "Книга удалена. Кнопка оставлена выключенной.",
+                show_alert=True,
+            )
+
+            new_callback = FakeCallback(self.admin_id, f"admin_book_delete:{book_ids[1]}:0")
+            await handlers.admin_book_delete_start(new_callback)
+            async with async_session_maker() as session:
+                self.assertIsNotNone(await session.get(Book, book_ids[1]))
+            new_markup = new_callback.message.edit_text.await_args.kwargs["reply_markup"]
+            new_actions = [
+                button.callback_data
+                for row in new_markup.inline_keyboard
+                for button in row
+            ]
+            self.assertIn(f"confirmed_del_book_{book_ids[1]}_0", new_actions)
+            self.assertIn(f"admin_book:{book_ids[1]}:0", new_actions)
+
+            await handlers.admin_book_card(FakeCallback(self.admin_id, f"admin_book:{book_ids[1]}:0"))
+            async with async_session_maker() as session:
+                self.assertIsNotNone(await session.get(Book, book_ids[1]))
+
+            await handlers.confirmed_delete_book(
+                FakeCallback(self.admin_id, f"confirmed_del_book_{book_ids[1]}_0")
+            )
+            async with async_session_maker() as session:
+                self.assertIsNone(await session.get(Book, book_ids[1]))
+                new_button = await session.scalar(select(MenuButton).where(
+                    MenuButton.source_type == "book",
+                    MenuButton.source_id == book_ids[1],
+                ))
+                self.assertFalse(new_button.enabled)
+        finally:
+            async with async_session_maker() as session:
+                for button_id in menu_button_ids:
+                    button = await session.get(MenuButton, button_id)
+                    if button:
+                        await session.delete(button)
+                for book_id in book_ids:
+                    book = await session.get(Book, book_id)
+                    if book:
+                        await session.delete(book)
+                await session.commit()
+
+    async def test_cancel_book_edit_clears_fsm_and_plain_message_keeps_book_unchanged(self):
         async with async_session_maker() as session:
-            book = Book(title="Книга, которую удалят", url="https://example.test/deleted")
+            book = Book(
+                title="Книга до отмены",
+                description="Описание до отмены",
+                url="https://example.test/cancel",
+            )
             session.add(book)
             await session.commit()
             book_id = book.id
+
+        try:
+            state = await self._state(self.admin_id)
+            await handlers._start_book_edit(
+                FakeCallback(self.admin_id, f"admin_book_edit_title:{book_id}:0"),
+                state,
+                "title",
+            )
+            self.assertEqual(await state.get_state(), handlers.AdminStates.edit_book_title.state)
+
+            await handlers.admin_book_card(
+                FakeCallback(self.admin_id, f"admin_book:{book_id}:0"),
+                state,
+            )
+            self.assertIsNone(await state.get_state())
+            self.assertEqual(await state.get_data(), {})
+
+            plain_message = SimpleNamespace(
+                from_user=SimpleNamespace(id=self.admin_id),
+                text="Сообщение после отмены",
+                bot=SimpleNamespace(),
+                chat=SimpleNamespace(id=self.admin_id),
+                answer=AsyncMock(),
+            )
+            await handlers.admin_book_edit_title_save(plain_message, state)
+
+            async with async_session_maker() as session:
+                persisted = await session.get(Book, book_id)
+                self.assertEqual(persisted.title, "Книга до отмены")
+            plain_message.answer.assert_awaited_once()
+        finally:
+            async with async_session_maker() as session:
+                book = await session.get(Book, book_id)
+                if book:
+                    await session.delete(book)
+                await session.commit()
+
+    async def test_thematic_callback_stays_stable_and_resolves_current_binding(self):
+        button = await self._button("thematic", 0)
+        stable_callback = button.legacy_callback
+        topic_slug = "review-current-thematic-topic"
         async with async_session_maker() as session:
-            await sync_book_menu_buttons(session)
-            menu_button_id = await session.scalar(select(MenuButton.id).where(
-                MenuButton.section_key == "books",
-                MenuButton.source_type == "book",
-                MenuButton.source_id == book_id,
-            ))
-
-        await handlers.delete_book(FakeCallback(self.admin_id, f"del_book_{book_id}_0"))
-        books_markup = await keyboards.books_keyboard()
-        self.assertNotIn(
-            "Книга, которую удалят",
-            [item.text for row in books_markup.inline_keyboard for item in row],
-        )
-
-        admin_books = FakeCallback(self.admin_id, "admin_menu_section:books")
-        await handlers.admin_menu_section(admin_books)
-        admin_labels = [item.text for row in admin_books.bot.send_message.await_args.kwargs["reply_markup"].inline_keyboard for item in row]
-        self.assertNotIn("Книга, которую удалят", admin_labels)
-
-        restore_attempt = FakeCallback(self.admin_id, f"admin_menu_button_toggle:{menu_button_id}")
-        await handlers.admin_menu_button_toggle(restore_attempt)
-        restore_attempt.answer.assert_awaited_once_with(
-            "Книга удалена. Кнопка оставлена выключенной.",
-            show_alert=True,
-        )
-        async with async_session_maker() as session:
-            ghost = await session.get(MenuButton, menu_button_id)
-            self.assertFalse(ghost.enabled)
-            await session.delete(ghost)
+            session.add(Topic(slug=topic_slug, name="Текущая тема", system_prompt="Ответь кратко."))
+            stored = await session.get(MenuButton, button.id)
+            stored.action_value = "thematic_stale_action"
+            stored.topic_slug = topic_slug
             await session.commit()
+
+        try:
+            markup = await keyboards.configured_thematic_sessions_keyboard()
+            rendered = next(
+                item
+                for row in markup.inline_keyboard
+                for item in row
+                if item.text == button.label
+            )
+            self.assertEqual(rendered.callback_data, stable_callback)
+
+            state = await self._state(self.ordinary_id)
+            with patch.object(handlers, "activate_ai_mode", new=AsyncMock()) as activate:
+                callback = FakeCallback(self.ordinary_id, stable_callback)
+                await handlers.thematic_session_choice(callback, state, SimpleNamespace())
+                activate.assert_awaited_once()
+                self.assertEqual(activate.call_args.args[1], topic_slug)
+
+            await handlers.admin_menu_button_topic_clear(
+                FakeCallback(self.admin_id, f"admin_menu_button_topic_clear:{button.id}")
+            )
+            async with async_session_maker() as session:
+                stored = await session.get(MenuButton, button.id)
+                self.assertIsNone(stored.topic_slug)
+
+            await init_db()
+            async with async_session_maker() as session:
+                stored = await session.get(MenuButton, button.id)
+                self.assertIsNone(stored.topic_slug)
+                self.assertEqual(stored.action_value, "thematic_stale_action")
+                self.assertEqual(stored.label, button.label)
+
+            with patch.object(handlers, "activate_ai_mode", new=AsyncMock()) as activate:
+                fallback = FakeCallback(self.ordinary_id, stable_callback)
+                await handlers.thematic_session_choice(fallback, state, SimpleNamespace())
+                activate.assert_awaited_once()
+                self.assertEqual(activate.call_args.args[1], stable_callback.removeprefix("thematic_"))
+
+            async with async_session_maker() as session:
+                stored = await session.get(MenuButton, button.id)
+                stored.topic_slug = "missing-review-topic"
+                await session.commit()
+            with patch.object(handlers, "activate_ai_mode", new=AsyncMock()) as activate:
+                missing = FakeCallback(self.ordinary_id, stable_callback)
+                await handlers.thematic_session_choice(missing, state, SimpleNamespace())
+                activate.assert_not_awaited()
+                self.assertIn("недоступна", missing.answer.await_args.args[0])
+        finally:
+            async with async_session_maker() as session:
+                stored = await session.get(MenuButton, button.id)
+                if stored:
+                    stored.action_value = stored.legacy_callback
+                    stored.topic_slug = None
+                topic = await session.scalar(select(Topic).where(Topic.slug == topic_slug))
+                if topic:
+                    await session.delete(topic)
+                await session.commit()
 
     async def test_admin_cannot_disable_last_root_menu_and_db_stays_safe(self):
         await handlers.admin_menu_section_toggle(FakeCallback(self.admin_id, "admin_menu_section_toggle:main"))

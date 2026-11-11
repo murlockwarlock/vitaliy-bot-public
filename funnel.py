@@ -822,37 +822,88 @@ def build_vitaly_method_keyboard():
     return builder.as_markup()
 
 
-async def configured_vitaly_method_keyboard():
-    return await configured_internal_menu_markup("funnel_vitaly_method", build_vitaly_method_keyboard())
+def _filter_strategy_practice_switch(markup: InlineKeyboardMarkup, include_practice: bool) -> InlineKeyboardMarkup:
+    if include_practice:
+        return markup
+    rows = [
+        [button for button in row if button.callback_data != "menu_funnel_start"]
+        for row in markup.inline_keyboard
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=[row for row in rows if row])
 
 
-def build_strategy_offer_keyboard():
+def _strategy_origin_is_funnel(state: FunnelState) -> bool:
+    if state.strategy_origin in {"main", "funnel"}:
+        return state.strategy_origin == "funnel"
+    return bool(state.meditation_id)
+
+
+async def _strategy_practice_allowed(user_id: int | None) -> bool:
+    if user_id is None:
+        return True
+    async with async_session_maker() as session:
+        state = await get_or_create_funnel_state(session, user_id)
+        return _strategy_origin_is_funnel(state)
+
+
+async def configured_vitaly_method_keyboard(user_id: int | None = None):
+    markup = await configured_internal_menu_markup("funnel_vitaly_method", build_vitaly_method_keyboard())
+    return _filter_strategy_practice_switch(markup, await _strategy_practice_allowed(user_id))
+
+
+def build_strategy_offer_keyboard(include_practice: bool = True):
     builder = InlineKeyboardBuilder()
     builder.button(text="Записаться на сессию", callback_data="funnel_open_landing")
     builder.button(text="У меня вопросы", callback_data="funnel_show_faq")
     builder.button(text="Хочу, но что-то останавливает", callback_data="funnel_start_objections")
     builder.button(text="Подробнее о Виталии", callback_data="funnel_vitaly_method")
-    builder.button(text="Выбрать другую практику", callback_data="menu_funnel_start")
+    if include_practice:
+        builder.button(text="Выбрать другую практику", callback_data="menu_funnel_start")
     builder.button(text="Главное меню", callback_data="funnel_to_main")
     builder.adjust(1)
     return builder.as_markup()
 
 
-async def configured_strategy_offer_keyboard():
-    return await configured_internal_menu_markup("funnel_strategy_offer", build_strategy_offer_keyboard())
+async def configured_strategy_offer_keyboard(include_practice: bool | None = None, user_id: int | None = None):
+    if include_practice is None:
+        if user_id is None:
+            include_practice = True
+        else:
+            async with async_session_maker() as session:
+                state = await get_or_create_funnel_state(session, user_id)
+                include_practice = _strategy_origin_is_funnel(state)
+    include_practice = bool(include_practice)
+    allowed_actions = {
+        "funnel_open_landing",
+        "funnel_show_faq",
+        "funnel_start_objections",
+        "funnel_vitaly_method",
+        "funnel_to_main",
+    }
+    if include_practice:
+        allowed_actions.add("menu_funnel_start")
+    markup = await configured_internal_menu_markup(
+        "funnel_strategy_offer",
+        build_strategy_offer_keyboard(include_practice),
+        allowed_actions=allowed_actions,
+    )
+    if not include_practice:
+        markup = _filter_strategy_practice_switch(markup, False)
+    return markup
 
 
 def objection_response_keyboard():
     builder = InlineKeyboardBuilder()
     builder.button(text="🎯 Записаться на сессию", callback_data="funnel_open_landing")
     builder.button(text="⬅️ Вернуться назад", callback_data="funnel_show_sales")
-    builder.button(text="Главное меню", callback_data="funnel_to_main")
+    builder.button(text="🏠 Главное меню", callback_data="funnel_to_main")
     builder.adjust(1)
     return builder.as_markup()
 
 
-async def configured_objection_response_keyboard():
-    return await configured_internal_menu_markup("funnel_objection", objection_response_keyboard())
+async def configured_objection_response_keyboard(user_id: int | None = None):
+    markup = await configured_internal_menu_markup("funnel_objection", objection_response_keyboard())
+    return _filter_strategy_practice_switch(markup, await _strategy_practice_allowed(user_id))
 
 
 async def build_faq_keyboard():
@@ -867,22 +918,30 @@ async def build_faq_keyboard():
     return builder.as_markup()
 
 
-async def configured_faq_keyboard():
-    return await configured_internal_menu_markup("funnel_faq", await build_faq_keyboard())
+async def configured_faq_keyboard(user_id: int | None = None):
+    markup = await configured_internal_menu_markup("funnel_faq", await build_faq_keyboard())
+    return _filter_strategy_practice_switch(markup, await _strategy_practice_allowed(user_id))
 
 
-async def build_no_strategy_keyboard():
+async def build_no_strategy_keyboard(include_practice: bool = True):
     channel_text, channel_url = await get_button_content("btn_vitaly_channel", "📢 Подписаться на канал", "https://t.me/lifeuspeh")
     builder = InlineKeyboardBuilder()
     builder.button(text=channel_text, url=channel_url)
-    builder.button(text="Выбрать другую практику", callback_data="menu_funnel_start")
+    if include_practice:
+        builder.button(text="Выбрать другую практику", callback_data="menu_funnel_start")
     builder.button(text="Главное меню", callback_data="funnel_to_main")
     builder.adjust(1)
     return builder.as_markup()
 
 
-async def configured_no_strategy_keyboard():
-    return await configured_internal_menu_markup("funnel_no_strategy", await build_no_strategy_keyboard())
+async def configured_no_strategy_keyboard(user_id: int | None = None, include_practice: bool | None = None):
+    if include_practice is None:
+        include_practice = await _strategy_practice_allowed(user_id)
+    markup = await configured_internal_menu_markup(
+        "funnel_no_strategy",
+        await build_no_strategy_keyboard(bool(include_practice)),
+    )
+    return _filter_strategy_practice_switch(markup, bool(include_practice))
 
 
 async def build_landing_keyboard():
@@ -1059,7 +1118,7 @@ async def continue_active_funnel(target, state: FSMContext, bot=None):
             target,
             "Продолжаем диалог по стратегической сессии. Напиши сообщение, и я подхвачу контекст дальше.",
             None,
-            await configured_strategy_offer_keyboard(),
+            await configured_strategy_offer_keyboard(user_id=user_id),
             bot,
         )
         return
@@ -1069,7 +1128,7 @@ async def continue_active_funnel(target, state: FSMContext, bot=None):
             target,
             "Продолжаем разбирать, что тебя останавливает. Напиши сообщение, и продолжим.",
             None,
-            await configured_strategy_offer_keyboard(),
+            await configured_objection_response_keyboard(user_id=user_id),
             bot,
         )
         return
@@ -1196,7 +1255,13 @@ async def show_vitaly_method(target, bot=None):
         await session.commit()
 
     content = await get_content("funnel_vitaly_method")
-    await send_content(target, content.text_content if content else "Информация о Виталии и методе.", content.media if content else None, await configured_vitaly_method_keyboard(), bot)
+    await send_content(
+        target,
+        content.text_content if content else "Информация о Виталии и методе.",
+        content.media if content else None,
+        await configured_vitaly_method_keyboard(user_id=target.from_user.id),
+        bot,
+    )
 
 
 async def show_strategy_sales(target, bot=None):
@@ -1204,12 +1269,20 @@ async def show_strategy_sales(target, bot=None):
         return
     async with async_session_maker() as session:
         funnel_state = await get_or_create_funnel_state(session, target.from_user.id)
+        if funnel_state.strategy_origin not in {"main", "funnel"}:
+            funnel_state.strategy_origin = "funnel" if funnel_state.meditation_id else "main"
         await set_stage(session, funnel_state, "strategy_offer", active=True, reminder_enabled=True, ai_reply=funnel_state.last_ai_reply)
         await register_event(session, target.from_user.id, "strategy_offer", "strategy_offer_opened", meditation_id=funnel_state.meditation_id)
         await session.commit()
 
     content = await get_content("funnel_strategy_sales")
-    await send_content(target, content.text_content if content else "Подробности о стратегической сессии.", content.media if content else None, await configured_strategy_offer_keyboard(), bot)
+    await send_content(
+        target,
+        content.text_content if content else "Подробности о стратегической сессии.",
+        content.media if content else None,
+        await configured_strategy_offer_keyboard(funnel_state.strategy_origin == "funnel"),
+        bot,
+    )
 
 
 async def show_strategy_faq(target, bot=None):
@@ -1220,7 +1293,13 @@ async def show_strategy_faq(target, bot=None):
         await session.commit()
 
     content = await get_content("funnel_strategy_faq")
-    await send_content(target, content.text_content if content else "Частые вопросы.", content.media if content else None, await configured_faq_keyboard(), bot)
+    await send_content(
+        target,
+        content.text_content if content else "Частые вопросы.",
+        content.media if content else None,
+        await configured_faq_keyboard(user_id=target.from_user.id),
+        bot,
+    )
 
 
 async def show_no_strategy_options(target, bot=None):
@@ -1247,7 +1326,13 @@ async def show_no_strategy_options(target, bot=None):
         await session.commit()
 
     content = await get_content("funnel_no_strategy")
-    await send_content(target, content.text_content if content else "Понимаю, возможно, сейчас не время.", content.media if content else None, await configured_no_strategy_keyboard(), bot)
+    await send_content(
+        target,
+        content.text_content if content else "Понимаю, возможно, сейчас не время.",
+        content.media if content else None,
+        await configured_no_strategy_keyboard(user_id=target.from_user.id),
+        bot,
+    )
 
 
 async def show_meditation_choices(target, page: int = 0, bot=None, *, start_new_journey: bool = False):
@@ -1713,7 +1798,7 @@ async def resume_funnel_strategy_after_disclaimer(callback, state: FSMContext, b
         )
         await handle_strategy_message(msg, state)
     else:
-        await start_strategy_session(callback, state, bot=bot)
+        await start_strategy_session(callback, state, bot=bot, origin="funnel")
 
 
 async def resume_funnel_objection_after_disclaimer(callback, state: FSMContext, bot: Bot, payload: dict):
@@ -1744,12 +1829,13 @@ async def resume_funnel_objection_after_disclaimer(callback, state: FSMContext, 
         await start_objection_dialogue(callback, state, bot=bot)
 
 
-async def start_strategy_session(target, state: FSMContext, bot=None):
+async def start_strategy_session(target, state: FSMContext, bot=None, *, origin: str = "main"):
     user_id = target.from_user.id
 
     async with async_session_maker() as session:
         dialogue_id = await allocate_global_dialogue_id(session, user_id)
         funnel_state = await get_or_create_funnel_state(session, user_id)
+        funnel_state.strategy_origin = "funnel" if origin == "funnel" else "main"
         await set_stage(session, funnel_state, "strategy_chat", active=True, reminder_enabled=True)
         await register_event(session, user_id, "strategy_chat", "strategy_chat_started", meditation_id=funnel_state.meditation_id)
         intro = await session.get(Content, "strategy_session_intro")
@@ -1769,7 +1855,7 @@ async def start_strategy_session(target, state: FSMContext, bot=None):
 
     await state.set_state(FunnelStates.strategy_chat)
     await state.update_data(strategy_dialogue_id=dialogue_id)
-    await send_content(target, first_message, None, await configured_strategy_offer_keyboard(), bot)
+    await send_content(target, first_message, None, await configured_strategy_offer_keyboard(origin == "funnel"), bot)
 
 
 async def open_landing(
@@ -1817,7 +1903,13 @@ async def start_objection_dialogue(target, state: FSMContext, bot=None):
 
     await state.set_state(FunnelStates.objection_chat)
     await state.update_data(objection_dialogue_id=dialogue_id)
-    await send_content(target, first_message, None, None, bot)
+    await send_content(
+        target,
+        first_message,
+        None,
+        await configured_objection_response_keyboard(user_id=user_id),
+        bot,
+    )
 
 
 async def handle_strategy_message(message: Message, state: FSMContext):
@@ -1901,7 +1993,7 @@ async def handle_strategy_message(message: Message, state: FSMContext):
         message.from_user.id,
         message.chat.id,
         response,
-        await configured_strategy_offer_keyboard(),
+        await configured_strategy_offer_keyboard(user_id=message.from_user.id),
     )
 
 
@@ -1997,7 +2089,7 @@ async def handle_objection_message(message: Message, state: FSMContext):
         message.from_user.id,
         message.chat.id,
         response,
-        await configured_objection_response_keyboard(),
+        await configured_objection_response_keyboard(user_id=message.from_user.id),
     )
 
 
@@ -2043,7 +2135,7 @@ async def quick_nav_practice(message: Message, state: FSMContext):
 @router.message(F.text == "Стратегическая сессия")
 async def quick_nav_strategy(message: Message, state: FSMContext):
     await state.clear()
-    await start_strategy_session(message, state)
+    await start_strategy_session(message, state, origin="main")
 
 
 @router.message(F.text == "Настройки")
@@ -2076,7 +2168,7 @@ async def menu_funnel_start(callback: CallbackQuery, state: FSMContext):
 async def menu_strategy_session(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.answer()
-    await start_strategy_session(callback, state)
+    await start_strategy_session(callback, state, origin="main")
 
 
 @router.callback_query(F.data == "funnel_intro_start")
@@ -2173,6 +2265,10 @@ async def funnel_offer_requested(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     async with async_session_maker() as session:
         funnel_state = await get_or_create_funnel_state(session, callback.from_user.id)
+        # This callback is reachable only from the meditation funnel.  Persist
+        # the source before rendering the offer so the practice switch remains
+        # available for this journey while main-menu entries keep it hidden.
+        funnel_state.strategy_origin = "funnel"
         await register_event(
             session,
             callback.from_user.id,
@@ -2291,6 +2387,9 @@ async def funnel_remind_7d(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "funnel_start_objections")
 async def funnel_start_objections(callback: CallbackQuery, state: FSMContext):
+    if await _guard_crisis_commercial_path(callback, state=state):
+        await callback.answer()
+        return
     await state.clear()
     await callback.answer()
     await start_objection_dialogue(callback, state)
@@ -4731,7 +4830,7 @@ async def process_funnel_followups(bot: Bot, single_iteration: bool = False):
                             await bot.send_message(
                                 st.user_id,
                                 text,
-                                reply_markup=await configured_no_strategy_keyboard(),
+                                reply_markup=await configured_no_strategy_keyboard(user_id=st.user_id),
                                 parse_mode="HTML",
                                 link_preview_options=LinkPreviewOptions(is_disabled=True),
                             )
