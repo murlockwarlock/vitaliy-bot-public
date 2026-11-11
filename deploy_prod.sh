@@ -198,6 +198,14 @@ fi
 [[ -f "${remote_dir}/database.db" ]] && ln -s "${remote_dir}/database.db" "$stage/database.db"
 (cd "$stage" && "$python_bin" -m py_compile ./*.py && PYTHONDONTWRITEBYTECODE=1 "$python_bin" -c 'import main')
 
+if ! "$python_bin" "$stage/deploy_telegram_healthcheck.py" \
+  --pm2-name "$pm2_name" \
+  --app-dir "$stage"; then
+  echo "Telegram preflight failed; production was not changed." >&2
+  rm -rf "$stage"
+  exit 1
+fi
+
 rollback() {
   rc=$?
   trap - ERR
@@ -255,6 +263,10 @@ if [[ "$status" != "online" ]]; then
   echo "PM2 health check failed: ${pm2_name} is ${status}" >&2
   false
 fi
+
+"$python_bin" "${remote_dir}/deploy_telegram_healthcheck.py" \
+  --pm2-name "$pm2_name" \
+  --app-dir "$remote_dir"
 
 trap - ERR
 rm -rf "$stage"
