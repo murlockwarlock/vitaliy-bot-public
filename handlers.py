@@ -2739,6 +2739,10 @@ async def _resume_ai_dialogue(target, state: FSMContext, bot: Bot, topic_slug: s
     chat_id = getattr(chat_id, "id", user_id)
     sent_message = await send_safe_response(chat_id, resume_text, bot, markup)
     await _remember_ai_response_message(state, sent_message)
+    # Keep the restored dialogue identifiers as the last FSM update.  The
+    # response-message bookkeeping above must not hide the active topic from
+    # the next user message or /menu continuation.
+    await state.update_data(current_topic_slug=topic_slug, dialogue_id=dialogue_id)
     if hasattr(target, "answer"):
         await target.answer("Продолжаем диалог")
     return True

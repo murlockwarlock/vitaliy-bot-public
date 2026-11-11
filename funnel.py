@@ -2211,6 +2211,10 @@ async def funnel_offer_requested(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     async with async_session_maker() as session:
         funnel_state = await get_or_create_funnel_state(session, callback.from_user.id)
+        # This callback is reachable only from the meditation funnel.  Persist
+        # the source before rendering the offer so the practice switch remains
+        # available for this journey while main-menu entries keep it hidden.
+        funnel_state.strategy_origin = "funnel"
         await register_event(
             session,
             callback.from_user.id,

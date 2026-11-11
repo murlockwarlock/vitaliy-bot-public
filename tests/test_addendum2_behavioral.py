@@ -60,6 +60,7 @@ def test_new_persistent_fields_are_additive():
 def test_diagnostics_formula_validation_and_disabled_calculation_are_safe():
     question = SimpleNamespace(
         variable_name="answer_01",
+        text="Как ты себя чувствуешь?",
         question_type="choice",
         answer_options_json='[{"text":"Да", "value": 1}]',
         allow_custom_answer=False,
