@@ -541,6 +541,10 @@ class AdminStates(StatesGroup):
     set_promo_days = State()
     set_promo_uses = State()
     set_welcome_bonus_days = State()
+    add_book_description = State()
+    edit_book_title = State()
+    edit_book_description = State()
+    edit_book_url = State()
     search_client = State()
     menu_button_label = State()
     menu_button_action = State()
@@ -2452,9 +2456,15 @@ async def activate_ai_mode(event, slug: str, state: FSMContext, bot: Bot, *, fro
     await state.update_data(current_topic_slug=slug, dialogue_id=dialogue_id)
 
     if not delivered_prerecorded and not (start_btn_enabled and from_start_button and cfg and cfg.welcome_text):
-        welcome_prompt = (cfg.welcome_text if cfg and cfg.welcome_text else None) or "🤖 Режим активирован. Напиши свой запрос."
+        welcome_prompt = (cfg.welcome_text if cfg and cfg.welcome_text else None) or "Добро пожаловать в сессию. Напиши, что хочешь обсудить."
         markup = await kb.ai_response_keyboard_for_topic(slug, dialogue_id)
-        sent_message = await send_smart_content(event, welcome_prompt, None, markup, bot)
+        media_rows = []
+        if cfg and cfg.welcome_media_id:
+            async with async_session_maker() as session:
+                media_row = await session.get(ContentMedia, cfg.welcome_media_id)
+            if media_row:
+                media_rows.append(media_row)
+        sent_message = await send_smart_content(event, welcome_prompt, media_rows or None, markup, bot)
         await _remember_ai_response_message(state, sent_message)
 
 
@@ -2568,10 +2578,39 @@ async def cb_ai_finish_dialogue(callback: CallbackQuery, state: FSMContext, bot:
     parts = callback.data.split(":")
     topic_slug = parts[1] if len(parts) > 1 else None
     dialogue_id = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else None
-    await callback.answer()
 
     effective_slug = topic_slug or "free_session"
     effective_dialogue_id = dialogue_id or 1
+    async with async_session_maker() as session:
+        user = await session.get(User, callback.from_user.id)
+        active_session = await session.scalar(select(UserTopicSession).where(
+            UserTopicSession.user_id == callback.from_user.id,
+            UserTopicSession.topic_slug == effective_slug,
+        ))
+        valid_active_dialogue = bool(active_session and active_session.active_dialogue_id == effective_dialogue_id)
+        latest_dialogue = await session.scalar(select(func.max(DBMessage.dialogue_id)).where(
+            DBMessage.user_id == callback.from_user.id,
+            DBMessage.topic_slug == effective_slug,
+        ))
+        valid_history_dialogue = latest_dialogue == effective_dialogue_id
+        if not user or user.current_topic_slug != effective_slug or (
+            user.current_dialogue_id != effective_dialogue_id and not (valid_active_dialogue or valid_history_dialogue)
+        ):
+            await callback.answer("⚠️ Эта кнопка устарела.", show_alert=True)
+            return
+        if active_session is None:
+            await set_active_topic_dialogue_id(
+                session,
+                callback.from_user.id,
+                effective_slug,
+                effective_dialogue_id,
+                monotonic=False,
+            )
+        # Keep the dialogue and its history available for an explicit
+        # continuation button, but remove it from the main-menu shortcut.
+        user.current_topic_slug = None
+        await session.commit()
+    await callback.answer()
     await state.update_data(
         ai_landing_return_callback=f"ai_session_completed:{effective_slug}:{effective_dialogue_id}",
         ai_landing_origin_stage="ai_session_completed",
@@ -2621,14 +2660,63 @@ async def cb_ai_continue_dialogue(callback: CallbackQuery, state: FSMContext, bo
     dialogue_id = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 1
     user_id = callback.from_user.id
 
+    await _resume_ai_dialogue(callback, state, bot, topic_slug, dialogue_id, explicit=True)
+
+
+async def _resume_ai_dialogue(target, state: FSMContext, bot: Bot, topic_slug: str, dialogue_id: int, *, explicit: bool = False):
+    user_id = target.from_user.id
+    last_assistant = None
     async with async_session_maker() as session:
         user = await session.get(User, user_id)
-        if user:
-            user.current_topic_slug = topic_slug
-            if not user.current_dialogue_id or dialogue_id > user.current_dialogue_id:
-                user.current_dialogue_id = dialogue_id
-            await session.commit()
+        latest_dialogue = await session.scalar(
+            select(func.max(DBMessage.dialogue_id)).where(
+                DBMessage.user_id == user_id,
+                DBMessage.topic_slug == topic_slug,
+            )
+        )
+        has_user_message = await session.scalar(
+            select(func.count(DBMessage.id)).where(
+                DBMessage.user_id == user_id,
+                DBMessage.topic_slug == topic_slug,
+                DBMessage.dialogue_id == dialogue_id,
+                DBMessage.role == "user",
+            )
+        )
+        active_session = await session.scalar(
+            select(UserTopicSession).where(
+                UserTopicSession.user_id == user_id,
+                UserTopicSession.topic_slug == topic_slug,
+            )
+        )
+        active_matches = bool(
+            (active_session and active_session.active_dialogue_id == dialogue_id)
+            or (explicit and active_session is None and latest_dialogue == dialogue_id and has_user_message)
+        )
+        if (
+            not user
+            or (latest_dialogue != dialogue_id and not (explicit and active_matches))
+            or (not has_user_message and not (explicit and active_matches))
+            or (not explicit and not user.current_topic_slug)
+            or (not explicit and user.current_topic_slug != topic_slug)
+            or (explicit and user.current_topic_slug and user.current_topic_slug != topic_slug)
+            or (explicit and not active_matches)
+        ):
+            if hasattr(target, "answer"):
+                await target.answer("⚠️ Этот диалог уже закрыт или устарел.", show_alert=True)
+            return False
+        last_assistant = (await session.scalars(
+            select(DBMessage).where(
+                DBMessage.user_id == user_id,
+                DBMessage.topic_slug == topic_slug,
+                DBMessage.dialogue_id == dialogue_id,
+                DBMessage.role == "assistant",
+            ).order_by(DBMessage.id.desc()).limit(1)
+        )).first()
+        user.current_topic_slug = topic_slug
+        if not user.current_dialogue_id or dialogue_id > user.current_dialogue_id:
+            user.current_dialogue_id = dialogue_id
         await set_active_topic_dialogue_id(session, user_id, topic_slug, dialogue_id, monotonic=False)
+        await session.commit()
 
     await state.set_state(UserStates.chatting)
     await state.update_data(current_topic_slug=topic_slug, dialogue_id=dialogue_id)
@@ -2640,13 +2728,45 @@ async def cb_ai_continue_dialogue(callback: CallbackQuery, state: FSMContext, bo
         "ai_landing_return_callback" in state_data or "ai_landing_origin_stage" in state_data
     ):
         await state.update_data(ai_landing_return_callback=None, ai_landing_origin_stage=None)
-    await callback.answer("Продолжаем диалог")
     markup = await kb.ai_response_keyboard_for_topic(topic_slug, dialogue_id)
-    sent_message = await callback.message.answer(
-        "Диалог продолжается. Напишите свой запрос или мысль:",
-        reply_markup=markup,
-    )
+    tail = (last_assistant.content or "").strip() if last_assistant else ""
+    resume_text = "Продолжаем 👇\n\n"
+    if tail:
+        resume_text += f"Последнее сообщение ассистента:\n{tail}"
+    else:
+        resume_text += "Напиши свой запрос или мысль."
+    chat_id = getattr(getattr(target, "message", None), "chat", None)
+    chat_id = getattr(chat_id, "id", user_id)
+    sent_message = await send_safe_response(chat_id, resume_text, bot, markup)
     await _remember_ai_response_message(state, sent_message)
+    if hasattr(target, "answer"):
+        await target.answer("Продолжаем диалог")
+    return True
+
+
+@router.callback_query(F.data == "ai_resume_current")
+async def cb_ai_resume_current(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    user_id = callback.from_user.id
+    async with async_session_maker() as session:
+        user = await session.get(User, user_id)
+        active_dialogue_id = None
+        if user and user.current_topic_slug:
+            active_dialogue_id = await session.scalar(
+                select(UserTopicSession.active_dialogue_id).where(
+                    UserTopicSession.user_id == user_id,
+                    UserTopicSession.topic_slug == user.current_topic_slug,
+                )
+            )
+    if not user or not user.current_topic_slug or not user.current_dialogue_id:
+        await callback.answer("Нет активного диалога.", show_alert=True)
+        return
+    await _resume_ai_dialogue(
+        callback,
+        state,
+        bot,
+        user.current_topic_slug,
+        active_dialogue_id or user.current_dialogue_id,
+    )
 
 
 @router.callback_query(F.data.startswith("ai_new_dialogue:"))
@@ -2702,8 +2822,8 @@ async def cb_ai_gen_summary(callback: CallbackQuery, state: FSMContext, bot: Bot
                 pass
 
         markup = await kb.configured_topic_summary_result_keyboard(topic_slug, dialogue_id)
-        safe_summary = html.escape(summary_text)
-        await callback.message.answer(f"📝 <b>Итог сессии:</b>\n\n{safe_summary}", reply_markup=markup, parse_mode="HTML")
+        chat_id = getattr(getattr(callback.message, "chat", None), "id", user_id)
+        await send_safe_response(chat_id, f"**Итог сессии:**\n\n{summary_text}", bot, markup)
 
 
 @router.callback_query(F.data.startswith("ai_regen_summary:"))
@@ -2738,11 +2858,12 @@ async def cb_ai_regen_summary(callback: CallbackQuery, state: FSMContext, bot: B
                 pass
 
         markup = await kb.configured_topic_summary_result_keyboard(topic_slug, dialogue_id)
-        safe_summary = html.escape(summary_text)
-        await callback.message.answer(
-            f"📝 <b>Обновлённый итог сессии{ver_text}:</b>\n\n{safe_summary}",
-            reply_markup=markup,
-            parse_mode="HTML",
+        chat_id = getattr(getattr(callback.message, "chat", None), "id", user_id)
+        await send_safe_response(
+            chat_id,
+            f"**Обновлённый итог сессии{ver_text}:**\n\n{summary_text}",
+            bot,
+            markup,
         )
 
 
@@ -3244,16 +3365,52 @@ async def habit_my_list(callback: CallbackQuery, bot: Bot):
 
 @router.callback_query(F.data.startswith("habit_delete_"))
 async def habit_delete(callback: CallbackQuery, bot: Bot):
-    h_id = int(callback.data.split("_")[-1])
-
+    try:
+        h_id = int(callback.data.removeprefix("habit_delete_"))
+    except ValueError:
+        await callback.answer("Привычка не найдена.", show_alert=True)
+        return
     async with async_session_maker() as session:
         habit = await session.get(Habit, h_id)
-        if habit and habit.user_id == callback.from_user.id:
+    if not habit or habit.user_id != callback.from_user.id:
+        await callback.answer("❌ Привычка не найдена.", show_alert=True)
+        return
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ Да, удалить", callback_data=f"habit_confirm_delete:{h_id}")
+    builder.button(text="❌ Нет, отмена", callback_data="habit_cancel_delete")
+    builder.adjust(1)
+    await callback.message.edit_text(
+        f"Удалить привычку «{html.escape(habit.name)}»?",
+        reply_markup=builder.as_markup(),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("habit_confirm_delete:"))
+async def habit_confirm_delete(callback: CallbackQuery, bot: Bot):
+    try:
+        h_id = int(callback.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await callback.answer("Привычка не найдена.", show_alert=True)
+        return
+    async with async_session_maker() as session:
+        habit = await session.get(Habit, h_id)
+        if not habit:
+            await callback.answer("Привычка уже удалена.", show_alert=True)
+        elif habit.user_id != callback.from_user.id:
+            await callback.answer("⛔️ Это не твоя привычка.", show_alert=True)
+            return
+        else:
             await session.delete(habit)
             await session.commit()
             await callback.answer("✅ Привычка удалена")
-        else:
-            await callback.answer("❌ Ошибка или привычка уже удалена")
+    await habit_my_list(callback, bot)
+
+
+@router.callback_query(F.data == "habit_cancel_delete")
+async def habit_cancel_delete(callback: CallbackQuery, bot: Bot):
+    await callback.answer("Удаление отменено")
 
     await habit_my_list(callback, bot)
 
@@ -4525,6 +4682,7 @@ async def _get_menu_button_view(button_id: int):
             content = await session.get(Content, button.content_key)
             if content and content.button_text:
                 label = content.button_text
+        topic = await session.scalar(select(Topic).where(Topic.slug == button.topic_slug)) if button.topic_slug else None
         return {
             "id": button.id,
             "section_key": button.section_key,
@@ -4532,12 +4690,17 @@ async def _get_menu_button_view(button_id: int):
             "enabled": bool(button.enabled),
             "position": position + 1,
             "total": len(buttons),
+            "topic_slug": topic.slug if topic else None,
+            "topic_name": topic.name if topic else None,
+            "topic_paid": bool(topic.is_paid) if topic else None,
         }
 
 
 def _menu_button_editor_keyboard(view: dict):
     builder = kb.InlineKeyboardBuilder()
     builder.button(text="✏️ Переименовать", callback_data=f"admin_menu_button_label:{view['id']}")
+    if view["section_key"] == "thematic":
+        builder.button(text="🧠 Выбрать ИИ-тему", callback_data=f"admin_menu_button_topic:{view['id']}")
     if view["section_key"] != "funnel_crisis":
         builder.button(text="🔗 Изменить ссылку или действие", callback_data=f"admin_menu_button_action:{view['id']}")
     builder.button(text="🔢 Изменить порядок", callback_data=f"admin_menu_button_order:{view['id']}")
@@ -4560,9 +4723,16 @@ def _menu_button_editor_text(view: dict):
             "Её действие и доступность закреплены системой.\n"
             f"Позиция: {view['position']} из {view['total']}."
         )
+    topic_info = (
+        f"ИИ-тема: <b>{html.escape(view['topic_name'])}</b> · "
+        f"<code>{html.escape(view['topic_slug'])}</code> · "
+        f"{'платная' if view['topic_paid'] else 'бесплатная'}.\n"
+        if view.get("topic_slug") else "ИИ-тема не выбрана: используется прежний callback.\n"
+    )
     return (
         f"🔘 <b>{html.escape(view['label'])}</b>\n\n"
         f"{status}.\n"
+        f"{topic_info}"
         f"Позиция: {view['position']} из {view['total']}."
     )
 
@@ -4608,6 +4778,79 @@ async def admin_menu_button(
     )
     if answer:
         await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_menu_button_topic:"))
+async def admin_menu_button_topic_picker(callback: CallbackQuery):
+    if not await _menu_admin_allowed(callback.from_user.id):
+        await callback.answer("⛔️ Доступ запрещён.", show_alert=True)
+        return
+    try:
+        button_id = int(callback.data.split(":", 1)[1])
+    except (TypeError, ValueError, IndexError):
+        await callback.answer("Кнопка не найдена", show_alert=True)
+        return
+    async with async_session_maker() as session:
+        button = await session.get(MenuButton, button_id)
+        topics = (await session.scalars(
+            select(Topic).where(Topic.system_prompt.is_not(None)).order_by(Topic.name.asc(), Topic.slug.asc())
+        )).all()
+    if not button or button.section_key != "thematic":
+        await callback.answer("Выбор темы доступен только для тематических кнопок.", show_alert=True)
+        return
+    builder = InlineKeyboardBuilder()
+    for topic in topics:
+        marker = "✅ " if topic.slug == button.topic_slug else ""
+        paid = "платная" if topic.is_paid else "бесплатная"
+        builder.button(
+            text=f"{marker}{topic.name} · {topic.slug} · {paid}",
+            callback_data=f"admin_menu_button_topic_set:{button_id}:{topic.slug}",
+        )
+    builder.button(text="↩️ Оставить прежний callback", callback_data=f"admin_menu_button_topic_clear:{button_id}")
+    builder.button(text="⬅️ Назад к кнопке", callback_data=f"admin_menu_button:{button_id}")
+    builder.adjust(1)
+    await send_smart_content(callback, "Выберите существующую ИИ-тему для этой кнопки:", None, builder.as_markup())
+    await callback.answer()
+
+
+async def _set_thematic_button_topic(callback: CallbackQuery, button_id: int, topic_slug: str | None):
+    async with async_session_maker() as session:
+        button = await session.get(MenuButton, button_id)
+        topic = await session.scalar(select(Topic).where(Topic.slug == topic_slug)) if topic_slug else None
+        if not button or button.section_key != "thematic" or (topic_slug and not topic):
+            await callback.answer("Кнопка или тема не найдены.", show_alert=True)
+            return
+        button.topic_slug = topic.slug if topic else None
+        await session.commit()
+    await admin_menu_button(
+        callback.model_copy(update={"data": f"admin_menu_button:{button_id}"}),
+        answer=False,
+    )
+    await callback.answer("ИИ-тема сохранена")
+
+
+@router.callback_query(F.data.startswith("admin_menu_button_topic_set:"))
+async def admin_menu_button_topic_set(callback: CallbackQuery):
+    if not await _menu_admin_allowed(callback.from_user.id):
+        await callback.answer("⛔️ Доступ запрещён.", show_alert=True)
+        return
+    try:
+        _, button_id, topic_slug = callback.data.split(":", 2)
+        await _set_thematic_button_topic(callback, int(button_id), topic_slug)
+    except (TypeError, ValueError, IndexError):
+        await callback.answer("Некорректный выбор темы.", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("admin_menu_button_topic_clear:"))
+async def admin_menu_button_topic_clear(callback: CallbackQuery):
+    if not await _menu_admin_allowed(callback.from_user.id):
+        await callback.answer("⛔️ Доступ запрещён.", show_alert=True)
+        return
+    try:
+        button_id = int(callback.data.split(":", 1)[1])
+        await _set_thematic_button_topic(callback, button_id, None)
+    except (TypeError, ValueError, IndexError):
+        await callback.answer("Кнопка не найдена.", show_alert=True)
 
 
 async def _move_menu_button(button_id: int, direction: str):
@@ -4942,7 +5185,6 @@ CATEGORIES = {
     "main": {
         "welcome_msg": "Приветственное сообщение",
         "start_msg": "Текст главного меню",
-        "btn_book_session_main": "📅 Кнопка 'Запись на сессию'",
         "habits_text": "🧘 Раздел 'Привычки'",
         "subscription_info": "ℹ️ Информация о подписке",
         "main_reminder_first": "🔔 Первое напоминание неактивным",
@@ -5011,7 +5253,6 @@ CATEGORIES = {
 HUMAN_NAMES = {
     "welcome_msg": "Приветственное сообщение",
     "start_msg": "Текст главного меню",
-    "btn_book_session_main": "Кнопка 'Запись на сессию'",
     "habits_text": "Раздел 'Привычки'",
     "subscription_info": "Информация о подписке",
     "main_reminder_first": "Первое напоминание неактивным",
@@ -5064,6 +5305,7 @@ _CONTENT_EDITOR_ALLOWED_BACK = {
     "admin_payment_settings",
     "admin_prodamus_settings",
     "admin_reminders_settings",
+    "admin_cat_books",
 }
 
 
@@ -5073,7 +5315,7 @@ def _content_editor_return_callback(data: dict) -> str:
         return explicit
     if isinstance(explicit, str) and explicit.startswith("admin_cat_"):
         category = explicit.removeprefix("admin_cat_").split("_page_", 1)[0]
-        if category in CATEGORIES:
+        if category in CATEGORIES or category == "books":
             return explicit
     category = data.get("category", "main")
     return _CONTENT_EDITOR_DEFAULT_BACK.get(category, f"admin_cat_{category}")
@@ -8558,6 +8800,12 @@ async def process_successful_payment(message: Message, bot: Bot):
 
 
 async def admin_books_manager(event, page=0, state: FSMContext | None = None):
+    if hasattr(event, "from_user") and not await is_admin_actor(event.from_user.id):
+        if isinstance(event, CallbackQuery):
+            await event.answer("⛔️ Доступ запрещён.", show_alert=True)
+        elif isinstance(event, Message):
+            await event.answer("⛔️ Доступ запрещён.")
+        return
     await _clear_admin_navigation_state(state)
 
     if isinstance(event, CallbackQuery):
@@ -8580,14 +8828,179 @@ async def admin_books_manager(event, page=0, state: FSMContext | None = None):
     builder = InlineKeyboardBuilder()
 
     for b in books:
-        builder.row(InlineKeyboardButton(text=f"🗑 {b.title}", callback_data=f"confirm_del_book_{b.id}_{page}"))
+        builder.row(InlineKeyboardButton(text=f"📖 {b.title}", callback_data=f"admin_book:{b.id}:{page}"))
 
     builder.row(*kb.standard_pagination_row(page, total_pages, lambda target: f"adm_books_pg_{target}"))
+    builder.row(InlineKeyboardButton(text="📝 Описание и фото библиотеки", callback_data="edit_cont_extended:books_intro:admin_cat_books"))
     builder.row(InlineKeyboardButton(text="➕ Добавить книгу", callback_data="add_book_start"))
     builder.row(InlineKeyboardButton(text="⬅️ К категориям", callback_data="admin_content_list"))
 
-    text = f"📚 <b>Управление книгами ({total} шт)</b>\nНажмите на книгу, чтобы удалить ее."
+    text = f"📚 <b>Управление книгами ({total} шт)</b>\nВыберите книгу для просмотра и редактирования."
     await send_smart_content(event, text, None, builder.as_markup())
+
+
+async def _book_card(callback: CallbackQuery, book_id: int, page: int = 0):
+    if not await is_admin_actor(callback.from_user.id):
+        await callback.answer("⛔️ Доступ запрещён.", show_alert=True)
+        return
+    async with async_session_maker() as session:
+        book = await session.get(Book, book_id)
+    if not book:
+        await callback.answer("Книга уже удалена.", show_alert=True)
+        await admin_books_manager(callback, page)
+        return
+    description = html.escape(book.description or "Описание не заполнено.")
+    safe_url = html.escape(book.url, quote=True)
+    text = (
+        f"📖 <b>{html.escape(book.title)}</b>\n\n"
+        f"<b>Описание:</b>\n{description}\n\n"
+        f"<b>Ссылка:</b> {safe_url}"
+    )
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✏️ Изменить название", callback_data=f"admin_book_edit_title:{book_id}:{page}")
+    builder.button(text="✏️ Изменить описание", callback_data=f"admin_book_edit_description:{book_id}:{page}")
+    builder.button(text="🔗 Изменить ссылку", callback_data=f"admin_book_edit_url:{book_id}:{page}")
+    builder.button(text="🗑 Удалить книгу", callback_data=f"admin_book_delete:{book_id}:{page}")
+    builder.button(text="⬅️ К списку книг", callback_data=f"adm_books_pg_{page}")
+    builder.adjust(1)
+    await send_smart_content(callback, text, None, builder.as_markup())
+    if hasattr(callback, "answer"):
+        await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_book:"))
+async def admin_book_card(callback: CallbackQuery):
+    try:
+        _, book_id, page = callback.data.split(":")
+        await _book_card(callback, int(book_id), int(page))
+    except (ValueError, IndexError):
+        await callback.answer("Книга не найдена.", show_alert=True)
+
+
+async def _start_book_edit(callback: CallbackQuery, state: FSMContext, field: str):
+    if not await is_admin_actor(callback.from_user.id):
+        await callback.answer("⛔️ Доступ запрещён.", show_alert=True)
+        return
+    try:
+        _, book_id, page = callback.data.split(":")
+        book_id, page = int(book_id), int(page)
+    except (ValueError, IndexError):
+        await callback.answer("Книга не найдена.", show_alert=True)
+        return
+    async with async_session_maker() as session:
+        book = await session.get(Book, book_id)
+    if not book:
+        await callback.answer("Книга уже удалена.", show_alert=True)
+        return
+    state_name = getattr(AdminStates, f"edit_book_{field}")
+    await state.set_state(state_name)
+    await state.update_data(book_id=book_id, book_page=page)
+    prompts = {
+        "title": f"Текущее название: {book.title}\n\nВведите новое название:",
+        "description": "Введите новое описание. Отправьте точку «.» чтобы очистить описание:",
+        "url": f"Текущая ссылка: {book.url}\n\nВведите новую ссылку (https://...):",
+    }
+    builder = InlineKeyboardBuilder()
+    builder.button(text="⬅️ Отмена", callback_data=f"admin_book:{book_id}:{page}")
+    await callback.message.answer(prompts[field], reply_markup=builder.as_markup())
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_book_edit_title:"))
+async def admin_book_edit_title_start(callback: CallbackQuery, state: FSMContext):
+    await _start_book_edit(callback, state, "title")
+
+
+@router.callback_query(F.data.startswith("admin_book_edit_description:"))
+async def admin_book_edit_description_start(callback: CallbackQuery, state: FSMContext):
+    await _start_book_edit(callback, state, "description")
+
+
+@router.callback_query(F.data.startswith("admin_book_edit_url:"))
+async def admin_book_edit_url_start(callback: CallbackQuery, state: FSMContext):
+    await _start_book_edit(callback, state, "url")
+
+
+async def _save_book_field(message: Message, state: FSMContext, field: str, value: str):
+    if not await is_admin_actor(message.from_user.id):
+        await state.clear()
+        await message.answer("⛔️ Доступ запрещён.")
+        return
+    data = await state.get_data()
+    try:
+        book_id, page = int(data["book_id"]), int(data.get("book_page", 0))
+    except (TypeError, ValueError, KeyError):
+        await state.clear()
+        await message.answer("Книга не найдена.")
+        return
+    value = value.strip()
+    if field == "title" and not value:
+        await message.answer("Название не должно быть пустым.")
+        return
+    if field == "url":
+        try:
+            value = validate_menu_url(value)
+        except ValueError as exc:
+            await message.answer(f"❌ {exc}")
+            return
+    if field == "description" and value == ".":
+        value = ""
+    async with async_session_maker() as session:
+        book = await session.get(Book, book_id)
+        if not book:
+            await state.clear()
+            await message.answer("Книга уже удалена.")
+            return
+        setattr(book, field, value)
+        if field in {"title", "url"}:
+            await sync_book_menu_buttons(session)
+        await session.commit()
+    await state.clear()
+    await message.answer("✅ Данные книги сохранены.")
+    class FakeUpdate:
+        def __init__(self, msg, data):
+            self.message, self.data = msg, data
+            self.from_user, self.bot, self.chat = msg.from_user, msg.bot, msg.chat
+    await _book_card(FakeUpdate(message, f"admin_book:{book_id}:{page}"), book_id, page)
+
+
+@router.message(AdminStates.edit_book_title, ~F.text.startswith('/'))
+async def admin_book_edit_title_save(message: Message, state: FSMContext):
+    await _save_book_field(message, state, "title", message.text or "")
+
+
+@router.message(AdminStates.edit_book_description, ~F.text.startswith('/'))
+async def admin_book_edit_description_save(message: Message, state: FSMContext):
+    await _save_book_field(message, state, "description", message.text or "")
+
+
+@router.message(AdminStates.edit_book_url, ~F.text.startswith('/'))
+async def admin_book_edit_url_save(message: Message, state: FSMContext):
+    await _save_book_field(message, state, "url", message.text or "")
+
+
+@router.callback_query(F.data.startswith("admin_book_delete:"))
+async def admin_book_delete_start(callback: CallbackQuery):
+    if not await is_admin_actor(callback.from_user.id):
+        await callback.answer("⛔️ Доступ запрещён.", show_alert=True)
+        return
+    try:
+        _, book_id, page = callback.data.split(":")
+        book_id, page = int(book_id), int(page)
+    except (ValueError, IndexError):
+        await callback.answer("Книга не найдена.", show_alert=True)
+        return
+    async with async_session_maker() as session:
+        book = await session.get(Book, book_id)
+    if not book:
+        await callback.answer("Книга уже удалена.", show_alert=True)
+        return
+    await _ask_admin_confirmation(
+        callback,
+        f"Книга «{html.escape(book.title)}» будет удалена из библиотеки.",
+        f"confirmed_del_book_{book_id}_{page}",
+        f"admin_book:{book_id}:{page}",
+    )
 
 
 @router.callback_query(F.data.startswith("adm_books_pg_"))
@@ -8624,8 +9037,25 @@ async def save_book_title(message: Message, state: FSMContext):
         )
         return
     await state.update_data(title=title)
-    await state.set_state(AdminStates.add_book_url)
+    await state.set_state(AdminStates.add_book_description)
 
+    msg = await message.answer(
+        "Добавьте короткое описание книги или отправьте точку «.» чтобы пропустить.",
+        reply_markup=kb.back_to_previous_menu("admin_cat_books"),
+    )
+    await state.update_data(last_msg_id=msg.message_id)
+
+
+@router.message(AdminStates.add_book_description, ~F.text.startswith('/'))
+async def save_book_description(message: Message, state: FSMContext):
+    await clean_chat_after_input(message, state)
+    value = (message.text or "").strip()
+    if value.lower() in {"отмена", "назад", "/cancel"}:
+        await state.clear()
+        await admin_books_manager(message)
+        return
+    await state.update_data(description="" if value == "." else value)
+    await state.set_state(AdminStates.add_book_url)
     msg = await message.answer(
         "Теперь отправьте ссылку на книгу, например https://example.com.",
         reply_markup=kb.back_to_previous_menu("admin_cat_books"),
@@ -8642,17 +9072,20 @@ async def save_book_url(message: Message, state: FSMContext, bot: Bot):
         await state.clear()
         await admin_books_manager(message)
         return
-    if not url:
+    try:
+        url = validate_menu_url(url)
+    except ValueError as exc:
         await message.answer(
-            "Ссылка не должна быть пустой. Например: https://example.com.",
+            f"❌ {exc}",
             reply_markup=kb.back_to_previous_menu("admin_cat_books"),
         )
         return
     title = data['title']
+    description = data.get("description") or None
 
 
     async with async_session_maker() as session:
-        session.add(Book(title=title, url=url))
+        session.add(Book(title=title, description=description, url=url))
         await session.commit()
     async with async_session_maker() as session:
         await sync_book_menu_buttons(session)
@@ -8674,6 +9107,9 @@ async def save_book_url(message: Message, state: FSMContext, bot: Bot):
 
 
 async def _execute_book_delete(callback: CallbackQuery, state: FSMContext | None, bid: int, page: int):
+    if not await is_admin_actor(callback.from_user.id):
+        await callback.answer("⛔️ Доступ запрещён.", show_alert=True)
+        return
     await _clear_admin_navigation_state(state)
 
     async with async_session_maker() as session:
@@ -8700,19 +9136,6 @@ async def delete_book(callback: CallbackQuery, state: FSMContext | None = None):
         bid, page = int(parts[2]), int(parts[3])
     except (IndexError, ValueError):
         await callback.answer("Книга не найдена.", show_alert=True)
-        return
-    if isinstance(callback, CallbackQuery):
-        async with async_session_maker() as session:
-            book = await session.get(Book, bid)
-        if not book:
-            await callback.answer("Книга уже удалена.", show_alert=True)
-            return
-        await _ask_admin_confirmation(
-            callback,
-            f"Книга «{html.escape(book.title)}» будет удалена из библиотеки.",
-            f"confirmed_del_book_{bid}_{page}",
-            "admin_cat_books",
-        )
         return
     await _execute_book_delete(callback, state, bid, page)
 

@@ -33,6 +33,7 @@ from database import (
     TestSession,
     TestSet,
     User,
+    ContentMedia,
     async_session_maker,
 )
 from file_parser import parse_formulas_file, parse_questions_file
@@ -702,10 +703,13 @@ async def _finish_test(bot: Bot, user_id: int, state: FSMContext, answers: list[
     async with async_session_maker() as session:
         crisis_active = await is_crisis_active(session, user_id)
 
+    from md_utils import markdown_to_html
+
     await _send_long(
         bot,
         user_id,
-        result_text,
+        markdown_to_html(result_text),
+        parse_mode="HTML",
         include_finish_markup=not crisis_active,
     )
     if crisis_detected_now:
@@ -741,9 +745,22 @@ async def _finish_test(bot: Bot, user_id: int, state: FSMContext, answers: list[
 
         await state.set_state("UserStates:chatting")
         await state.update_data(current_topic_slug=topic_slug, dialogue_id=dialogue_id)
-        welcome_prompt = (cfg.welcome_text if cfg and cfg.welcome_text else None) or "🤖 Режим активирован. Напиши свой запрос."
+        welcome_prompt = (cfg.welcome_text if cfg and cfg.welcome_text else None) or "Добро пожаловать в сессию. Напиши, что хочешь обсудить."
         markup = await kb.ai_response_keyboard_for_topic(topic_slug, dialogue_id)
-        sent_message = await bot.send_message(user_id, welcome_prompt, reply_markup=markup)
+        media_row = None
+        if cfg and cfg.welcome_media_id:
+            async with async_session_maker() as session:
+                media_row = await session.get(ContentMedia, cfg.welcome_media_id)
+        if media_row and media_row.file_type == "photo":
+            sent_message = await bot.send_photo(user_id, media_row.file_id, caption=welcome_prompt, parse_mode="HTML", reply_markup=markup)
+        elif media_row and media_row.file_type == "video":
+            sent_message = await bot.send_video(user_id, media_row.file_id, caption=welcome_prompt, parse_mode="HTML", reply_markup=markup)
+        elif media_row and media_row.file_type == "animation":
+            sent_message = await bot.send_animation(user_id, media_row.file_id, caption=welcome_prompt, parse_mode="HTML", reply_markup=markup)
+        elif media_row and media_row.file_type == "document":
+            sent_message = await bot.send_document(user_id, media_row.file_id, caption=welcome_prompt, parse_mode="HTML", reply_markup=markup)
+        else:
+            sent_message = await bot.send_message(user_id, welcome_prompt, reply_markup=markup, parse_mode="HTML")
         if isinstance(getattr(sent_message, "message_id", None), int):
             await state.update_data(ai_last_response_message_id=sent_message.message_id)
         return

@@ -195,6 +195,11 @@ async def load_menu_buttons(section_key: str) -> tuple[MenuSection | None, list[
                 if content.button_text and not button.label_override:
                     button.label = content.button_text
                 button._resolved_action_value = content.link_url
+            if section_key == "thematic" and getattr(button, "topic_slug", None):
+                # The callback remains stable for old rows, while a selected
+                # topic changes the actual destination without rewriting the
+                # administrator's label or order.
+                button._resolved_action_value = f"thematic_{button.topic_slug}"
             visible.append(button)
         return section, visible
 
