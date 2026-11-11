@@ -9170,13 +9170,26 @@ async def _execute_book_delete(callback: CallbackQuery, state: FSMContext | None
 
 @router.callback_query(F.data.startswith("del_book_"))
 async def delete_book(callback: CallbackQuery, state: FSMContext | None = None):
+    if not await is_admin_actor(callback.from_user.id):
+        await callback.answer("⛔️ Доступ запрещён.", show_alert=True)
+        return
     parts = callback.data.split("_")
     try:
         bid, page = int(parts[2]), int(parts[3])
     except (IndexError, ValueError):
         await callback.answer("Книга не найдена.", show_alert=True)
         return
-    await _execute_book_delete(callback, state, bid, page)
+    async with async_session_maker() as session:
+        book = await session.get(Book, bid)
+    if not book:
+        await callback.answer("Книга уже удалена.", show_alert=True)
+        return
+    await _ask_admin_confirmation(
+        callback,
+        f"Книга «{html.escape(book.title)}» будет удалена из библиотеки.",
+        f"confirmed_del_book_{bid}_{page}",
+        "admin_cat_books",
+    )
 
 
 @router.callback_query(F.data.startswith("confirmed_del_book_"))
