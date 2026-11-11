@@ -2399,17 +2399,6 @@ async def activate_ai_mode(event, slug: str, state: FSMContext, bot: Bot, *, fro
             is_completed = bool(claim and claim.status == "completed")
 
         if not is_completed:
-            welcome_text = (cfg.welcome_text if cfg and cfg.welcome_text else None)
-            media_id = cfg.welcome_media_id if cfg else None
-            if welcome_text or media_id:
-                media_rows = []
-                if media_id:
-                    async with async_session_maker() as session:
-                        m = await session.get(ContentMedia, media_id)
-                        if m:
-                            media_rows.append(m)
-                await send_smart_content(event, welcome_text or "", media_rows or None, None, bot)
-
             await start_universal_test(
                 bot,
                 user_id,
@@ -2455,7 +2444,7 @@ async def activate_ai_mode(event, slug: str, state: FSMContext, bot: Bot, *, fro
     await state.set_state(UserStates.chatting)
     await state.update_data(current_topic_slug=slug, dialogue_id=dialogue_id)
 
-    if not delivered_prerecorded and not (start_btn_enabled and from_start_button and cfg and cfg.welcome_text):
+    if not delivered_prerecorded and not (start_btn_enabled and from_start_button):
         welcome_prompt = (cfg.welcome_text if cfg and cfg.welcome_text else None) or "Добро пожаловать в сессию. Напиши, что хочешь обсудить."
         markup = await kb.ai_response_keyboard_for_topic(slug, dialogue_id)
         media_rows = []
@@ -2666,8 +2655,15 @@ async def cb_ai_continue_dialogue(callback: CallbackQuery, state: FSMContext, bo
 async def _resume_ai_dialogue(target, state: FSMContext, bot: Bot, topic_slug: str, dialogue_id: int, *, explicit: bool = False):
     user_id = target.from_user.id
     last_assistant = None
+    if not await check_paid_access(target, bot, topic_slug=topic_slug):
+        return False
     async with async_session_maker() as session:
         user = await session.get(User, user_id)
+        topic = await session.scalar(select(Topic).where(Topic.slug == topic_slug))
+        if topic is None:
+            if hasattr(target, "answer"):
+                await target.answer("⚠️ Эта ИИ-тема больше недоступна.", show_alert=True)
+            return False
         latest_dialogue = await session.scalar(
             select(func.max(DBMessage.dialogue_id)).where(
                 DBMessage.user_id == user_id,
@@ -2895,8 +2891,34 @@ async def menu_thematic_sessions_callback(callback: CallbackQuery, bot: Bot):
 
 @router.callback_query(F.data.startswith("thematic_"))
 async def thematic_session_choice(callback: CallbackQuery, state: FSMContext, bot: Bot):
-    topic_slug = callback.data.replace("thematic_", "", 1)
-    await activate_ai_mode(callback, topic_slug, state, bot)
+    stable_callback = callback.data
+    async with async_session_maker() as session:
+        button = await session.scalar(
+            select(MenuButton)
+            .where(
+                MenuButton.section_key == "thematic",
+                MenuButton.action_type == "callback",
+                or_(
+                    MenuButton.legacy_callback == stable_callback,
+                    MenuButton.action_value == stable_callback,
+                ),
+            )
+            .order_by(MenuButton.id.asc())
+        )
+        topic = await session.get(Topic, button.topic_slug) if button and button.topic_slug else None
+    if not button or not button.topic_slug:
+        await callback.answer(
+            "Эта тематическая кнопка ещё не привязана к ИИ-теме. Обратись к администратору.",
+            show_alert=True,
+        )
+        return
+    if not topic:
+        await callback.answer(
+            "Привязанная ИИ-тема сейчас недоступна. Обратись к администратору.",
+            show_alert=True,
+        )
+        return
+    await activate_ai_mode(callback, topic.slug, state, bot)
     await callback.answer()
 
 
@@ -8861,10 +8883,11 @@ def book_card_text(book: Book) -> str:
     )
 
 
-async def _book_card(callback: CallbackQuery, book_id: int, page: int = 0):
+async def _book_card(callback: CallbackQuery, book_id: int, page: int = 0, state: FSMContext | None = None):
     if not await is_admin_actor(callback.from_user.id):
         await callback.answer("⛔️ Доступ запрещён.", show_alert=True)
         return
+    await _clear_admin_navigation_state(state)
     async with async_session_maker() as session:
         book = await session.get(Book, book_id)
     if not book:
@@ -8885,10 +8908,10 @@ async def _book_card(callback: CallbackQuery, book_id: int, page: int = 0):
 
 
 @router.callback_query(F.data.startswith("admin_book:"))
-async def admin_book_card(callback: CallbackQuery):
+async def admin_book_card(callback: CallbackQuery, state: FSMContext | None = None):
     try:
         _, book_id, page = callback.data.split(":")
-        await _book_card(callback, int(book_id), int(page))
+        await _book_card(callback, int(book_id), int(page), state=state)
     except (ValueError, IndexError):
         await callback.answer("Книга не найдена.", show_alert=True)
 
@@ -8977,7 +9000,7 @@ async def _save_book_field(message: Message, state: FSMContext, field: str, valu
         def __init__(self, msg, data):
             self.message, self.data = msg, data
             self.from_user, self.bot, self.chat = msg.from_user, msg.bot, msg.chat
-    await _book_card(FakeUpdate(message, f"admin_book:{book_id}:{page}"), book_id, page)
+    await _book_card(FakeUpdate(message, f"admin_book:{book_id}:{page}"), book_id, page, state=state)
 
 
 @router.message(AdminStates.edit_book_title, ~F.text.startswith('/'))

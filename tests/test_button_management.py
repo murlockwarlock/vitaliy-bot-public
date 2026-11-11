@@ -5,7 +5,7 @@ import os
 import tempfile
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.base import StorageKey
@@ -26,6 +26,7 @@ from database import (
     Content,
     MenuButton,
     MenuSection,
+    Topic,
     User,
     async_session_maker,
     init_db,
@@ -1093,6 +1094,101 @@ class ButtonManagementTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(ghost.enabled)
             await session.delete(ghost)
             await session.commit()
+
+    async def test_cancel_book_edit_clears_fsm_and_plain_message_keeps_book_unchanged(self):
+        async with async_session_maker() as session:
+            book = Book(
+                title="Книга до отмены",
+                description="Описание до отмены",
+                url="https://example.test/cancel",
+            )
+            session.add(book)
+            await session.commit()
+            book_id = book.id
+
+        try:
+            state = await self._state(self.admin_id)
+            await handlers._start_book_edit(
+                FakeCallback(self.admin_id, f"admin_book_edit_title:{book_id}:0"),
+                state,
+                "title",
+            )
+            self.assertEqual(await state.get_state(), handlers.AdminStates.edit_book_title.state)
+
+            await handlers.admin_book_card(
+                FakeCallback(self.admin_id, f"admin_book:{book_id}:0"),
+                state,
+            )
+            self.assertIsNone(await state.get_state())
+            self.assertEqual(await state.get_data(), {})
+
+            plain_message = SimpleNamespace(
+                from_user=SimpleNamespace(id=self.admin_id),
+                text="Сообщение после отмены",
+                bot=SimpleNamespace(),
+                chat=SimpleNamespace(id=self.admin_id),
+                answer=AsyncMock(),
+            )
+            await handlers.admin_book_edit_title_save(plain_message, state)
+
+            async with async_session_maker() as session:
+                persisted = await session.get(Book, book_id)
+                self.assertEqual(persisted.title, "Книга до отмены")
+            plain_message.answer.assert_awaited_once()
+        finally:
+            async with async_session_maker() as session:
+                book = await session.get(Book, book_id)
+                if book:
+                    await session.delete(book)
+                await session.commit()
+
+    async def test_thematic_callback_stays_stable_and_resolves_current_binding(self):
+        button = await self._button("thematic", 0)
+        stable_callback = button.legacy_callback
+        topic_slug = "review-current-thematic-topic"
+        async with async_session_maker() as session:
+            session.add(Topic(slug=topic_slug, name="Текущая тема", system_prompt="Ответь кратко."))
+            stored = await session.get(MenuButton, button.id)
+            stored.action_value = "thematic_stale_action"
+            stored.topic_slug = topic_slug
+            await session.commit()
+
+        try:
+            markup = await keyboards.configured_thematic_sessions_keyboard()
+            rendered = next(
+                item
+                for row in markup.inline_keyboard
+                for item in row
+                if item.text == button.label
+            )
+            self.assertEqual(rendered.callback_data, stable_callback)
+
+            state = await self._state(self.ordinary_id)
+            with patch.object(handlers, "activate_ai_mode", new=AsyncMock()) as activate:
+                callback = FakeCallback(self.ordinary_id, stable_callback)
+                await handlers.thematic_session_choice(callback, state, SimpleNamespace())
+                activate.assert_awaited_once()
+                self.assertEqual(activate.call_args.args[1], topic_slug)
+
+            async with async_session_maker() as session:
+                stored = await session.get(MenuButton, button.id)
+                stored.topic_slug = None
+                await session.commit()
+            with patch.object(handlers, "activate_ai_mode", new=AsyncMock()) as activate:
+                missing = FakeCallback(self.ordinary_id, stable_callback)
+                await handlers.thematic_session_choice(missing, state, SimpleNamespace())
+                activate.assert_not_awaited()
+                self.assertIn("не привязана", missing.answer.await_args.args[0])
+        finally:
+            async with async_session_maker() as session:
+                stored = await session.get(MenuButton, button.id)
+                if stored:
+                    stored.action_value = stored.legacy_callback
+                    stored.topic_slug = None
+                topic = await session.get(Topic, topic_slug)
+                if topic:
+                    await session.delete(topic)
+                await session.commit()
 
     async def test_admin_cannot_disable_last_root_menu_and_db_stays_safe(self):
         await handlers.admin_menu_section_toggle(FakeCallback(self.admin_id, "admin_menu_section_toggle:main"))
