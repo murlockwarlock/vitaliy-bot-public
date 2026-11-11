@@ -1063,7 +1063,7 @@ class BehavioralV5Tests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(buttons[0].callback_data, "funnel_show_sales")
         self.assertEqual(buttons[1].text, "Пока нет, спасибо")
         self.assertEqual(buttons[1].callback_data, "funnel_interest_no")
-        self.assertEqual(buttons[2].text, "🏠 Главное меню")
+        self.assertEqual(buttons[2].text, "Главное меню")
         self.assertEqual(buttons[2].callback_data, "funnel_to_main")
 
     async def test_block_7_keyboard_exact_labels_count_callbacks(self):
@@ -1140,7 +1140,7 @@ class BehavioralV5Tests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(buttons[0].callback_data, "funnel_open_landing")
         self.assertEqual(buttons[1].text, "⬅️ Вернуться назад")
         self.assertEqual(buttons[1].callback_data, "funnel_show_sales")
-        self.assertEqual(buttons[2].text, "Главное меню")
+        self.assertEqual(buttons[2].text, "🏠 Главное меню")
         self.assertEqual(buttons[2].callback_data, "funnel_to_main")
 
     async def test_objection_generation_ux_typing_action_and_wait_text(self):

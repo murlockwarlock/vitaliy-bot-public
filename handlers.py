@@ -2694,8 +2694,8 @@ async def _resume_ai_dialogue(target, state: FSMContext, bot: Bot, topic_slug: s
         )
         if (
             not user
-            or (latest_dialogue != dialogue_id and not (explicit and active_matches))
-            or (not has_user_message and not (explicit and active_matches))
+            or (latest_dialogue != dialogue_id and not active_matches)
+            or (not has_user_message and not active_matches)
             or (not explicit and not user.current_topic_slug)
             or (not explicit and user.current_topic_slug != topic_slug)
             or (explicit and user.current_topic_slug and user.current_topic_slug != topic_slug)
@@ -3380,11 +3380,11 @@ async def habit_delete(callback: CallbackQuery, bot: Bot):
         await callback.answer("❌ Привычка не найдена.", show_alert=True)
         return
     builder = InlineKeyboardBuilder()
-    builder.button(text="✅ Да, удалить", callback_data=f"habit_confirm_delete:{h_id}")
-    builder.button(text="❌ Нет, отмена", callback_data="habit_cancel_delete")
+    builder.button(text="Да, удалить", callback_data=f"habit_confirm_delete:{h_id}")
+    builder.button(text="Нет, отмена", callback_data="habit_cancel_delete")
     builder.adjust(1)
     await callback.message.edit_text(
-        f"Удалить привычку «{html.escape(habit.name)}»?",
+        f"Удалить привычку „{html.escape(habit.name)}“?",
         reply_markup=builder.as_markup(),
         parse_mode="HTML",
     )

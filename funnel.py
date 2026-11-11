@@ -2333,6 +2333,9 @@ async def funnel_remind_7d(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "funnel_start_objections")
 async def funnel_start_objections(callback: CallbackQuery, state: FSMContext):
+    if await _guard_crisis_commercial_path(callback, state=state):
+        await callback.answer()
+        return
     await state.clear()
     await callback.answer()
     await start_objection_dialogue(callback, state)
