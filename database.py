@@ -2182,21 +2182,6 @@ async def run_data_migrations(session: AsyncSession):
     import logging
     log = logging.getLogger("database")
 
-    # Keep the six thematic menu entries editable without changing their
-    # legacy callbacks. A missing link means the historical callback slug is
-    # still the source of truth.
-    thematic_buttons = (await session.scalars(
-        select(MenuButton).where(
-            MenuButton.section_key == "thematic",
-            MenuButton.topic_slug.is_(None),
-            MenuButton.action_value.like("thematic_%"),
-        )
-    )).all()
-    for button in thematic_buttons:
-        slug = (button.action_value or "").removeprefix("thematic_")
-        if await session.scalar(select(Topic.slug).where(Topic.slug == slug)):
-            button.topic_slug = slug
-
     # These links are normal Telegram URL buttons. Preserve their configured
     # Content.link_url values and only change the Telegram button type.
     await session.execute(
@@ -2512,17 +2497,6 @@ async def run_data_migrations(session: AsyncSession):
 
     await _seed_menu_configuration(session)
     await _migrate_investor_menu_defaults(session)
-    thematic_buttons = (await session.scalars(
-        select(MenuButton).where(
-            MenuButton.section_key == "thematic",
-            MenuButton.topic_slug.is_(None),
-            MenuButton.action_value.like("thematic_%"),
-        )
-    )).all()
-    for button in thematic_buttons:
-        slug = (button.action_value or "").removeprefix("thematic_")
-        if await session.scalar(select(Topic.slug).where(Topic.slug == slug)):
-            button.topic_slug = slug
     await session.execute(
         update(MenuButton)
         .where(

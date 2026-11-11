@@ -1170,15 +1170,35 @@ class ButtonManagementTests(unittest.IsolatedAsyncioTestCase):
                 activate.assert_awaited_once()
                 self.assertEqual(activate.call_args.args[1], topic_slug)
 
+            await handlers.admin_menu_button_topic_clear(
+                FakeCallback(self.admin_id, f"admin_menu_button_topic_clear:{button.id}")
+            )
             async with async_session_maker() as session:
                 stored = await session.get(MenuButton, button.id)
-                stored.topic_slug = None
+                self.assertIsNone(stored.topic_slug)
+
+            await init_db()
+            async with async_session_maker() as session:
+                stored = await session.get(MenuButton, button.id)
+                self.assertIsNone(stored.topic_slug)
+                self.assertEqual(stored.action_value, "thematic_stale_action")
+                self.assertEqual(stored.label, button.label)
+
+            with patch.object(handlers, "activate_ai_mode", new=AsyncMock()) as activate:
+                fallback = FakeCallback(self.ordinary_id, stable_callback)
+                await handlers.thematic_session_choice(fallback, state, SimpleNamespace())
+                activate.assert_awaited_once()
+                self.assertEqual(activate.call_args.args[1], stable_callback.removeprefix("thematic_"))
+
+            async with async_session_maker() as session:
+                stored = await session.get(MenuButton, button.id)
+                stored.topic_slug = "missing-review-topic"
                 await session.commit()
             with patch.object(handlers, "activate_ai_mode", new=AsyncMock()) as activate:
                 missing = FakeCallback(self.ordinary_id, stable_callback)
                 await handlers.thematic_session_choice(missing, state, SimpleNamespace())
                 activate.assert_not_awaited()
-                self.assertIn("не привязана", missing.answer.await_args.args[0])
+                self.assertIn("недоступна", missing.answer.await_args.args[0])
         finally:
             async with async_session_maker() as session:
                 stored = await session.get(MenuButton, button.id)

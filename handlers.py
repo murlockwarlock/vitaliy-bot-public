@@ -2900,22 +2900,25 @@ async def thematic_session_choice(callback: CallbackQuery, state: FSMContext, bo
             )
             .order_by(MenuButton.id.asc())
         )
-        topic = None
-        if button and button.topic_slug:
-            topic = await session.scalar(select(Topic).where(Topic.slug == button.topic_slug))
-    if not button or not button.topic_slug:
+        if not button:
+            topic_slug = None
+            topic = None
+        else:
+            topic_slug = button.topic_slug or stable_callback.removeprefix("thematic_")
+            topic = await session.scalar(select(Topic).where(Topic.slug == topic_slug))
+    if not button or not topic_slug:
         await callback.answer(
-            "Эта тематическая кнопка ещё не привязана к ИИ-теме. Обратись к администратору.",
+            "Эта тематическая кнопка недоступна. Обратись к администратору.",
             show_alert=True,
         )
         return
     if not topic:
         await callback.answer(
-            "Привязанная ИИ-тема сейчас недоступна. Обратись к администратору.",
+            "ИИ-тема для этой кнопки сейчас недоступна. Обратись к администратору.",
             show_alert=True,
         )
         return
-    await activate_ai_mode(callback, topic.slug, state, bot)
+    await activate_ai_mode(callback, topic_slug, state, bot)
     await callback.answer()
 
 
