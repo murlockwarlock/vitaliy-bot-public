@@ -2900,7 +2900,9 @@ async def thematic_session_choice(callback: CallbackQuery, state: FSMContext, bo
             )
             .order_by(MenuButton.id.asc())
         )
-        topic = await session.get(Topic, button.topic_slug) if button and button.topic_slug else None
+        topic = None
+        if button and button.topic_slug:
+            topic = await session.scalar(select(Topic).where(Topic.slug == button.topic_slug))
     if not button or not button.topic_slug:
         await callback.answer(
             "Эта тематическая кнопка ещё не привязана к ИИ-теме. Обратись к администратору.",

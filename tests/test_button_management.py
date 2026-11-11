@@ -1185,7 +1185,7 @@ class ButtonManagementTests(unittest.IsolatedAsyncioTestCase):
                 if stored:
                     stored.action_value = stored.legacy_callback
                     stored.topic_slug = None
-                topic = await session.get(Topic, topic_slug)
+                topic = await session.scalar(select(Topic).where(Topic.slug == topic_slug))
                 if topic:
                     await session.delete(topic)
                 await session.commit()
