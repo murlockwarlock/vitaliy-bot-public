@@ -527,7 +527,7 @@ class PostgreSQLConcurrencyTests(unittest.IsolatedAsyncioTestCase):
                     name="Global main user",
                     current_dialogue_id=1,
                     current_topic_slug=None,
-                    last_activity_at=now - timedelta(hours=1),
+                    last_activity_at=now - timedelta(minutes=1),
                     created_at=now,
                 ),
                 User(
@@ -536,7 +536,7 @@ class PostgreSQLConcurrencyTests(unittest.IsolatedAsyncioTestCase):
                     name="Global topic user",
                     current_dialogue_id=1,
                     current_topic_slug=topic_slug,
-                    last_activity_at=now - timedelta(hours=1),
+                    last_activity_at=now - timedelta(minutes=1),
                     created_at=now,
                 ),
             ])
