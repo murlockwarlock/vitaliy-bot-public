@@ -24,7 +24,7 @@ from sqlalchemy import delete, func, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from database import Base, Mailing, User, _ensure_postgresql_compat_schema
+from database import Base, Mailing, Topic, User, _ensure_postgresql_compat_schema
 from automation_engine import (
     AutomationActionExecution,
     AutomationConversationState,
@@ -508,6 +508,279 @@ class PostgreSQLConcurrencyTests(unittest.IsolatedAsyncioTestCase):
             1,
             f"Expected Fake Telegram to receive exactly 1 send_message call, got {fake_bot.send_message.call_count}",
         )
+
+    async def test_followup_scope_global_sends_to_main_and_topic_users(self):
+        """Global campaigns include inactive users in both main and topic dialogs."""
+        from time_utils import msk_now
+
+        main_user_id = self._unique_id(18100000)
+        topic_user_id = self._unique_id(18200000)
+        topic_slug = f"scope_global_{uuid.uuid4().hex[:8]}"
+        now = msk_now()
+
+        async with self.session_maker() as session:
+            session.add(Topic(slug=topic_slug, name="Global scope test topic"))
+            session.add_all([
+                User(
+                    id=main_user_id,
+                    username=f"scope_global_main_{main_user_id}",
+                    name="Global main user",
+                    current_dialogue_id=1,
+                    current_topic_slug=None,
+                    last_activity_at=now - timedelta(hours=1),
+                    created_at=now,
+                ),
+                User(
+                    id=topic_user_id,
+                    username=f"scope_global_topic_{topic_user_id}",
+                    name="Global topic user",
+                    current_dialogue_id=1,
+                    current_topic_slug=topic_slug,
+                    last_activity_at=now - timedelta(hours=1),
+                    created_at=now,
+                ),
+            ])
+            campaign = FollowupCampaign(
+                name="Global scope regression",
+                scope="global",
+                is_active=1,
+                quiet_hours_start=0,
+                quiet_hours_end=0,
+            )
+            session.add(campaign)
+            await session.flush()
+            session.add(FollowupStep(
+                campaign_id=campaign.id,
+                step_number=1,
+                delay_minutes=0,
+                message_text="Global scope message",
+            ))
+            await session.commit()
+
+        fake_bot = AsyncMock(spec=Bot)
+        fake_bot.send_message = AsyncMock()
+        await process_generic_followups(
+            fake_bot,
+            session_maker=self.session_maker,
+            scope="global",
+            user_id=main_user_id,
+        )
+        await process_generic_followups(
+            fake_bot,
+            session_maker=self.session_maker,
+            scope="global",
+            user_id=topic_user_id,
+        )
+
+        sent_ids = [call.args[0] for call in fake_bot.send_message.call_args_list]
+        self.assertCountEqual(sent_ids, [main_user_id, topic_user_id])
+
+    async def test_followup_scope_main_excludes_topic_users(self):
+        """Main campaigns send only to users whose current topic is empty."""
+        from time_utils import msk_now
+
+        main_user_id = self._unique_id(18300000)
+        topic_user_id = self._unique_id(18400000)
+        topic_slug = f"scope_main_{uuid.uuid4().hex[:8]}"
+        now = msk_now()
+
+        async with self.session_maker() as session:
+            session.add(Topic(slug=topic_slug, name="Main scope test topic"))
+            session.add_all([
+                User(
+                    id=main_user_id,
+                    username=f"scope_main_main_{main_user_id}",
+                    name="Main dialog user",
+                    current_dialogue_id=1,
+                    current_topic_slug=None,
+                    last_activity_at=now - timedelta(hours=1),
+                    created_at=now,
+                ),
+                User(
+                    id=topic_user_id,
+                    username=f"scope_main_topic_{topic_user_id}",
+                    name="Topic dialog user",
+                    current_dialogue_id=1,
+                    current_topic_slug=topic_slug,
+                    last_activity_at=now - timedelta(hours=1),
+                    created_at=now,
+                ),
+            ])
+            campaign = FollowupCampaign(
+                name="Main scope regression",
+                scope="main",
+                is_active=1,
+                quiet_hours_start=0,
+                quiet_hours_end=0,
+            )
+            session.add(campaign)
+            await session.flush()
+            session.add(FollowupStep(
+                campaign_id=campaign.id,
+                step_number=1,
+                delay_minutes=0,
+                message_text="Main scope message",
+            ))
+            await session.commit()
+
+        fake_bot = AsyncMock(spec=Bot)
+        fake_bot.send_message = AsyncMock()
+        await process_generic_followups(
+            fake_bot,
+            session_maker=self.session_maker,
+            scope="main",
+            user_id=main_user_id,
+        )
+        await process_generic_followups(
+            fake_bot,
+            session_maker=self.session_maker,
+            scope="main",
+            user_id=topic_user_id,
+        )
+
+        sent_ids = [call.args[0] for call in fake_bot.send_message.call_args_list]
+        self.assertEqual(sent_ids, [main_user_id])
+
+    async def test_followup_scope_topic_sends_only_to_selected_topic(self):
+        """Topic campaigns send only to users currently in the configured topic."""
+        from time_utils import msk_now
+
+        selected_user_id = self._unique_id(18500000)
+        other_user_id = self._unique_id(18600000)
+        selected_slug = f"scope_topic_selected_{uuid.uuid4().hex[:8]}"
+        other_slug = f"scope_topic_other_{uuid.uuid4().hex[:8]}"
+        now = msk_now()
+
+        async with self.session_maker() as session:
+            session.add_all([
+                Topic(slug=selected_slug, name="Selected topic"),
+                Topic(slug=other_slug, name="Other topic"),
+                User(
+                    id=selected_user_id,
+                    username=f"scope_topic_selected_{selected_user_id}",
+                    name="Selected topic user",
+                    current_dialogue_id=1,
+                    current_topic_slug=selected_slug,
+                    last_activity_at=now - timedelta(hours=1),
+                    created_at=now,
+                ),
+                User(
+                    id=other_user_id,
+                    username=f"scope_topic_other_{other_user_id}",
+                    name="Other topic user",
+                    current_dialogue_id=1,
+                    current_topic_slug=other_slug,
+                    last_activity_at=now - timedelta(hours=1),
+                    created_at=now,
+                ),
+            ])
+            campaign = FollowupCampaign(
+                name="Topic scope regression",
+                scope="topic",
+                topic_slug=selected_slug,
+                is_active=1,
+                quiet_hours_start=0,
+                quiet_hours_end=0,
+            )
+            session.add(campaign)
+            await session.flush()
+            session.add(FollowupStep(
+                campaign_id=campaign.id,
+                step_number=1,
+                delay_minutes=0,
+                message_text="Topic scope message",
+            ))
+            await session.commit()
+
+        fake_bot = AsyncMock(spec=Bot)
+        fake_bot.send_message = AsyncMock()
+        await process_generic_followups(
+            fake_bot,
+            session_maker=self.session_maker,
+            scope="topic",
+            user_id=selected_user_id,
+        )
+        await process_generic_followups(
+            fake_bot,
+            session_maker=self.session_maker,
+            scope="topic",
+            user_id=other_user_id,
+        )
+
+        sent_ids = [call.args[0] for call in fake_bot.send_message.call_args_list]
+        self.assertEqual(sent_ids, [selected_user_id])
+
+    async def test_followup_scope_rechecks_topic_before_send_after_switch(self):
+        """A user switching topics after selection is skipped before Telegram send."""
+        from time_utils import msk_now
+        import followups as followups_module
+
+        user_id = self._unique_id(18700000)
+        selected_slug = f"scope_switch_selected_{uuid.uuid4().hex[:8]}"
+        switched_slug = f"scope_switch_other_{uuid.uuid4().hex[:8]}"
+        now = msk_now()
+
+        async with self.session_maker() as session:
+            session.add_all([
+                Topic(slug=selected_slug, name="Switch selected topic"),
+                Topic(slug=switched_slug, name="Switch other topic"),
+                User(
+                    id=user_id,
+                    username=f"scope_switch_{user_id}",
+                    name="Switching topic user",
+                    current_dialogue_id=1,
+                    current_topic_slug=selected_slug,
+                    last_activity_at=now - timedelta(hours=1),
+                    created_at=now,
+                ),
+            ])
+            campaign = FollowupCampaign(
+                name="Topic switch regression",
+                scope="topic",
+                topic_slug=selected_slug,
+                is_active=1,
+                quiet_hours_start=0,
+                quiet_hours_end=0,
+            )
+            session.add(campaign)
+            await session.flush()
+            session.add(FollowupStep(
+                campaign_id=campaign.id,
+                step_number=1,
+                delay_minutes=0,
+                message_text="Must not send after topic switch",
+            ))
+            await session.commit()
+
+        original_get_or_create = followups_module.get_or_create_active_followup_run
+        switched = False
+
+        async def switch_topic_then_create_run(session, **kwargs):
+            nonlocal switched
+            if not switched:
+                async with self.session_maker() as switch_session:
+                    switched_user = await switch_session.get(User, user_id)
+                    switched_user.current_topic_slug = switched_slug
+                    await switch_session.commit()
+                switched = True
+            return await original_get_or_create(session, **kwargs)
+
+        fake_bot = AsyncMock(spec=Bot)
+        fake_bot.send_message = AsyncMock()
+        with patch.object(
+            followups_module,
+            "get_or_create_active_followup_run",
+            side_effect=switch_topic_then_create_run,
+        ):
+            delivered = await process_generic_followups(
+                fake_bot,
+                session_maker=self.session_maker,
+                scope="topic",
+                user_id=user_id,
+            )
+
+        self.assertEqual(delivered, 0)
+        fake_bot.send_message.assert_not_awaited()
 
     async def test_09_concurrent_automation_event_dispatch_fake_telegram_count_20_workers(self):
         """Scenario 9: 20 concurrent event dispatches execute simultaneously.
