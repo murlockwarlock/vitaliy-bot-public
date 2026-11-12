@@ -36,15 +36,36 @@ DEFAULT_CRISIS_MARKERS = (
     "причинить себе вред",
     "сделать себе больно",
     "не хочу жить",
+    "не хочу больше жить",
     "не вижу смысла жить",
+    "не вижу смысла продолжать жить",
+    "не вижу смысла дальше жить",
+    "не вижу смысла жить дальше",
+    "не хочется жить",
+    "мне незачем жить",
     "не вижу смысла продолжать сил больше нет",
     "лучше бы меня не было",
     "хочу умереть",
 )
 
-_SCENARIO_4_PREFIX = ("не", "вижу", "смысла", "продолжать")
-_SCENARIO_4_SUFFIX = ("сил", "больше", "нет")
 SCENARIO_4_CRISIS_MARKER = "не вижу смысла продолжать сил больше нет"
+SCENARIO_4_WITH_LIFE_CRISIS_MARKER = "не вижу смысла продолжать жить сил больше нет"
+_SCENARIO_4_PREFIX = ("не", "вижу", "смысла")
+_SCENARIO_4_MIDDLES = (
+    (("продолжать",), SCENARIO_4_CRISIS_MARKER),
+    (("продолжать", "жить"), SCENARIO_4_WITH_LIFE_CRISIS_MARKER),
+    (("продолжать", "жить", "дальше"), SCENARIO_4_WITH_LIFE_CRISIS_MARKER),
+    (("дальше", "жить"), "не вижу смысла дальше жить сил больше нет"),
+    (("жить", "дальше"), "не вижу смысла жить дальше сил больше нет"),
+    (("больше", "жить"), "не вижу смысла больше жить сил больше нет"),
+)
+_SCENARIO_4_SUFFIXES = (
+    ("сил", "больше", "нет"),
+    ("больше", "нет", "сил"),
+    ("сил", "не", "осталось"),
+    ("сил", "больше", "не", "осталось"),
+    ("у", "меня", "больше", "нет", "сил"),
+)
 _SCENARIO_4_QUOTE_ATTRIBUTIONS = (
     ("в", "книге", "герой", "сказал"),
     ("в", "романе", "герой", "сказал"),
@@ -145,6 +166,8 @@ def get_configured_crisis_markers(config: object | None) -> list[str]:
 
 
 def _is_explicitly_negated(tokens: list[str], start: int, marker_tokens: list[str]) -> bool:
+    if start > 0 and marker_tokens[0] == "не" and tokens[start - 1] == "не":
+        return True
     if start > 0 and tokens[start - 1] == "не" and marker_tokens[0] in _CRISIS_INTENT_WORDS:
         return True
     for prefix in _CRISIS_NEGATION_PREFIXES:
@@ -153,14 +176,16 @@ def _is_explicitly_negated(tokens: list[str], start: int, marker_tokens: list[st
     return False
 
 
-def _scenario_4_starts(tokens: list[str]) -> list[int]:
-    scenario_tokens = _SCENARIO_4_PREFIX + _SCENARIO_4_SUFFIX
-    width = len(scenario_tokens)
-    return [
-        start
-        for start in range(len(tokens) - width + 1)
-        if tuple(tokens[start:start + width]) == scenario_tokens
-    ]
+def _scenario_4_starts(tokens: list[str]) -> list[tuple[int, str]]:
+    matches = []
+    for middle, marker in _SCENARIO_4_MIDDLES:
+        for suffix in _SCENARIO_4_SUFFIXES:
+            scenario_tokens = _SCENARIO_4_PREFIX + middle + suffix
+            width = len(scenario_tokens)
+            for start in range(len(tokens) - width + 1):
+                if tuple(tokens[start:start + width]) == scenario_tokens:
+                    matches.append((start, marker))
+    return matches
 
 
 def _contains_token_phrase(tokens: list[str], phrase: tuple[str, ...]) -> bool:
@@ -171,9 +196,9 @@ def _contains_token_phrase(tokens: list[str], phrase: tuple[str, ...]) -> bool:
     )
 
 
-def _scenario_4_quoted_starts(tokens: list[str], starts: list[int]) -> set[int]:
+def _scenario_4_quoted_starts(tokens: list[str], starts: list[tuple[int, str]]) -> set[int]:
     quoted_starts = set()
-    for start in starts:
+    for start, _ in starts:
         context = tokens[max(0, start - 10):start]
         if any(_contains_token_phrase(context, phrase) for phrase in _SCENARIO_4_QUOTE_ATTRIBUTIONS):
             quoted_starts.add(start)
@@ -184,7 +209,15 @@ def _matches_scenario_4(tokens: list[str]) -> bool:
     """Match the acceptance phrase unless an explicit external attribution quotes it."""
     starts = _scenario_4_starts(tokens)
     quoted_starts = _scenario_4_quoted_starts(tokens, starts)
-    return any(start not in quoted_starts for start in starts)
+    return any(
+        start not in quoted_starts and not _is_explicitly_negated(tokens, start, marker.split())
+        for start, marker in starts
+    )
+
+
+def _is_explicitly_quoted(tokens: list[str], start: int) -> bool:
+    context = tokens[max(0, start - 10):start]
+    return any(_contains_token_phrase(context, phrase) for phrase in _SCENARIO_4_QUOTE_ATTRIBUTIONS)
 
 
 def find_crisis_marker(text: str | None, markers: object = None) -> str | None:
@@ -193,8 +226,12 @@ def find_crisis_marker(text: str | None, markers: object = None) -> str | None:
         return None
     scenario_4_starts = _scenario_4_starts(tokens)
     quoted_scenario_4_starts = _scenario_4_quoted_starts(tokens, scenario_4_starts)
-    if any(start not in quoted_scenario_4_starts for start in scenario_4_starts):
-        return SCENARIO_4_CRISIS_MARKER
+    for start, marker in scenario_4_starts:
+        if (
+            start not in quoted_scenario_4_starts
+            and not _is_explicitly_negated(tokens, start, marker.split())
+        ):
+            return marker
     configured = list(DEFAULT_CRISIS_MARKERS) if markers is None else parse_crisis_markers(markers)
     configured = sorted(enumerate(configured), key=lambda item: (-len(item[1].split()), item[0]))
     for _, marker in configured:
@@ -203,7 +240,7 @@ def find_crisis_marker(text: str | None, markers: object = None) -> str | None:
         for start in range(len(tokens) - width + 1):
             if tokens[start:start + width] != marker_tokens:
                 continue
-            if marker == SCENARIO_4_CRISIS_MARKER and start in quoted_scenario_4_starts:
+            if _is_explicitly_quoted(tokens, start):
                 continue
             if _is_explicitly_negated(tokens, start, marker_tokens):
                 continue

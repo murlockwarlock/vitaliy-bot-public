@@ -107,9 +107,17 @@ async def test_crisis_marker_matcher_uses_phrases_context_and_negation():
     assert find_crisis_marker("Я не хочу покончить с собой", ["хочу покончить с собой"]) is None
     assert find_crisis_marker("В статье обсуждается суицидальный риск", ["суицид"]) is None
     assert find_crisis_marker("Я планирую суицид", ["суицид"]) == "суицид"
+    assert find_crisis_marker(
+        "Не вижу смысла продолжать жить. Сил больше нет",
+        ["другой маркер"],
+    ) == "не вижу смысла продолжать жить сил больше нет"
     assert find_crisis_marker("Не вижу смысла продолжать. Сил больше нет", ["другой маркер"]) == (
         "не вижу смысла продолжать сил больше нет"
     )
+    assert find_crisis_marker("Не вижу смысла жить дальше, у меня больше нет сил", ["другой маркер"]) == (
+        "не вижу смысла жить дальше сил больше нет"
+    )
+    assert find_crisis_marker("Я не не вижу смысла продолжать жить. Сил больше нет", ["другой маркер"]) is None
     assert find_crisis_marker("Не вижу смысла продолжать разговор о проекте") is None
     assert find_crisis_marker("Не вижу смысла продолжать разговор. Сил больше нет") is None
     assert find_crisis_marker("Сил больше нет после тренировки") is None
@@ -117,6 +125,11 @@ async def test_crisis_marker_matcher_uses_phrases_context_and_negation():
         "В книге герой сказал: «Не вижу смысла продолжать. Сил больше нет»",
         ["другой маркер"],
     ) is None
+    assert find_crisis_marker(
+        "В книге герой сказал: «Не вижу смысла продолжать жить. Сил больше нет»",
+        ["другой маркер"],
+    ) is None
+    assert find_crisis_marker("Цитата: «Я хочу умереть»", ["хочу умереть"]) is None
     assert find_crisis_marker(
         "«Не вижу смысла продолжать. Сил больше нет»",
         ["другой маркер"],

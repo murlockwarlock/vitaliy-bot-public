@@ -378,7 +378,7 @@ async def _process_ai_automation_and_clean_text(
     session,
     *,
     raw_text: str,
-    user_id: int,
+    user_id: int | None,
     dialogue_id: int,
     scope: str,
     topic_slug: Optional[str],
@@ -387,6 +387,8 @@ async def _process_ai_automation_and_clean_text(
     alert_metadata: Optional[Dict[str, Any]] = None,
 ) -> str:
     clean_visible_text, payloads, invalid_block_count = extract_service_data(raw_text)
+    if user_id is None:
+        return clean_visible_text
     effective_bot = bot or get_active_bot()
     base_metadata = dict(alert_metadata or {})
     base_metadata["user_text"] = user_text or base_metadata.get("user_text") or ""
@@ -504,7 +506,17 @@ async def get_standalone_ai_response(
                     model_name,
                     req_messages,
                 )
-                resp = ai_res.text or ""
+                raw_resp = ai_res.text or ""
+                resp = await _process_ai_automation_and_clean_text(
+                    session,
+                    raw_text=raw_resp,
+                    user_id=user_id,
+                    dialogue_id=1,
+                    scope="main",
+                    topic_slug=None,
+                    bot=bot,
+                    user_text=user_prompt,
+                )
                 latency_ms = int((time.monotonic() - start_ts) * 1000)
                 payload_str = (
                     json.dumps(ai_res.raw_payload, ensure_ascii=False)
@@ -519,7 +531,7 @@ async def get_standalone_ai_response(
                     latency_ms=latency_ms,
                     prompt_summary=user_prompt[:500] if user_prompt else None,
                     clean_text=resp,
-                    raw_response=resp,
+                    raw_response=raw_resp,
                     request_capture=req_messages,
                     provider_response_payload=payload_str,
                     http_status=ai_res.http_status,
@@ -983,7 +995,7 @@ async def analyze_image(image_bytes: bytes, prompt: str) -> str:
         from kie_client import upload_file
         filename = 'photo.jpg'
         url = await upload_file(config.kie_api_key, _kie_upload_base_url(config), image_bytes, filename, 'images')
-        return await kie_chat(
+        raw_result = await kie_chat(
             config.kie_api_key,
             _kie_base_url(config),
             config.vision_model or 'gemini-3-flash',
@@ -993,6 +1005,7 @@ async def analyze_image(image_bytes: bytes, prompt: str) -> str:
             ],
             temperature=float(config.temperature or 0.7),
         )
+        return extract_service_data(raw_result)[0]
 
 
 async def generate_image(prompt: str) -> bytes:
@@ -1017,7 +1030,15 @@ async def transcribe_audio(audio_bytes: bytes, filename: str) -> str:
         if not config or config.transcription_provider != 'KIE' or not config.kie_api_key:
             raise RuntimeError('Для транскрибации нужен настроенный KIE.')
         try:
-            return await kie_transcribe(config.kie_api_key, _kie_base_url(config), _kie_upload_base_url(config), config.kie_transcription_model, audio_bytes, filename)
+            raw_result = await kie_transcribe(
+                config.kie_api_key,
+                _kie_base_url(config),
+                _kie_upload_base_url(config),
+                config.kie_transcription_model,
+                audio_bytes,
+                filename,
+            )
+            return extract_service_data(raw_result)[0]
         except KIEError:
             if not config.openai_api_key:
                 raise
@@ -1025,7 +1046,7 @@ async def transcribe_audio(audio_bytes: bytes, filename: str) -> str:
             client = AsyncOpenAI(api_key=config.openai_api_key)
             try:
                 result = await client.audio.transcriptions.create(model="whisper-1", file=(filename, audio_bytes))
-                return result.text
+                return extract_service_data(result.text)[0]
             finally:
                 await client.close()
 
@@ -1155,6 +1176,17 @@ async def generate_journal_daily_summary(
                 ai_res = await _generate_chat_response(ai_config, chat_client, model_name, messages)
                 latency_ms = int((time.monotonic() - start_ts) * 1000)
                 raw_text = ai_res.text if hasattr(ai_res, "text") else (str(ai_res) if ai_res else "")
+                clean_text = await _process_ai_automation_and_clean_text(
+                    session,
+                    raw_text=raw_text,
+                    user_id=user_id,
+                    dialogue_id=1,
+                    scope="main",
+                    topic_slug="journal",
+                    bot=bot,
+                    user_text=user_prompt,
+                    alert_metadata={"journal": "daily_summary"},
+                )
                 payload_str = (
                     json.dumps(ai_res.raw_payload, ensure_ascii=False)
                     if hasattr(ai_res, "raw_payload") and isinstance(ai_res.raw_payload, (dict, list))
@@ -1172,7 +1204,7 @@ async def generate_journal_daily_summary(
                     status="success",
                     latency_ms=latency_ms,
                     prompt_summary=user_prompt[:500],
-                    clean_text=raw_text,
+                    clean_text=clean_text,
                     raw_response=raw_text,
                     request_capture=messages,
                     provider_response_payload=payload_str,
@@ -1186,7 +1218,7 @@ async def generate_journal_daily_summary(
                 await session.commit()
 
                 await _stop_journal_heartbeat(heartbeat_task)
-                parsed_result = parse_journal_daily_summary_response(raw_text)
+                parsed_result = parse_journal_daily_summary_response(clean_text)
                 success = await finalize_journal_ai_operation_success(
                     session, op.id, op.owner_token, parsed_result
                 )
@@ -1245,6 +1277,17 @@ async def generate_journal_daily_summary(
 
                         fb_latency = int((time.monotonic() - fb_start) * 1000)
                         fb_raw_text = fb_ai_res.text if hasattr(fb_ai_res, "text") else (str(fb_ai_res) if fb_ai_res else "")
+                        fb_clean_text = await _process_ai_automation_and_clean_text(
+                            session,
+                            raw_text=fb_raw_text,
+                            user_id=user_id,
+                            dialogue_id=1,
+                            scope="main",
+                            topic_slug="journal",
+                            bot=bot,
+                            user_text=user_prompt,
+                            alert_metadata={"journal": "daily_summary"},
+                        )
                         fb_payload_str = (
                             json.dumps(fb_ai_res.raw_payload, ensure_ascii=False)
                             if hasattr(fb_ai_res, "raw_payload") and isinstance(fb_ai_res.raw_payload, (dict, list))
@@ -1262,7 +1305,7 @@ async def generate_journal_daily_summary(
                             status="success",
                             latency_ms=fb_latency,
                             prompt_summary=user_prompt[:500],
-                            clean_text=fb_raw_text,
+                            clean_text=fb_clean_text,
                             raw_response=fb_raw_text,
                             request_capture=messages,
                             provider_response_payload=fb_payload_str,
@@ -1300,7 +1343,7 @@ async def generate_journal_daily_summary(
                             logger.warning("Failed to dispatch journal AI fallback alert: %s", alert_exc)
 
                         await _stop_journal_heartbeat(heartbeat_task)
-                        parsed_result = parse_journal_daily_summary_response(fb_raw_text)
+                        parsed_result = parse_journal_daily_summary_response(fb_clean_text)
                         success = await finalize_journal_ai_operation_success(
                             session, op.id, op.owner_token, parsed_result
                         )
@@ -1482,6 +1525,17 @@ async def generate_journal_dynamics_analysis(
                 ai_res = await _generate_chat_response(ai_config, chat_client, model_name, messages)
                 latency_ms = int((time.monotonic() - start_ts) * 1000)
                 raw_text = ai_res.text if hasattr(ai_res, "text") else (str(ai_res) if ai_res else "")
+                clean_text = await _process_ai_automation_and_clean_text(
+                    session,
+                    raw_text=raw_text,
+                    user_id=user_id,
+                    dialogue_id=1,
+                    scope="main",
+                    topic_slug="journal",
+                    bot=bot,
+                    user_text=user_prompt,
+                    alert_metadata={"journal": f"dynamics_{days}"},
+                )
                 payload_str = (
                     json.dumps(ai_res.raw_payload, ensure_ascii=False)
                     if hasattr(ai_res, "raw_payload") and isinstance(ai_res.raw_payload, (dict, list))
@@ -1499,7 +1553,7 @@ async def generate_journal_dynamics_analysis(
                     status="success",
                     latency_ms=latency_ms,
                     prompt_summary=user_prompt[:500],
-                    clean_text=raw_text,
+                    clean_text=clean_text,
                     raw_response=raw_text,
                     request_capture=request_capture,
                     provider_response_payload=payload_str,
@@ -1513,10 +1567,10 @@ async def generate_journal_dynamics_analysis(
                 await session.commit()
 
                 await _stop_journal_heartbeat(heartbeat_task)
-                finalized = await finalize_journal_ai_operation_success(session, op.id, op.owner_token, raw_text)
+                finalized = await finalize_journal_ai_operation_success(session, op.id, op.owner_token, clean_text)
                 if not finalized:
                     return False, "⚠️ Запрос уже завершён или был восстановлен после сбоя. Повтори действие при необходимости."
-                return True, raw_text
+                return True, clean_text
             except Exception as e:
                 latency_ms = int((time.monotonic() - start_ts) * 1000)
                 primary_cls, _ = classify_external_error(e, provider=primary_prov)
@@ -1572,6 +1626,17 @@ async def generate_journal_dynamics_analysis(
 
                         fb_latency = int((time.monotonic() - fb_start) * 1000)
                         fb_raw_text = fb_ai_res.text if hasattr(fb_ai_res, "text") else (str(fb_ai_res) if fb_ai_res else "")
+                        fb_clean_text = await _process_ai_automation_and_clean_text(
+                            session,
+                            raw_text=fb_raw_text,
+                            user_id=user_id,
+                            dialogue_id=1,
+                            scope="main",
+                            topic_slug="journal",
+                            bot=bot,
+                            user_text=user_prompt,
+                            alert_metadata={"journal": f"dynamics_{days}"},
+                        )
                         fb_payload_str = (
                             json.dumps(fb_ai_res.raw_payload, ensure_ascii=False)
                             if hasattr(fb_ai_res, "raw_payload") and isinstance(fb_ai_res.raw_payload, (dict, list))
@@ -1589,7 +1654,7 @@ async def generate_journal_dynamics_analysis(
                             status="success",
                             latency_ms=fb_latency,
                             prompt_summary=user_prompt[:500],
-                            clean_text=fb_raw_text,
+                            clean_text=fb_clean_text,
                             raw_response=fb_raw_text,
                             request_capture=request_capture,
                             provider_response_payload=fb_payload_str,
@@ -1627,10 +1692,10 @@ async def generate_journal_dynamics_analysis(
                             logger.warning("Failed to dispatch journal dynamics AI fallback alert: %s", alert_exc)
 
                         await _stop_journal_heartbeat(heartbeat_task)
-                        finalized = await finalize_journal_ai_operation_success(session, op.id, op.owner_token, fb_raw_text)
+                        finalized = await finalize_journal_ai_operation_success(session, op.id, op.owner_token, fb_clean_text)
                         if not finalized:
                             return False, "⚠️ Запрос уже завершён или был восстановлен после сбоя. Повтори действие при необходимости."
-                        return True, fb_raw_text
+                        return True, fb_clean_text
                     except Exception as fb_err:
                         fb_latency = int((time.monotonic() - fb_start) * 1000)
                         fb_cls, _ = classify_external_error(fb_err, provider=fallback_provider)
