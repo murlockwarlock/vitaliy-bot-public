@@ -137,6 +137,23 @@ def is_in_quiet_hours(now_dt: datetime, start_hour: int, end_hour: int) -> bool:
     return False
 
 
+def _followup_scope_matches_user(campaign: FollowupCampaign, user: User) -> bool:
+    if campaign.scope == "main":
+        return user.current_topic_slug is None
+    if campaign.scope == "topic":
+        return bool(campaign.topic_slug) and user.current_topic_slug == campaign.topic_slug
+    return True
+
+
+async def _refresh_followup_user(session: AsyncSession, user_id: int) -> Optional[User]:
+    result = await session.execute(
+        select(User)
+        .where(User.id == user_id)
+        .execution_options(populate_existing=True)
+    )
+    return result.scalar_one_or_none()
+
+
 async def get_or_create_active_followup_run(
     session: AsyncSession,
     *,
@@ -519,12 +536,20 @@ async def process_generic_followups(
             )
             if user_id is not None:
                 query = query.where(User.id == user_id)
-            if campaign.scope == 'topic' and campaign.topic_slug:
+            if campaign.scope == "main":
+                query = query.where(User.current_topic_slug.is_(None))
+            elif campaign.scope == "topic":
+                if not campaign.topic_slug:
+                    continue
                 query = query.where(User.current_topic_slug == campaign.topic_slug)
 
             users = (await session.execute(query)).scalars().all()
 
             for user in users:
+                fresh_user = await _refresh_followup_user(session, user.id)
+                if fresh_user is None or not _followup_scope_matches_user(campaign, fresh_user):
+                    continue
+                user = fresh_user
                 dialogue_id = user.current_dialogue_id or 1
 
                 active_run = await get_or_create_active_followup_run(
@@ -697,6 +722,23 @@ async def process_generic_followups(
 
                 if not claimed or not target_deliv_id:
                     continue
+
+                fresh_user = await _refresh_followup_user(session, user.id)
+                if fresh_user is None or not _followup_scope_matches_user(campaign, fresh_user):
+                    async with sm() as finish_session:
+                        d_row = await finish_session.scalar(
+                            select(FollowupDelivery).where(
+                                FollowupDelivery.id == target_deliv_id,
+                                FollowupDelivery.claim_token == new_claim_token,
+                            )
+                        )
+                        if d_row:
+                            d_row.status = "failed"
+                            d_row.error = "scope_mismatch_before_send"
+                            d_row.delivered_at = msk_now()
+                        await finish_session.commit()
+                    continue
+                user = fresh_user
 
                 # Claim won: invoke external send
                 ok, status, err = await send_followup_step_to_user(
