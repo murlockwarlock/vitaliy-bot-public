@@ -154,6 +154,23 @@ async def _refresh_followup_user(session: AsyncSession, user_id: int) -> Optiona
     return result.scalar_one_or_none()
 
 
+async def _validate_followup_send(
+    session: AsyncSession,
+    user: User,
+    campaign: Optional[FollowupCampaign] = None,
+) -> Tuple[Optional[User], Optional[str]]:
+    current_user = user
+    if campaign is not None:
+        current_user = await _refresh_followup_user(session, user.id)
+        if current_user is None:
+            return None, "user_missing"
+        if not _followup_scope_matches_user(campaign, current_user):
+            return None, "scope_mismatch_before_send"
+    if not await automatic_send_allowed(session, user.id, "generic_followup"):
+        return None, "crisis_flag"
+    return current_user, None
+
+
 async def get_or_create_active_followup_run(
     session: AsyncSession,
     *,
@@ -398,6 +415,7 @@ async def send_followup_step_to_user(
     step: FollowupStep,
     user: User,
     dialogue_id: int,
+    campaign: Optional[FollowupCampaign] = None,
 ) -> Tuple[bool, str, Optional[str]]:
     """Sends a follow-up step to user and returns (success, status, error)."""
     if not await automatic_send_allowed(session, user.id, "generic_followup"):
@@ -442,7 +460,13 @@ async def send_followup_step_to_user(
         # Static admin template: preserve trusted template HTML markup, escape dynamic placeholder
         clean_text = text_to_send.replace("{name}", safe_user_name).replace("{first_name}", safe_user_name)
 
-    async def _dispatch_message(text: str) -> None:
+    async def _dispatch_message(text: str) -> Optional[str]:
+        nonlocal user
+        current_user, blocked_reason = await _validate_followup_send(session, user, campaign)
+        if blocked_reason:
+            return blocked_reason
+        if current_user is not None:
+            user = current_user
         try:
             await bot.send_message(
                 user.id,
@@ -456,6 +480,11 @@ async def send_followup_step_to_user(
             if "can't parse entities" in err_msg or "entity" in err_msg:
                 logger.warning("Malformed HTML in followup step id=%s, falling back to clean plain text: %s", step.id, b_err)
                 plain_fallback = strip_telegram_html(text_to_send).replace("{name}", raw_user_name).replace("{first_name}", raw_user_name)
+                current_user, blocked_reason = await _validate_followup_send(session, user, campaign)
+                if blocked_reason:
+                    return blocked_reason
+                if current_user is not None:
+                    user = current_user
                 await bot.send_message(
                     user.id,
                     plain_fallback,
@@ -465,16 +494,19 @@ async def send_followup_step_to_user(
                 )
             else:
                 raise
+        return None
 
     try:
-        await _dispatch_message(clean_text)
+        blocked_reason = await _dispatch_message(clean_text)
+        if blocked_reason:
+            return False, "skipped", blocked_reason
         return True, "delivered", None
     except TelegramRetryAfter as e:
         await asyncio.sleep(min(e.retry_after, 60))
-        if not await automatic_send_allowed(session, user.id, "generic_followup"):
-            return False, "skipped", "crisis_flag"
         try:
-            await _dispatch_message(clean_text)
+            blocked_reason = await _dispatch_message(clean_text)
+            if blocked_reason:
+                return False, "skipped", blocked_reason
             return True, "delivered", None
         except Exception as e2:
             return False, "failed", str(e2)
@@ -747,6 +779,7 @@ async def process_generic_followups(
                     step=step_to_send,
                     user=user,
                     dialogue_id=dialogue_id,
+                    campaign=campaign,
                 )
 
                 async with sm() as finish_session:

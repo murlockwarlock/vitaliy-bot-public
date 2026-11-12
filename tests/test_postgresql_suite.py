@@ -20,6 +20,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 import pytest
 from aiogram import Bot
+from aiogram.exceptions import TelegramRetryAfter
 from sqlalchemy import delete, func, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -781,6 +782,227 @@ class PostgreSQLConcurrencyTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(delivered, 0)
         fake_bot.send_message.assert_not_awaited()
+
+    async def test_followup_scope_rechecks_topic_after_ai_generation(self):
+        """A topic switch while an AI step is generating prevents the send."""
+        from time_utils import msk_now
+
+        user_id = self._unique_id(18800000)
+        selected_slug = f"scope_ai_selected_{uuid.uuid4().hex[:8]}"
+        switched_slug = f"scope_ai_switched_{uuid.uuid4().hex[:8]}"
+        now = msk_now()
+
+        async with self.session_maker() as session:
+            session.add_all([
+                Topic(slug=selected_slug, name="AI selected topic"),
+                Topic(slug=switched_slug, name="AI switched topic"),
+                User(
+                    id=user_id,
+                    username=f"scope_ai_{user_id}",
+                    name="AI topic user",
+                    current_dialogue_id=1,
+                    current_topic_slug=selected_slug,
+                    last_activity_at=now - timedelta(minutes=1),
+                    created_at=now,
+                ),
+            ])
+            campaign = FollowupCampaign(
+                name="AI generation scope regression",
+                scope="topic",
+                topic_slug=selected_slug,
+                is_active=1,
+                quiet_hours_start=0,
+                quiet_hours_end=0,
+            )
+            session.add(campaign)
+            await session.flush()
+            session.add(FollowupStep(
+                campaign_id=campaign.id,
+                step_number=1,
+                delay_minutes=0,
+                step_type="ai",
+                ai_instruction="Напомни о практике",
+                message_text="Fallback message",
+            ))
+            await session.commit()
+
+        async def generate_after_switch(*args, **kwargs):
+            async with self.session_maker() as switch_session:
+                switched_user = await switch_session.get(User, user_id)
+                switched_user.current_topic_slug = switched_slug
+                await switch_session.commit()
+            return "AI response generated after topic switch"
+
+        fake_bot = AsyncMock(spec=Bot)
+        fake_bot.send_message = AsyncMock()
+        with patch(
+            "ai_integration.get_standalone_ai_response",
+            new=AsyncMock(side_effect=generate_after_switch),
+        ):
+            delivered = await process_generic_followups(
+                fake_bot,
+                session_maker=self.session_maker,
+                scope="topic",
+                user_id=user_id,
+            )
+
+        self.assertEqual(delivered, 0)
+        fake_bot.send_message.assert_not_awaited()
+
+    async def test_followup_scope_rechecks_topic_after_retry_wait(self):
+        """A topic switch during TelegramRetryAfter wait prevents the retry send."""
+        from time_utils import msk_now
+        import followups as followups_module
+
+        user_id = self._unique_id(18900000)
+        selected_slug = f"scope_retry_selected_{uuid.uuid4().hex[:8]}"
+        switched_slug = f"scope_retry_switched_{uuid.uuid4().hex[:8]}"
+        now = msk_now()
+
+        async with self.session_maker() as session:
+            session.add_all([
+                Topic(slug=selected_slug, name="Retry selected topic"),
+                Topic(slug=switched_slug, name="Retry switched topic"),
+                User(
+                    id=user_id,
+                    username=f"scope_retry_{user_id}",
+                    name="Retry topic user",
+                    current_dialogue_id=1,
+                    current_topic_slug=selected_slug,
+                    last_activity_at=now - timedelta(minutes=1),
+                    created_at=now,
+                ),
+            ])
+            campaign = FollowupCampaign(
+                name="Retry scope regression",
+                scope="topic",
+                topic_slug=selected_slug,
+                is_active=1,
+                quiet_hours_start=0,
+                quiet_hours_end=0,
+            )
+            session.add(campaign)
+            await session.flush()
+            session.add(FollowupStep(
+                campaign_id=campaign.id,
+                step_number=1,
+                delay_minutes=0,
+                message_text="Retry scope message",
+            ))
+            await session.commit()
+
+        attempts = 0
+
+        async def send_with_retry(*args, **kwargs):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise TelegramRetryAfter(method="sendMessage", message="Flood", retry_after=0.01)
+
+        fake_bot = AsyncMock(spec=Bot)
+        fake_bot.send_message = AsyncMock(side_effect=send_with_retry)
+        original_sleep = followups_module.asyncio.sleep
+        switched = False
+
+        async def switch_during_retry(delay):
+            nonlocal switched
+            if not switched and delay <= 0.02:
+                async with self.session_maker() as switch_session:
+                    switched_user = await switch_session.get(User, user_id)
+                    switched_user.current_topic_slug = switched_slug
+                    await switch_session.commit()
+                switched = True
+                return
+            await original_sleep(delay)
+
+        with patch.object(followups_module.asyncio, "sleep", new=switch_during_retry):
+            delivered = await process_generic_followups(
+                fake_bot,
+                session_maker=self.session_maker,
+                scope="topic",
+                user_id=user_id,
+            )
+
+        self.assertTrue(switched)
+        self.assertEqual(delivered, 0)
+        self.assertEqual(attempts, 1)
+
+    async def test_followup_rechecks_crisis_flag_after_retry_wait(self):
+        """A crisis flag raised during TelegramRetryAfter wait prevents the retry send."""
+        from time_utils import msk_now
+        import followups as followups_module
+
+        user_id = self._unique_id(19000000)
+        topic_slug = f"scope_crisis_retry_{uuid.uuid4().hex[:8]}"
+        now = msk_now()
+
+        async with self.session_maker() as session:
+            session.add_all([
+                Topic(slug=topic_slug, name="Crisis retry topic"),
+                User(
+                    id=user_id,
+                    username=f"scope_crisis_retry_{user_id}",
+                    name="Crisis retry user",
+                    current_dialogue_id=1,
+                    current_topic_slug=topic_slug,
+                    crisis_detected_at=None,
+                    last_activity_at=now - timedelta(minutes=1),
+                    created_at=now,
+                ),
+            ])
+            campaign = FollowupCampaign(
+                name="Crisis retry regression",
+                scope="topic",
+                topic_slug=topic_slug,
+                is_active=1,
+                quiet_hours_start=0,
+                quiet_hours_end=0,
+            )
+            session.add(campaign)
+            await session.flush()
+            session.add(FollowupStep(
+                campaign_id=campaign.id,
+                step_number=1,
+                delay_minutes=0,
+                message_text="Crisis retry message",
+            ))
+            await session.commit()
+
+        attempts = 0
+
+        async def send_with_retry(*args, **kwargs):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise TelegramRetryAfter(method="sendMessage", message="Flood", retry_after=0.01)
+
+        fake_bot = AsyncMock(spec=Bot)
+        fake_bot.send_message = AsyncMock(side_effect=send_with_retry)
+        original_sleep = followups_module.asyncio.sleep
+        crisis_set = False
+
+        async def set_crisis_during_retry(delay):
+            nonlocal crisis_set
+            if not crisis_set and delay <= 0.02:
+                async with self.session_maker() as crisis_session:
+                    crisis_user = await crisis_session.get(User, user_id)
+                    crisis_user.crisis_detected_at = msk_now()
+                    await crisis_session.commit()
+                crisis_set = True
+                return
+            await original_sleep(delay)
+
+        with patch.object(followups_module.asyncio, "sleep", new=set_crisis_during_retry):
+            delivered = await process_generic_followups(
+                fake_bot,
+                session_maker=self.session_maker,
+                scope="topic",
+                user_id=user_id,
+            )
+
+        self.assertTrue(crisis_set)
+        self.assertEqual(delivered, 0)
+        self.assertEqual(attempts, 1)
 
     async def test_09_concurrent_automation_event_dispatch_fake_telegram_count_20_workers(self):
         """Scenario 9: 20 concurrent event dispatches execute simultaneously.
