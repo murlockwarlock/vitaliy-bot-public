@@ -23,10 +23,10 @@ from database import (
 import automation_admin
 import automation_events
 import handlers
-from ai_integration import StructuredAIResponse, get_ai_response_for_topic
+from ai_integration import StructuredAIResponse, get_ai_response_for_topic, get_standalone_ai_response
 from automation_engine import AutomationActionExecution, AutomationHandler
 from automation_events import dispatch_automation_events, wait_for_pending_automation_events
-from crisis_safety import crisis_contacts_keyboard
+from crisis_safety import automatic_send_allowed, crisis_contacts_keyboard
 from followups import FollowupStep, send_followup_step_to_user
 from mailing_service import send_mailing_to_recipient
 from time_utils import msk_now
@@ -161,6 +161,224 @@ async def test_ai_data_crisis_sets_flag_before_response_and_alerts_selected_reci
     assert "&lt;продолжать&gt;" in alert_messages[0][1]
     assert "Тестовая практика" in alert_messages[0][1]
     assert "Тема поддержки" in alert_messages[0][1]
+
+
+@pytest.mark.asyncio
+async def test_ordinary_topic_data_crisis_runs_safety_flow_and_hides_data():
+    await init_db()
+    user_id = 98130007
+    recipient_id = 98130107
+    topic_slug = f"ordinary-crisis-topic-{user_id}"
+    await _ensure_user(user_id, crisis_detected_at=None, username="ordinary_crisis_user")
+
+    async with async_session_maker() as session:
+        handler = AutomationHandler(
+            name="Ordinary topic crisis alert",
+            scope="global",
+            event_name="crisis_detected",
+            action_type="send_admin_message",
+            action_payload_json=json.dumps({"text": "crisis {user_id}"}),
+            recipient_ids_json=json.dumps([recipient_id]),
+            is_active=1,
+        )
+        session.add(handler)
+        await session.commit()
+        ai_config = await session.get(AIConfig, 1)
+
+    bot = RecordingBot()
+    model_response = StructuredAIResponse(
+        text='Я рядом.<DATA>{"events":["crisis_detected"]}</DATA>',
+        raw_payload={},
+        http_status=None,
+        finish_reason="stop",
+    )
+
+    async def fake_prepare_clients(session):
+        return ai_config, None, object(), "ordinary-crisis-model", None
+
+    with patch("ai_integration._prepare_clients", new=AsyncMock(side_effect=fake_prepare_clients)), \
+         patch("ai_integration._generate_chat_response", new=AsyncMock(return_value=model_response)):
+        answer = await get_ai_response_for_topic(
+            user_id,
+            "Обычный вопрос по теме",
+            "Пользователь",
+            topic_slug=topic_slug,
+            dialogue_id=17,
+            bot=bot,
+            chat_id=user_id,
+        )
+
+    assert answer == "Я рядом."
+    assert "<DATA>" not in answer
+    await wait_for_pending_automation_events()
+
+    async with async_session_maker() as session:
+        user = await session.get(User, user_id)
+        assert user.crisis_detected_at is not None
+        assert await automatic_send_allowed(session, user_id, "ordinary-topic") is False
+        mailing_result = await send_mailing_to_recipient(
+            bot,
+            user_id,
+            Mailing(text="Автоматическое сообщение"),
+            session=session,
+        )
+        followup_result = await send_followup_step_to_user(
+            bot,
+            session,
+            step=FollowupStep(campaign_id=user_id, step_number=1, message_text="Авто follow-up"),
+            user=user,
+            dialogue_id=17,
+        )
+
+    assert mailing_result == (False, "skipped", "crisis_flag")
+    assert followup_result == (False, "skipped", "crisis_flag")
+
+    await handlers.send_ai_response(user_id, answer, bot, None, crisis_contacts_keyboard())
+    await wait_for_pending_automation_events()
+
+    user_messages = [item for item in bot.sent if item[0] == user_id]
+    contact_messages = [
+        item for item in user_messages
+        if item[2].get("reply_markup") and item[2]["reply_markup"].inline_keyboard
+    ]
+    alert_messages = [item for item in bot.sent if item[0] == recipient_id]
+    assert len(alert_messages) == 1
+    assert len(user_messages) == 2
+    assert user_messages[0][1] == "Я рядом."
+    assert user_messages[0][2].get("reply_markup") is None
+    assert len(contact_messages) == 1
+    assert [
+        button.text
+        for row in contact_messages[0][2]["reply_markup"].inline_keyboard
+        for button in row
+    ] == ["Главное меню"]
+
+
+@pytest.mark.asyncio
+async def test_clinical_data_only_alerts_without_crisis_flag_or_contacts():
+    await init_db()
+    user_id = 98130008
+    clinical_recipient_id = 98130108
+    crisis_recipient_id = 98130109
+    topic_slug = f"ordinary-clinical-topic-{user_id}"
+    await _ensure_user(user_id, crisis_detected_at=None, username="clinical_user")
+
+    async with async_session_maker() as session:
+        session.add_all([
+            AutomationHandler(
+                name="Clinical-only alert",
+                scope="global",
+                event_name="clinical_detected",
+                action_type="send_admin_message",
+                action_payload_json=json.dumps({"text": "clinical {user_id}"}),
+                recipient_ids_json=json.dumps([clinical_recipient_id]),
+                is_active=1,
+            ),
+            AutomationHandler(
+                name="Unrelated crisis alert",
+                scope="global",
+                event_name="crisis_detected",
+                action_type="send_admin_message",
+                action_payload_json=json.dumps({"text": "crisis {user_id}"}),
+                recipient_ids_json=json.dumps([crisis_recipient_id]),
+                is_active=1,
+            ),
+        ])
+        await session.commit()
+        ai_config = await session.get(AIConfig, 1)
+
+    bot = RecordingBot()
+    model_response = StructuredAIResponse(
+        text='Нужна бережная поддержка.<DATA>{"events":["clinical_detected"]}</DATA>',
+        raw_payload={},
+        http_status=None,
+        finish_reason="stop",
+    )
+
+    async def fake_prepare_clients(session):
+        return ai_config, None, object(), "clinical-model", None
+
+    with patch("ai_integration._prepare_clients", new=AsyncMock(side_effect=fake_prepare_clients)), \
+         patch("ai_integration._generate_chat_response", new=AsyncMock(return_value=model_response)):
+        answer = await get_ai_response_for_topic(
+            user_id,
+            "Обычный вопрос без кризисного содержания",
+            "Пользователь",
+            topic_slug=topic_slug,
+            dialogue_id=18,
+            bot=bot,
+            chat_id=user_id,
+        )
+
+    assert answer == "Нужна бережная поддержка."
+    assert "<DATA>" not in answer
+    await wait_for_pending_automation_events()
+
+    async with async_session_maker() as session:
+        user = await session.get(User, user_id)
+        assert user.crisis_detected_at is None
+        assert await automatic_send_allowed(session, user_id, "clinical-topic") is True
+
+    await handlers.send_ai_response(user_id, answer, bot, None)
+    clinical_alerts = [item for item in bot.sent if item[0] == clinical_recipient_id]
+    crisis_alerts = [item for item in bot.sent if item[0] == crisis_recipient_id]
+    user_messages = [item for item in bot.sent if item[0] == user_id]
+    assert len(clinical_alerts) == 1
+    assert crisis_alerts == []
+    assert len(user_messages) == 1
+    assert user_messages[0][2].get("reply_markup") is None
+
+
+@pytest.mark.asyncio
+async def test_standalone_data_is_stripped_and_crisis_event_is_processed():
+    await init_db()
+    user_id = 98130009
+    recipient_id = 98130110
+    await _ensure_user(user_id, crisis_detected_at=None, username="standalone_crisis_user")
+
+    async with async_session_maker() as session:
+        handler = AutomationHandler(
+            name="Standalone crisis alert",
+            scope="global",
+            event_name="crisis_detected",
+            action_type="send_admin_message",
+            action_payload_json=json.dumps({"text": "standalone crisis {user_id}"}),
+            recipient_ids_json=json.dumps([recipient_id]),
+            is_active=1,
+        )
+        session.add(handler)
+        await session.commit()
+        ai_config = await session.get(AIConfig, 1)
+
+    bot = RecordingBot()
+    model_response = StructuredAIResponse(
+        text='Интерпретация.<DATA>{"events":["crisis_detected"]}</DATA>',
+        raw_payload={},
+        http_status=None,
+        finish_reason="stop",
+    )
+
+    async def fake_prepare_clients(session):
+        return ai_config, None, object(), "standalone-model", None
+
+    with patch("ai_integration._prepare_clients", new=AsyncMock(side_effect=fake_prepare_clients)), \
+         patch("ai_integration._generate_chat_response", new=AsyncMock(return_value=model_response)):
+        answer = await get_standalone_ai_response(
+            "Ты бережный помощник.",
+            "Интерпретируй результаты.",
+            bot=bot,
+            chat_id=user_id,
+            user_id=user_id,
+        )
+
+    assert answer == "Интерпретация."
+    assert "<DATA>" not in answer
+    await wait_for_pending_automation_events()
+
+    async with async_session_maker() as session:
+        user = await session.get(User, user_id)
+        assert user.crisis_detected_at is not None
+    assert len([item for item in bot.sent if item[0] == recipient_id]) == 1
 
 
 @pytest.mark.asyncio
