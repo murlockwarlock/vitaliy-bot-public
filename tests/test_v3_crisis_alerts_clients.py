@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
+import pytest_asyncio
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.base import StorageKey
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -30,6 +31,15 @@ from crisis_safety import automatic_send_allowed, crisis_contacts_keyboard
 from followups import FollowupStep, send_followup_step_to_user
 from mailing_service import send_mailing_to_recipient
 from time_utils import msk_now
+
+
+_TEST_SAFETY_HANDLER_NAMES = (
+    "V3 crisis alert",
+    "Ordinary topic crisis alert",
+    "Clinical-only alert",
+    "Unrelated crisis alert",
+    "Standalone crisis alert",
+)
 
 
 class RecordingBot:
@@ -77,6 +87,25 @@ async def _ensure_user(user_id: int, **values) -> None:
         for key, value in values.items():
             setattr(user, key, value)
         await session.commit()
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def deactivate_test_safety_handlers():
+    async def deactivate() -> None:
+        async with async_session_maker() as session:
+            handlers = (
+                await session.execute(
+                    select(AutomationHandler).where(
+                        AutomationHandler.name.in_(_TEST_SAFETY_HANDLER_NAMES)
+                    )
+                )
+            ).scalars().all()
+            for handler in handlers:
+                handler.is_active = 0
+            await session.commit()
+
+    yield
+    await deactivate()
 
 
 @pytest.mark.asyncio
