@@ -1180,8 +1180,9 @@ class AiDialoguePlatformV6Tests(unittest.IsolatedAsyncioTestCase):
     # =========================================================================
 
     async def test_pre_dialogue_lifecycle_gate_order_and_reentry(self):
-        """P0-2: Gate order: pre-test -> welcome/Start button -> prerecorded -> chatting.
+        """Gate order: welcome/Start button -> pre-test -> AI breakdown (+ prerecorded) -> chatting.
 
+        Welcome is shown FIRST before pre-test and NEVER repeated after test completion.
         Pre-test does not rerun upon completed claim. Abandoned/failed test does not brick topic.
         """
         user_id = 20101
@@ -1198,6 +1199,7 @@ class AiDialoguePlatformV6Tests(unittest.IsolatedAsyncioTestCase):
                 topic_slug=slug,
                 welcome_text="Добро пожаловать в гейт-тест",
                 welcome_media_id=str(welcome_media.id),
+                reset_dialogue_on_entry=False,
                 start_dialogue_button_enabled=True,
                 start_dialogue_button_text="Старт диалога",
                 pre_dialogue_test_enabled=True,
@@ -1221,18 +1223,38 @@ class AiDialoguePlatformV6Tests(unittest.IsolatedAsyncioTestCase):
                 await sess.commit()
             return True
 
-        # 1. First entry: pre-test is required and not completed -> pre-test appears FIRST
-        with patch("handlers.start_universal_test", side_effect=fake_start_universal_test) as mock_test:
+        # 1. First entry: welcome media + text + Start button appear FIRST; pre-test has NOT started yet
+        with patch("handlers.start_universal_test", side_effect=fake_start_universal_test) as mock_test_entry:
             await handlers.activate_ai_mode(event, slug, state, self.bot)
-            mock_test.assert_called_once()
-            _, kwargs = mock_test.call_args
+            mock_test_entry.assert_not_called()
+
+        async with async_session_maker() as session:
+            did = await get_active_topic_dialogue_id(session, user_id, slug)
+
+        self.assertEqual(len(self.bot.sent_photos), 1)
+        self.assertEqual(self.bot.sent_photos[0].caption, "Добро пожаловать в гейт-тест")
+        self.assertEqual(
+            self.bot.sent_photos[0].reply_markup.inline_keyboard[0][0].callback_data,
+            f"ai_start_dialogue:{slug}:{did}",
+        )
+
+        # 2. Click Start button: pre-test starts NOW
+        cb_start = SimpleNamespace(
+            from_user=SimpleNamespace(id=user_id, first_name="GateUser"),
+            message=SimpleNamespace(chat=SimpleNamespace(id=user_id), delete=AsyncMock()),
+            data=f"ai_start_dialogue:{slug}:{did}",
+            answer=AsyncMock(),
+        )
+        with patch("handlers.start_universal_test", side_effect=fake_start_universal_test) as mock_test_start:
+            await handlers.activate_ai_mode(cb_start, slug, state, self.bot, from_start_button=True, dialogue_id=did)
+            mock_test_start.assert_called_once()
+            _, kwargs = mock_test_start.call_args
             self.assertEqual(kwargs.get("purpose"), "pre_dialogue")
             self.assertEqual(kwargs.get("test_set_id"), 1)
 
-        # 2. Simulate pre-test completion via _finish_test
+        # 3. Simulate pre-test completion via _finish_test
         import test_system_handlers
         async with async_session_maker() as session:
-            did = await get_active_topic_dialogue_id(session, user_id, slug)
             claim = await get_pre_test_claim(session, user_id, slug, did)
             self.assertIsNotNone(claim)
             attempt = TestAttempt(
@@ -1270,36 +1292,25 @@ class AiDialoguePlatformV6Tests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(claim.status, "completed")
             self.assertEqual(claim.attempt_id, attempt_id)
 
-        # After completion: the configured topic welcome is shown with the
-        # Start Dialogue button, without a technical invitation.
-        start_btns = [m for m in self.bot.sent_messages if m.text and "Добро пожаловать в гейт-тест" in m.text]
-        self.assertTrue(len(start_btns) >= 1)
-        self.assertFalse(any(m.text and "Тестирование пройдено" in m.text for m in self.bot.sent_messages))
+        # Welcome photo/text is NOT repeated after completion; AI result + prerecorded enter working dialogue directly
         self.assertEqual(len(self.bot.sent_photos), 1)
-        self.assertEqual(self.bot.sent_photos[0].caption, "Добро пожаловать в гейт-тест")
-        self.assertEqual(
-            start_btns[-1].reply_markup.inline_keyboard[0][0].callback_data,
-            f"ai_start_dialogue:{slug}:{did}",
-        )
-
-        # 3. Click Start button: activate_ai_mode(from_start_button=True)
-        cb_start = SimpleNamespace(
-            from_user=SimpleNamespace(id=user_id, first_name="GateUser"),
-            message=SimpleNamespace(chat=SimpleNamespace(id=user_id), delete=AsyncMock()),
-            data=f"ai_start_dialogue:{slug}:{did}",
-            answer=AsyncMock(),
-        )
-        with patch("handlers.start_universal_test", new=AsyncMock()) as mock_test_rerun:
-            await handlers.activate_ai_mode(cb_start, slug, state, self.bot, from_start_button=True)
-            # Pre-test does NOT rerun
-            mock_test_rerun.assert_not_called()
-
-        # Prerecorded message delivered and state is chatting
+        start_btns = [m for m in self.bot.sent_messages if m.text and "Добро пожаловать в гейт-тест" in m.text]
+        self.assertEqual(len(start_btns), 1)
         prerec = [m for m in self.bot.sent_messages if m.text and "Записанное сообщение ассистента" in m.text]
-        self.assertTrue(len(prerec) >= 1)
+        self.assertEqual(len(prerec), 1)
+        self.assertEqual(
+            prerec[0].reply_markup.inline_keyboard[0][0].callback_data,
+            f"ai_finish_dialogue:{slug}:{did}",
+        )
+        finish_state.set_state.assert_called_with("UserStates:chatting")
+
+        # 4. Subsequent click after completed claim does NOT rerun pre-test
+        with patch("handlers.start_universal_test", new=AsyncMock()) as mock_test_rerun:
+            await handlers.activate_ai_mode(cb_start, slug, state, self.bot, from_start_button=True, dialogue_id=did)
+            mock_test_rerun.assert_not_called()
         state.set_state.assert_called_with(handlers.UserStates.chatting)
 
-        # 4. Recoverable: failed/abandoned pre-test does not permanently brick topic
+        # 5. Recoverable: failed/abandoned pre-test does not permanently brick topic
         async with async_session_maker() as session:
             c = await get_pre_test_claim(session, user_id, slug, did)
             c.status = "failed"

@@ -291,6 +291,9 @@ async def deliver_prerecorded_first_message(
     topic_slug: str,
     dialogue_id: int,
     text: str,
+    *,
+    reply_markup=None,
+    sent_messages: list | None = None,
 ) -> bool:
     """Guard 2: Concurrency-safe DB-level exactly-once delivery of prerecorded first message with atomic CAS retry and stale recovery."""
     now = msk_now()
@@ -343,7 +346,12 @@ async def deliver_prerecorded_first_message(
 
     # 2. Try external send
     try:
-        await bot.send_message(user_id, text)
+        if reply_markup is not None:
+            sent = await bot.send_message(user_id, text, reply_markup=reply_markup)
+        else:
+            sent = await bot.send_message(user_id, text)
+        if sent_messages is not None and sent is not None:
+            sent_messages.append(sent)
     except Exception as exc:
         logger.warning("Failed to send prerecorded message via bot: %s", exc)
         # Update delivery status to failed so it can be retried and doesn't permanently suppress

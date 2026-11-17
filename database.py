@@ -2472,10 +2472,33 @@ async def run_data_migrations(session: AsyncSession):
                 summary_prompt=None,
             ))
         elif is_diagnostics:
-            existing_cfg.test_set_id = diag_set.id
-            if not diag_ready:
-                existing_cfg.pre_dialogue_test_enabled = False
-            existing_cfg.summary_generation_enabled = False
+            if not existing_cfg.test_set_id:
+                existing_cfg.test_set_id = diag_set.id
+                existing_cfg.pre_dialogue_test_enabled = diag_ready
+            else:
+                configured_set = await session.get(TestSet, existing_cfg.test_set_id)
+                configured_ready = scenario_ready(configured_set, "diagnostics")
+                if not configured_ready:
+                    existing_cfg.pre_dialogue_test_enabled = False
+                else:
+                    restore_marker_key = "__migration_diag_testset3_pretest_restore_v1"
+                    restore_marker = await session.get(Content, restore_marker_key)
+                    if (
+                        restore_marker is None
+                        and existing_cfg.test_set_id == 3
+                        and not existing_cfg.pre_dialogue_test_enabled
+                        and bool(existing_cfg.start_dialogue_button_enabled)
+                        and (existing_cfg.start_dialogue_button_text or "").strip() == "Пройти тест"
+                        and configured_set is not None
+                        and (configured_set.slug or "").strip() == "express_blocks"
+                    ):
+                        existing_cfg.pre_dialogue_test_enabled = True
+                        session.add(
+                            Content(
+                                key=restore_marker_key,
+                                text_content="restored_diagnostics_testset_3",
+                            )
+                        )
         elif is_express:
             if not existing_cfg.test_set_id:
                 existing_cfg.test_set_id = profile_set.id

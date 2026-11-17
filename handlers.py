@@ -498,6 +498,7 @@ class AdminStates(StatesGroup):
     edit_content = State()
     edit_url = State()
     edit_topic_prompt = State()
+    edit_topic_name = State()
     set_referral_points = State()
     edit_ref_reg_points = State()
     edit_ref_first_percent = State()
@@ -2242,7 +2243,63 @@ async def touch_user_activity(user_id: int):
         await session.commit()
 
 
-async def activate_ai_mode(event, slug: str, state: FSMContext, bot: Bot, *, from_start_button: bool = False, dialogue_id: int | None = None):
+_ai_start_locks: dict[tuple[int, str], asyncio.Lock] = {}
+
+
+async def _clear_event_message_reply_markup(event) -> None:
+    msg = getattr(event, "message", None)
+    edit_rm = getattr(msg, "edit_reply_markup", None) if msg is not None else None
+    if callable(edit_rm):
+        try:
+            await edit_rm(reply_markup=None)
+        except Exception:
+            pass
+
+
+async def activate_ai_mode(
+    event,
+    slug: str,
+    state: FSMContext,
+    bot: Bot,
+    *,
+    from_start_button: bool = False,
+    from_new_dialogue: bool = False,
+    dialogue_id: int | None = None,
+):
+    user_id = event.from_user.id
+    lock = _ai_start_locks.setdefault((user_id, slug), asyncio.Lock()) if from_start_button else None
+    if lock is not None:
+        async with lock:
+            return await _activate_ai_mode_inner(
+                event,
+                slug,
+                state,
+                bot,
+                from_start_button=from_start_button,
+                from_new_dialogue=from_new_dialogue,
+                dialogue_id=dialogue_id,
+            )
+    return await _activate_ai_mode_inner(
+        event,
+        slug,
+        state,
+        bot,
+        from_start_button=from_start_button,
+        from_new_dialogue=from_new_dialogue,
+        dialogue_id=dialogue_id,
+    )
+
+
+async def _activate_ai_mode_inner(
+    event,
+    slug: str,
+    state: FSMContext,
+    bot: Bot,
+    *,
+    from_start_button: bool = False,
+    from_new_dialogue: bool = False,
+    dialogue_id: int | None = None,
+):
     user_id = event.from_user.id
     chat_id = (
         event.message.chat.id
@@ -2251,7 +2308,7 @@ async def activate_ai_mode(event, slug: str, state: FSMContext, bot: Bot, *, fro
     )
 
     if not await check_paid_access(event, bot, topic_slug=slug):
-        return
+        return "callback_answered"
 
     # 1. Guard 1: AI Disclaimer gate
     async with async_session_maker() as session:
@@ -2269,9 +2326,26 @@ async def activate_ai_mode(event, slug: str, state: FSMContext, bot: Bot, *, fro
             flow_type=flow_type,
             payload={"topic_slug": slug},
         )
-        return
+        return None
 
     await touch_user_activity(user_id)
+
+    prior_state = None
+    prior_data = {}
+    if state is not None and hasattr(state, "get_state"):
+        try:
+            raw_state = await state.get_state()
+            if isinstance(raw_state, str):
+                prior_state = raw_state
+        except Exception:
+            prior_state = None
+    if state is not None and hasattr(state, "get_data"):
+        try:
+            raw_data = await state.get_data()
+            if isinstance(raw_data, dict):
+                prior_data = raw_data
+        except Exception:
+            prior_data = {}
 
     # 2. Topic Dialogue Config & Dialogue ID allocation
     async with async_session_maker() as session:
@@ -2302,17 +2376,46 @@ async def activate_ai_mode(event, slug: str, state: FSMContext, bot: Bot, *, fro
                     await session.rollback()
                     if hasattr(event, "answer"):
                         await event.answer("⚠️ Эта кнопка устарела. Начни диалог заново из меню темы.", show_alert=True)
+                        return "callback_answered"
                     elif hasattr(event, "message") and hasattr(event.message, "answer"):
                         await event.message.answer("⚠️ Эта кнопка устарела. Начни диалог заново из меню темы.")
-                    return
+                    return None
 
         # P0-1: Check if user is currently in a live pre-test for THIS topic:
         current_tsess = await session.get(TestSession, user_id)
+
+        # Idempotent double-click guard on start button
+        if from_start_button and not from_new_dialogue and dialogue_id is not None and prior_state is not None:
+            if (
+                prior_state == UniversalTestStates.answering.state
+                and current_tsess
+                and not current_tsess.is_finished
+                and current_tsess.invocation_topic_slug == slug
+                and current_tsess.invocation_dialogue_id == dialogue_id
+            ):
+                await _clear_event_message_reply_markup(event)
+                if hasattr(event, "answer"):
+                    await event.answer("Тест уже запущен.")
+                    return "callback_answered"
+                return None
+            if (
+                prior_state == UserStates.chatting.state
+                and prior_data.get("current_topic_slug") == slug
+                and prior_data.get("dialogue_id") == dialogue_id
+                and prior_data.get("started_via_button_dialogue_id") == dialogue_id
+            ):
+                await _clear_event_message_reply_markup(event)
+                if hasattr(event, "answer"):
+                    await event.answer("Диалог уже начат.")
+                    return "callback_answered"
+                return None
+
         if (
             current_tsess
             and not current_tsess.is_finished
             and current_tsess.invocation_topic_slug == slug
             and current_tsess.attempt_id
+            and (not from_start_button or dialogue_id is None or current_tsess.invocation_dialogue_id == dialogue_id)
         ):
             active_test_set, active_count, active_ready = await get_test_set_readiness(
                 session,
@@ -2327,13 +2430,15 @@ async def activate_ai_mode(event, slug: str, state: FSMContext, bot: Bot, *, fro
                     active_count=active_count,
                     expected_count=expected_test_set_question_count(active_test_set, slug) if active_test_set else None,
                 )
-                return
+                return None
             active_attempt = await session.get(TestAttempt, current_tsess.attempt_id)
             if active_attempt and active_attempt.purpose == "pre_dialogue" and active_attempt.status == "in_progress":
                 claim = await get_pre_test_claim(
                     session, user_id, slug, current_tsess.invocation_dialogue_id, test_set_id=current_tsess.test_set_id
                 )
                 if claim and claim.status == "in_progress" and (claim.lease_until is None or claim.lease_until > msk_now()):
+                    if from_start_button:
+                        await _clear_event_message_reply_markup(event)
                     # User has a live progressing pre-test session. Restore FSM, resend question and return.
                     await state.set_state(UniversalTestStates.answering)
                     await _send_question(
@@ -2343,7 +2448,7 @@ async def activate_ai_mode(event, slug: str, state: FSMContext, bot: Bot, *, fro
                         current_tsess.test_set_id,
                         state,
                     )
-                    return
+                    return None
 
         if from_start_button:
             # Active dialogue was atomically validated and touched; do not alter or lower it
@@ -2366,9 +2471,12 @@ async def activate_ai_mode(event, slug: str, state: FSMContext, bot: Bot, *, fro
                 user.current_dialogue_id = dialogue_id
         await session.commit()
 
+    if from_start_button:
+        await _clear_event_message_reply_markup(event)
+
     await state.clear()
 
-    # 3. Pre-dialogue Test Gate (Guard 3) - MUST run before Start button
+    # 3. Readiness Validation before Welcome / Pre-test
     if slug in {"diagnostics", "express"} and cfg and cfg.test_set_id:
         async with async_session_maker() as session:
             configured_set, active_count, configured_ready = await get_test_set_readiness(
@@ -2384,34 +2492,16 @@ async def activate_ai_mode(event, slug: str, state: FSMContext, bot: Bot, *, fro
                 active_count=active_count,
                 expected_count=expected_test_set_question_count(configured_set, slug) if configured_set else None,
             )
-            return
+            return None
 
     pre_test_enabled = bool(cfg and cfg.pre_dialogue_test_enabled)
-    if pre_test_enabled:
-        if not cfg.test_set_id:
-            logger.warning("Topic %s has pre_dialogue_test_enabled=True but test_set_id is None", slug)
-            await send_test_setup_unavailable(bot, user_id, state)
-            return
+    if pre_test_enabled and not (cfg and cfg.test_set_id):
+        logger.warning("Topic %s has pre_dialogue_test_enabled=True but test_set_id is None", slug)
+        await send_test_setup_unavailable(bot, user_id, state)
+        return None
 
-        test_set_id = cfg.test_set_id
-        async with async_session_maker() as session:
-            claim = await get_pre_test_claim(session, user_id, slug, dialogue_id, test_set_id=test_set_id)
-            is_completed = bool(claim and claim.status == "completed")
-
-        if not is_completed:
-            await start_universal_test(
-                bot,
-                user_id,
-                state,
-                test_set_id=test_set_id,
-                dialogue_id=dialogue_id,
-                topic_slug=slug,
-                purpose="pre_dialogue",
-            )
-            return
-
-    # 4. Start Dialogue Button Gate (Runs after pre-test is completed or not required)
-    start_btn_enabled = cfg.start_dialogue_button_enabled if cfg else False
+    # 4. Welcome & Start Dialogue Button Gate (Runs FIRST on topic entry)
+    start_btn_enabled = bool(cfg and cfg.start_dialogue_button_enabled)
     if start_btn_enabled and not from_start_button:
         welcome_text = (cfg.welcome_text if cfg and cfg.welcome_text else None) or "Добро пожаловать в сессию."
         btn_text = (cfg.start_dialogue_button_text if cfg and cfg.start_dialogue_button_text else None) or "Начать диалог"
@@ -2422,14 +2512,51 @@ async def activate_ai_mode(event, slug: str, state: FSMContext, bot: Bot, *, fro
                 media_row = await session.get(ContentMedia, media_id)
             if media_row:
                 await send_smart_content(event, welcome_text, [media_row], keyboard, bot)
-                return
+                return None
         await send_smart_content(event, welcome_text, None, keyboard, bot)
-        return
+        return None
 
-    # 5. Prerecorded First Message (Guard 2)
+    # 5. Pre-dialogue Test Gate (Guard 3 - Runs after Start button click or direct entry)
+    if pre_test_enabled:
+        test_set_id = cfg.test_set_id
+        async with async_session_maker() as session:
+            claim = await get_pre_test_claim(session, user_id, slug, dialogue_id, test_set_id=test_set_id)
+            is_completed = bool(claim and claim.status == "completed")
+
+        if not is_completed:
+            if not from_start_button and cfg and cfg.welcome_text:
+                media_rows = []
+                if cfg.welcome_media_id:
+                    async with async_session_maker() as session:
+                        media_row = await session.get(ContentMedia, cfg.welcome_media_id)
+                    if media_row:
+                        media_rows.append(media_row)
+                await send_smart_content(event, cfg.welcome_text, media_rows or None, None, bot)
+            await start_universal_test(
+                bot,
+                user_id,
+                state,
+                test_set_id=test_set_id,
+                dialogue_id=dialogue_id,
+                topic_slug=slug,
+                purpose="pre_dialogue",
+            )
+            return None
+
+    # 6. Prerecorded First Message (Guard 2) & Working Dialogue Entry
+    markup = await kb.ai_response_keyboard_for_topic(slug, dialogue_id)
     prerecorded_text = cfg.prerecorded_first_message if (cfg and cfg.prerecorded_first_message) else None
     delivered_prerecorded = False
+    sent_prerec = []
     if prerecorded_text:
+        if not from_start_button and not start_btn_enabled and cfg and cfg.welcome_text:
+            media_rows = []
+            if cfg.welcome_media_id:
+                async with async_session_maker() as session:
+                    media_row = await session.get(ContentMedia, cfg.welcome_media_id)
+                if media_row:
+                    media_rows.append(media_row)
+            await send_smart_content(event, cfg.welcome_text, media_rows or None, None, bot)
         async with async_session_maker() as session:
             delivered_prerecorded = await deliver_prerecorded_first_message(
                 bot,
@@ -2438,23 +2565,42 @@ async def activate_ai_mode(event, slug: str, state: FSMContext, bot: Bot, *, fro
                 slug,
                 dialogue_id,
                 prerecorded_text,
+                reply_markup=markup,
+                sent_messages=sent_prerec,
             )
 
-    # 6. Enter Chatting State
+    # 7. Enter Chatting State (no silent branches)
     await state.set_state(UserStates.chatting)
-    await state.update_data(current_topic_slug=slug, dialogue_id=dialogue_id)
+    state_payload = {"current_topic_slug": slug, "dialogue_id": dialogue_id}
+    if from_start_button and not from_new_dialogue:
+        state_payload["started_via_button_dialogue_id"] = dialogue_id
 
-    if not delivered_prerecorded and not (start_btn_enabled and from_start_button):
-        welcome_prompt = (cfg.welcome_text if cfg and cfg.welcome_text else None) or "Добро пожаловать в сессию. Напиши, что хочешь обсудить."
-        markup = await kb.ai_response_keyboard_for_topic(slug, dialogue_id)
-        media_rows = []
-        if cfg and cfg.welcome_media_id:
-            async with async_session_maker() as session:
-                media_row = await session.get(ContentMedia, cfg.welcome_media_id)
-            if media_row:
-                media_rows.append(media_row)
-        sent_message = await send_smart_content(event, welcome_prompt, media_rows or None, markup, bot)
-        await _remember_ai_response_message(state, sent_message)
+    sent_message = sent_prerec[-1] if sent_prerec else None
+    if not delivered_prerecorded:
+        if from_new_dialogue:
+            prompt_text = "Начинаем новый разговор. Напиши, с чем сегодня хочешь поработать."
+            sent_message = await bot.send_message(chat_id, prompt_text, reply_markup=markup)
+        elif from_start_button:
+            prompt_text = (
+                "Продолжаем разговор. Напиши свой вопрос или мысль."
+                if prerecorded_text
+                else "Я на связи. Напиши, с чем сегодня хочешь поработать или какой вопрос разобрать."
+            )
+            sent_message = await bot.send_message(chat_id, prompt_text, reply_markup=markup)
+        else:
+            welcome_prompt = (cfg.welcome_text if cfg and cfg.welcome_text else None) or "Добро пожаловать в сессию. Напиши, что хочешь обсудить."
+            media_rows = []
+            if cfg and cfg.welcome_media_id:
+                async with async_session_maker() as session:
+                    media_row = await session.get(ContentMedia, cfg.welcome_media_id)
+                if media_row:
+                    media_rows.append(media_row)
+            sent_message = await send_smart_content(event, welcome_prompt, media_rows or None, markup, bot)
+
+    if isinstance(getattr(sent_message, "message_id", None), int):
+        state_payload["ai_last_response_message_id"] = sent_message.message_id
+    await state.update_data(**state_payload)
+    return None
 
 
 @router.callback_query(F.data == "cb_accept_disclaimer")
@@ -2555,11 +2701,12 @@ async def cb_ai_start_dialogue(callback: CallbackQuery, state: FSMContext, bot: 
     parts = callback.data.split(":")
     topic_slug = parts[1] if len(parts) > 1 else "free_session"
     btn_dialogue_id = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else None
-    await activate_ai_mode(callback, topic_slug, state, bot, from_start_button=True, dialogue_id=btn_dialogue_id)
-    try:
-        await callback.answer()
-    except Exception:
-        pass
+    res = await activate_ai_mode(callback, topic_slug, state, bot, from_start_button=True, dialogue_id=btn_dialogue_id)
+    if res != "callback_answered":
+        try:
+            await callback.answer()
+        except Exception:
+            pass
 
 
 @router.callback_query(F.data.startswith("ai_finish_dialogue:"))
@@ -2768,6 +2915,8 @@ async def cb_ai_resume_current(callback: CallbackQuery, state: FSMContext, bot: 
 async def cb_ai_new_dialogue(callback: CallbackQuery, state: FSMContext, bot: Bot):
     parts = callback.data.split(":")
     topic_slug = parts[1] if len(parts) > 1 else "free_session"
+    if not await check_paid_access(callback, bot, topic_slug=topic_slug):
+        return
     user_id = callback.from_user.id
     async with async_session_maker() as session:
         new_dialogue_id = await allocate_next_dialogue_id(session, user_id, topic_slug)
@@ -2786,6 +2935,7 @@ async def cb_ai_new_dialogue(callback: CallbackQuery, state: FSMContext, bot: Bo
         state,
         bot,
         from_start_button=True,
+        from_new_dialogue=True,
         dialogue_id=new_dialogue_id,
     )
 
@@ -5786,10 +5936,92 @@ def topic_admin_button_text(topic, section: str) -> str:
     return f"📝 {topic.name} {paid_icon}"
 
 
+_MAIN_MENU_TOPIC_ACTIONS = {
+    "mode_free_session": "free_session",
+    "mode_diagnostics": "diagnostics",
+    "mode_express": "express",
+    "menu_strategy_session": "strategy_session",
+    "mode_journal": "journal",
+    "mode_habits": "habits",
+}
+
+
+async def _resolve_menu_labels_by_topic_slug(session) -> dict[str, str]:
+    rows = (await session.scalars(
+        select(MenuButton)
+        .where(MenuButton.section_key.in_(("main", "thematic")))
+        .order_by(MenuButton.enabled.desc(), MenuButton.order_num.asc(), MenuButton.id.asc())
+    )).all()
+    labels: dict[str, str] = {}
+    for btn in rows:
+        label = btn.label or ""
+        if btn.content_key and not btn.label_override:
+            content_row = await session.get(Content, btn.content_key)
+            if content_row and content_row.button_text:
+                label = content_row.button_text
+        clean_label = " ".join(label.splitlines()).strip()
+        if not clean_label:
+            continue
+        if btn.section_key == "main":
+            action = btn.action_value or btn.legacy_callback or ""
+            mapped_slug = _MAIN_MENU_TOPIC_ACTIONS.get(action)
+            if mapped_slug:
+                labels.setdefault(mapped_slug, clean_label)
+        elif btn.section_key == "thematic" and btn.action_type == "callback":
+            stable_cb = btn.legacy_callback or btn.action_value or ""
+            if stable_cb.startswith("thematic_"):
+                resolved_slug = (btn.topic_slug or stable_cb.removeprefix("thematic_")).strip()
+                if resolved_slug:
+                    labels.setdefault(resolved_slug, clean_label)
+    return labels
+
+
+def _build_edit_topic_view(topic: Topic | None, slug: str, menu_label: str | None) -> tuple[str, InlineKeyboardMarkup]:
+    topic_name = topic.name if topic else slug
+    current_prompt = topic.system_prompt if topic and topic.system_prompt else "Стандартный (не задан)"
+    is_paid = topic.is_paid if topic else True
+
+    preview = current_prompt[:200] + "..." if len(current_prompt) > 200 else current_prompt
+    paid_status = "💰 Платная" if is_paid else "🆓 Бесплатная"
+    menu_line = f"🧭 <b>Кнопка в меню:</b> {html.escape(menu_label)}\n" if menu_label else ""
+
+    text = (
+        f"⚙️ <b>Настройки темы: {html.escape(topic_name)}</b>\n"
+        f"🆔 <b>ID темы:</b> <code>{html.escape(slug)}</code>\n"
+        f"{menu_line}"
+        f"💳 <b>Доступ:</b> {paid_status}\n\n"
+        f"📝 <b>Текущий системный промпт (начало):</b>\n"
+        f"<i>{html.escape(preview)}</i>\n\n"
+        f"👇 <b>Что можно сделать:</b>\n"
+        f"1. <b>Переименовать тему</b> — изменить название в админке или подогнать под кнопку меню.\n"
+        f"2. <b>Изменить промпт</b> — задать новую инструкцию для AI в этом режиме.\n"
+        f"3. <b>Прикрепить файл</b> — выбрать документы из Базы Знаний, которые AI будет использовать для ответов в этой теме.\n"
+        f"4. <b>Скачать</b> — получить текущий промпт файлом.\n"
+        f"5. <b>Переключить платный/бесплатный</b> — сделать тему доступной всем или только по подписке."
+    )
+
+    toggle_text = "🆓 Сделать бесплатной" if is_paid else "💰 Сделать платной"
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✏️ Переименовать тему", callback_data=f"rename_topic_{slug}")
+    if menu_label and menu_label != topic_name:
+        builder.button(text="🔄 Синхронизировать с меню", callback_data=f"confirm_sync_topic_menu_name_{slug}")
+    builder.button(text="✏️ Изменить промпт", callback_data=f"set_prompt_{slug}")
+    builder.button(text="📥 Скачать текущий промпт (.txt)", callback_data=f"download_prompt_{slug}")
+    builder.button(text="📎 База знаний (привязка)", callback_data=f"attach_kb_{slug}")
+    builder.button(text=toggle_text, callback_data=f"toggle_topic_paid_{slug}")
+    builder.button(text="⚙️ Параметры диалога", callback_data=f"admin_topic_dialogue_cfg_{slug}")
+    builder.button(text="⬅️ Назад", callback_data="admin_topics_list")
+    builder.adjust(1)
+    return text, builder.as_markup()
+
+
 @router.callback_query(F.data == "admin_topics_list")
 @router.callback_query(F.data.startswith("admin_topics_list_"))
 @router.callback_query(F.data.startswith("admin_topics_page_"))
 async def admin_topics_list(event, state: FSMContext | None = None):
+    if hasattr(event, "from_user") and event.from_user:
+        if not await require_permission(event, AdminPermission.CONTENT, state=state):
+            return
     await _clear_admin_navigation_state(state)
     raw_page = str(getattr(event, "data", "") or "")
     try:
@@ -5805,6 +6037,7 @@ async def admin_topics_list(event, state: FSMContext | None = None):
             select(Topic).order_by(Topic.id.asc())
         )
         topics = topics.scalars().all()
+        menu_labels = await _resolve_menu_labels_by_topic_slug(session)
 
     grouped = group_topics_for_admin(topics)
     ordered_topics = [
@@ -5828,11 +6061,19 @@ async def admin_topics_list(event, state: FSMContext | None = None):
             label = dict(TOPIC_ADMIN_SECTION_ORDER).get(section, section)
             text_lines.extend(["", f"<b>{html.escape(label)}</b>"])
             current_section = section
-        text_lines.append(f"• {html.escape(topic.name)}")
+        menu_lbl = menu_labels.get(topic.slug)
+        if menu_lbl and menu_lbl != topic.name:
+            text_lines.append(f"• {html.escape(topic.name)} <i>(в меню: {html.escape(menu_lbl)})</i>")
+        else:
+            text_lines.append(f"• {html.escape(topic.name)}")
         builder.row(InlineKeyboardButton(
             text=topic_admin_button_text(topic, section),
             callback_data=f"edit_topic_{topic.slug}",
         ))
+    builder.row(InlineKeyboardButton(
+        text="🔄 Синхронизировать названия с меню",
+        callback_data="confirm_sync_topics_menu_names",
+    ))
     builder.row(*kb.standard_pagination_row(
         page,
         total_pages,
@@ -5841,50 +6082,226 @@ async def admin_topics_list(event, state: FSMContext | None = None):
     builder.row(InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_section_ai"))
 
     await send_smart_content(event, "\n".join(text_lines), None, builder.as_markup())
+    if isinstance(event, CallbackQuery):
+        await event.answer()
 
 
 @router.callback_query(F.data.startswith("edit_topic_"))
 async def edit_topic_menu(callback: CallbackQuery, state: FSMContext | None = None):
+    if not await require_permission(callback, AdminPermission.CONTENT, state=state):
+        return
     await _clear_admin_navigation_state(state)
-    slug = callback.data.split("edit_topic_")[1]
+    slug = callback.data.removeprefix("edit_topic_")
 
     async with async_session_maker() as session:
         topic = await session.scalar(select(Topic).where(Topic.slug == slug))
-        topic_name = topic.name if topic else slug
-        current_prompt = topic.system_prompt if topic and topic.system_prompt else "Стандартный (не задан)"
-        is_paid = topic.is_paid if topic else True
+        menu_labels = await _resolve_menu_labels_by_topic_slug(session)
 
-    preview = current_prompt[:200] + "..." if len(current_prompt) > 200 else current_prompt
-    paid_status = "💰 Платная" if is_paid else "🆓 Бесплатная"
+    if not topic:
+        await callback.answer("Тема не найдена.", show_alert=True)
+        return
 
-    text = (
-        f"⚙️ <b>Настройки темы: {topic_name}</b>\n\n"
-        f"💳 <b>Доступ:</b> {paid_status}\n\n"
-        f"📝 <b>Текущий системный промпт (начало):</b>\n"
-        f"<i>{html.escape(preview)}</i>\n\n"
-        f"👇 <b>Что можно сделать:</b>\n"
-        f"1. <b>Изменить промпт</b> — задать новую инструкцию для AI в этом режиме.\n"
-        f"2. <b>Прикрепить файл</b> — выбрать документы из Базы Знаний, которые AI будет использовать для ответов в этой теме.\n"
-        f"3. <b>Скачать</b> — получить текущий промпт файлом.\n"
-        f"4. <b>Переключить платный/бесплатный</b> — сделать тему доступной всем или только по подписке."
-    )
+    text, markup = _build_edit_topic_view(topic, slug, menu_labels.get(slug))
+    await send_smart_content(callback, text, None, markup)
+    await callback.answer()
 
-    toggle_text = "🆓 Сделать бесплатной" if is_paid else "💰 Сделать платной"
+
+@router.callback_query(F.data.startswith("rename_topic_"))
+async def rename_topic_start(callback: CallbackQuery, state: FSMContext):
+    if not await require_permission(callback, AdminPermission.CONTENT, state=state):
+        return
+    slug = callback.data.removeprefix("rename_topic_")
+    async with async_session_maker() as session:
+        topic = await session.scalar(select(Topic).where(Topic.slug == slug))
+        menu_labels = await _resolve_menu_labels_by_topic_slug(session)
+    if not topic:
+        await callback.answer("Тема не найдена.", show_alert=True)
+        return
+
+    await state.set_state(AdminStates.edit_topic_name)
+    await state.update_data(slug=slug)
+
     builder = InlineKeyboardBuilder()
-    builder.button(text="✏️ Изменить промпт", callback_data=f"set_prompt_{slug}")
-    builder.button(text="📥 Скачать текущий промпт (.txt)", callback_data=f"download_prompt_{slug}")
-    builder.button(text="📎 База знаний (привязка)", callback_data=f"attach_kb_{slug}")
-    builder.button(text=toggle_text, callback_data=f"toggle_topic_paid_{slug}")
-    builder.button(text="⚙️ Параметры диалога", callback_data=f"admin_topic_dialogue_cfg_{slug}")
-    builder.button(text="⬅️ Назад", callback_data="admin_topics_list")
+    builder.button(text="⬅️ Назад", callback_data=f"edit_topic_{slug}")
     builder.adjust(1)
 
+    menu_hint = ""
+    if menu_labels.get(slug):
+        menu_hint = f"\nКнопка в меню: <b>{html.escape(menu_labels[slug])}</b>"
+
+    prompt_text = (
+        f"✏️ <b>Переименование темы</b>\n\n"
+        f"🆔 ID темы: <code>{html.escape(slug)}</code>\n"
+        f"Текущее название: <b>{html.escape(topic.name)}</b>{menu_hint}\n\n"
+        f"Отправьте новое название темы (до 120 символов):"
+    )
+    await send_smart_content(callback, prompt_text, None, builder.as_markup())
+    await callback.answer()
+
+
+@router.message(AdminStates.edit_topic_name, F.text, ~F.text.startswith('/'))
+async def save_topic_name(message: Message, state: FSMContext):
+    if not await require_permission(message, AdminPermission.CONTENT, state=state):
+        return
+    data = await state.get_data()
+    slug = data.get("slug")
+    if not slug:
+        await state.clear()
+        return
+
+    new_name = " ".join((message.text or "").splitlines()).strip()
+    cancel_builder = InlineKeyboardBuilder()
+    cancel_builder.button(text="⬅️ Назад", callback_data=f"edit_topic_{slug}")
+    cancel_builder.adjust(1)
+
+    if not new_name:
+        await message.answer("Название не может быть пустым. Отправьте новое название:", reply_markup=cancel_builder.as_markup())
+        return
+    if len(new_name) > 120:
+        await message.answer("Название слишком длинное (максимум 120 символов). Отправьте более короткий вариант:", reply_markup=cancel_builder.as_markup())
+        return
+
+    async with async_session_maker() as session:
+        topic = await session.scalar(select(Topic).where(Topic.slug == slug))
+        if not topic:
+            await state.clear()
+            await message.answer("Тема не найдена.")
+            return
+        topic.name = new_name
+        await session.commit()
+        menu_labels = await _resolve_menu_labels_by_topic_slug(session)
+        text, markup = _build_edit_topic_view(topic, slug, menu_labels.get(slug))
+
+    await state.clear()
+    await message.answer("✅ Название темы обновлено!\n\n" + text, reply_markup=markup, parse_mode="HTML")
+
+
+@router.callback_query(F.data.startswith("confirm_sync_topic_menu_name_"))
+async def confirm_sync_single_topic_menu_name(callback: CallbackQuery, state: FSMContext | None = None):
+    if not await require_permission(callback, AdminPermission.CONTENT, state=state):
+        return
+    await _clear_admin_navigation_state(state)
+    slug = callback.data.removeprefix("confirm_sync_topic_menu_name_")
+    async with async_session_maker() as session:
+        topic = await session.scalar(select(Topic).where(Topic.slug == slug))
+        menu_labels = await _resolve_menu_labels_by_topic_slug(session)
+    if not topic:
+        await callback.answer("Тема не найдена.", show_alert=True)
+        return
+    target_label = menu_labels.get(slug)
+    if not target_label:
+        await callback.answer("Для этой темы нет связанной кнопки меню.", show_alert=True)
+        return
+    if topic.name == target_label:
+        await callback.answer("Название уже совпадает с кнопкой меню.", show_alert=True)
+        return
+
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ Подтвердить", callback_data=f"confirmed_sync_topic_menu_name_{slug}")
+    builder.button(text="⬅️ Отмена", callback_data=f"edit_topic_{slug}")
+    builder.adjust(1)
+
+    text = (
+        f"🔄 <b>Синхронизация названия темы с меню</b>\n\n"
+        f"🆔 ID темы: <code>{html.escape(slug)}</code>\n"
+        f"Было: {html.escape(topic.name)}\n"
+        f"Станет: <b>{html.escape(target_label)}</b>\n\n"
+        f"<i>ID темы, привязки, callback и пользовательские данные не меняются.</i>"
+    )
     await send_smart_content(callback, text, None, builder.as_markup())
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("confirmed_sync_topic_menu_name_"))
+async def confirmed_sync_single_topic_menu_name(callback: CallbackQuery, state: FSMContext | None = None):
+    if not await require_permission(callback, AdminPermission.CONTENT, state=state):
+        return
+    await _clear_admin_navigation_state(state)
+    slug = callback.data.removeprefix("confirmed_sync_topic_menu_name_")
+    async with async_session_maker() as session:
+        topic = await session.scalar(select(Topic).where(Topic.slug == slug))
+        menu_labels = await _resolve_menu_labels_by_topic_slug(session)
+        if not topic:
+            await callback.answer("Тема не найдена.", show_alert=True)
+            return
+        target_label = menu_labels.get(slug)
+        if not target_label:
+            await callback.answer("Для этой темы нет связанной кнопки меню.", show_alert=True)
+            return
+        topic.name = target_label[:120]
+        await session.commit()
+        text, markup = _build_edit_topic_view(topic, slug, target_label)
+
+    await send_smart_content(callback, text, None, markup)
+    await callback.answer("✅ Название синхронизировано с меню")
+
+
+@router.callback_query(F.data == "confirm_sync_topics_menu_names")
+async def confirm_sync_topics_menu_names(callback: CallbackQuery, state: FSMContext | None = None):
+    if not await require_permission(callback, AdminPermission.CONTENT, state=state):
+        return
+    await _clear_admin_navigation_state(state)
+    async with async_session_maker() as session:
+        topics = (await session.scalars(select(Topic).order_by(Topic.id.asc()))).all()
+        menu_labels = await _resolve_menu_labels_by_topic_slug(session)
+
+    diffs = [
+        (t.slug, t.name, menu_labels[t.slug][:120])
+        for t in topics
+        if t.slug in menu_labels and menu_labels[t.slug][:120] != t.name
+    ]
+    if not diffs:
+        await callback.answer("Все названия тем уже совпадают с меню.", show_alert=True)
+        return
+
+    lines = [
+        "🔄 <b>Синхронизация названий тем с меню</b>",
+        "",
+        "Будут обновлены следующие названия:",
+        "",
+    ]
+    for slug, old_name, new_name in diffs:
+        lines.append(f"• <code>{html.escape(slug)}</code>: {html.escape(old_name)} → <b>{html.escape(new_name)}</b>")
+    lines.extend([
+        "",
+        "<i>Сами ID тем (slug), привязки, callback и пользовательские данные не изменятся.</i>",
+    ])
+
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ Подтвердить синхронизацию", callback_data="confirmed_sync_topics_menu_names")
+    builder.button(text="⬅️ Отмена", callback_data="admin_topics_list")
+    builder.adjust(1)
+
+    await send_smart_content(callback, "\n".join(lines), None, builder.as_markup())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "confirmed_sync_topics_menu_names")
+async def confirmed_sync_topics_menu_names(callback: CallbackQuery, state: FSMContext | None = None):
+    if not await require_permission(callback, AdminPermission.CONTENT, state=state):
+        return
+    await _clear_admin_navigation_state(state)
+    updated_count = 0
+    async with async_session_maker() as session:
+        topics = (await session.scalars(select(Topic).order_by(Topic.id.asc()))).all()
+        menu_labels = await _resolve_menu_labels_by_topic_slug(session)
+        for topic in topics:
+            target = menu_labels.get(topic.slug)
+            if target:
+                trimmed = target[:120]
+                if topic.name != trimmed:
+                    topic.name = trimmed
+                    updated_count += 1
+        if updated_count:
+            await session.commit()
+
+    await callback.answer(f"✅ Синхронизировано тем: {updated_count}")
+    await admin_topics_list(_callback_with_data(callback, "admin_topics_list"), state=state)
 
 
 @router.callback_query(F.data.startswith("download_prompt_"))
 async def download_topic_prompt(callback: CallbackQuery, bot: Bot):
-    slug = callback.data.split("download_prompt_")[1]
+    slug = callback.data.removeprefix("download_prompt_")
 
     async with async_session_maker() as session:
         topic = await session.scalar(select(Topic).where(Topic.slug == slug))
@@ -5894,13 +6311,17 @@ async def download_topic_prompt(callback: CallbackQuery, bot: Bot):
     file_data = content.encode('utf-8')
     input_file = BufferedInputFile(file_data, filename=f"prompt_{slug}.txt")
 
-    await callback.message.answer_document(input_file, caption=f"📄 Промпт для темы: <b>{topic_name}</b>", parse_mode='HTML')
+    await callback.message.answer_document(
+        input_file,
+        caption=f"📄 Промпт для темы: <b>{html.escape(topic_name)}</b>",
+        parse_mode='HTML',
+    )
     await callback.answer()
 
 
 @router.callback_query(F.data.startswith("set_prompt_"))
 async def set_prompt_start(callback: CallbackQuery, state: FSMContext):
-    slug = callback.data.split("set_prompt_")[1]
+    slug = callback.data.removeprefix("set_prompt_")
     await state.set_state(AdminStates.edit_topic_prompt)
     await state.update_data(slug=slug)
 
@@ -5943,7 +6364,7 @@ async def save_topic_prompt(message: Message, state: FSMContext, bot: Bot):
 
 @router.callback_query(F.data.startswith("toggle_topic_paid_"))
 async def toggle_topic_paid(callback: CallbackQuery):
-    slug = callback.data.split("toggle_topic_paid_")[1]
+    slug = callback.data.removeprefix("toggle_topic_paid_")
     async with async_session_maker() as session:
         topic = await session.scalar(select(Topic).where(Topic.slug == slug))
         if topic:
@@ -5955,7 +6376,7 @@ async def toggle_topic_paid(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("attach_kb_"))
 async def attach_kb_list(callback: CallbackQuery):
-    payload = callback.data.split("attach_kb_")[1]
+    payload = callback.data.removeprefix("attach_kb_")
     if "_page_" in payload:
         slug, page_raw = payload.rsplit("_page_", 1)
         page = int(page_raw)
@@ -5990,7 +6411,7 @@ async def attach_kb_list(callback: CallbackQuery):
     builder.row(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"edit_topic_{slug}"))
 
     text = (
-        f"📎 <b>Управление знаниями для: {topic_name}</b>\n\n"
+        f"📎 <b>Управление знаниями для: {html.escape(topic_name)}</b>\n\n"
         f"Здесь вы решаете, какие документы AI должен читать при ответе на вопросы в этой теме.\n\n"
         f"✅ — Файл используется (AI его видит)\n"
         f"⭕️ — Файл отключен (AI его игнорирует)\n\n"
