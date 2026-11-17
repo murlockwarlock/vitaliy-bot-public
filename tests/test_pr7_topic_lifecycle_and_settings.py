@@ -356,7 +356,6 @@ class TopicLifecycleAndSettingsE2ETests(unittest.IsolatedAsyncioTestCase):
             self.dp.include_router(r)
 
         self._update_seq = 1
-        self._user_msg_seq = 50000
 
         async with async_session_maker() as session:
             ai_cfg = await session.get(AIConfig, 1)
@@ -410,16 +409,20 @@ class TopicLifecycleAndSettingsE2ETests(unittest.IsolatedAsyncioTestCase):
         return await self.storage.get_data(key)
 
     def _latest_chat_message(self, chat_id: int) -> Message:
-        candidates = [m for m in self.tg.messages.values() if m.chat.id == chat_id]
-        self.assertTrue(candidates, f"No active messages found in chat {chat_id}")
+        candidates = [
+            m
+            for m in self.tg.messages.values()
+            if m.chat.id == chat_id and m.from_user is not None and m.from_user.is_bot
+        ]
+        self.assertTrue(candidates, f"No active bot messages found in chat {chat_id}")
         return max(candidates, key=lambda m: m.message_id)
 
     async def _send_text(self, user_id: int, text: str) -> list[dict[str, Any]]:
         before = len(self.tg.events)
         self._update_seq += 1
-        self._user_msg_seq += 1
+        self.tg._next_message_id += 1
         msg = Message(
-            message_id=self._user_msg_seq,
+            message_id=self.tg._next_message_id,
             date=datetime.now(),
             chat=Chat(id=user_id, type="private"),
             from_user=TgUser(id=user_id, is_bot=False, first_name="User"),
