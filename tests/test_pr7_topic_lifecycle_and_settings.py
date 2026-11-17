@@ -498,14 +498,14 @@ class TopicLifecycleAndSettingsE2ETests(unittest.IsolatedAsyncioTestCase):
             cfg.summary_generation_enabled = True
             await session.commit()
 
-        # Step 1: Open /menu -> click mode_express
+        # Step 1: Open /menu -> click mode_express (User starts at current_dialogue_id=1; reset_dialogue_on_entry=True allocates 2)
         await self._send_text(user_id, "/menu")
         events = await self._click(user_id, "mode_express")
         welcome_msg = self._latest_chat_message(user_id)
         self.assertIn("🧩 Глубокий разбор мышления", welcome_msg.text or "")
         self.assertEqual(
             [(t, cb) for t, cb, _ in _extract_buttons(welcome_msg.reply_markup)],
-            [("Начать разбор", "ai_start_dialogue:express:1"), ("⬅️ Назад", "back_to_main_menu")],
+            [("Начать разбор", "ai_start_dialogue:express:2"), ("⬅️ Назад", "back_to_main_menu")],
         )
         self.assertIsNone(await self._state_of(user_id))
         async with async_session_maker() as session:
@@ -518,28 +518,28 @@ class TopicLifecycleAndSettingsE2ETests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("mode_express", menu_cbs)
         self.assertIsNone(await self._state_of(user_id))
 
-        # Step 3: Re-enter mode_express -> dialogue_id=2; test stale button from dialogue_id=1
+        # Step 3: Re-enter mode_express -> dialogue_id=3; test stale button from dialogue_id=2
         await self._click(user_id, "mode_express", message_id=menu_msg.message_id)
         welcome_msg_2 = self._latest_chat_message(user_id)
         self.assertEqual(
             [(t, cb) for t, cb, _ in _extract_buttons(welcome_msg_2.reply_markup)],
-            [("Начать разбор", "ai_start_dialogue:express:2"), ("⬅️ Назад", "back_to_main_menu")],
+            [("Начать разбор", "ai_start_dialogue:express:3"), ("⬅️ Назад", "back_to_main_menu")],
         )
 
-        stale_events = await self._click(user_id, "ai_start_dialogue:express:1", message_id=welcome_msg_2.message_id)
+        stale_events = await self._click(user_id, "ai_start_dialogue:express:2", message_id=welcome_msg_2.message_id)
         stale_alerts = [e for e in stale_events if e["kind"] == "callback_answer" and e["show_alert"]]
         self.assertEqual(len(stale_alerts), 1)
         self.assertIn("устарела", stale_alerts[0]["text"])
         self.assertIsNone(await self._state_of(user_id))
 
         # Step 4: Click "Начать разбор" + immediate double-click -> welcome markup cleared, Q1 sent ONCE
-        start_events = await self._click(user_id, "ai_start_dialogue:express:2", message_id=welcome_msg_2.message_id)
+        start_events = await self._click(user_id, "ai_start_dialogue:express:3", message_id=welcome_msg_2.message_id)
         self.assertIsNone(self.tg.messages[welcome_msg_2.message_id].reply_markup)
         q1_sends = [e for e in start_events if e["kind"] == "send_message" and "Вопрос 1 из 12" in e["text"]]
         self.assertEqual(len(q1_sends), 1)
         self.assertEqual(await self._state_of(user_id), "UniversalTestStates:answering")
 
-        dup_events = await self._click(user_id, "ai_start_dialogue:express:2", message_id=welcome_msg_2.message_id)
+        dup_events = await self._click(user_id, "ai_start_dialogue:express:3", message_id=welcome_msg_2.message_id)
         self.assertEqual([e for e in dup_events if e["kind"] == "send_message"], [])
         self.assertTrue(any(e["kind"] == "callback_answer" and "уже запущен" in (e["text"] or "") for e in dup_events))
 
@@ -599,12 +599,12 @@ class TopicLifecycleAndSettingsE2ETests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("Твой психологический портрет готов", portrait_msg.text or "")
             self.assertEqual(
                 [cb for _, cb, _ in _extract_buttons(portrait_msg.reply_markup)],
-                ["ai_finish_dialogue:express:2"],
+                ["ai_finish_dialogue:express:3"],
             )
             self.assertEqual(await self._state_of(user_id), "UserStates:chatting")
             sdata = await self._state_data(user_id)
             self.assertEqual(sdata.get("current_topic_slug"), "express")
-            self.assertEqual(sdata.get("dialogue_id"), 2)
+            self.assertEqual(sdata.get("dialogue_id"), 3)
 
             # Step 7: Working dialogue turn clears previous finish button and attaches it to new reply
             await self._send_text(user_id, "Откликается тема планирования и гибкости")
@@ -613,16 +613,16 @@ class TopicLifecycleAndSettingsE2ETests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("разберём этот сценарий", chat_reply.text or "")
             self.assertEqual(
                 [cb for _, cb, _ in _extract_buttons(chat_reply.reply_markup)],
-                ["ai_finish_dialogue:express:2"],
+                ["ai_finish_dialogue:express:3"],
             )
 
-        # Step 8: Finish dialogue -> summary & new dialogue options -> New dialogue starts Q1 of dialogue 3
-        await self._click(user_id, "ai_finish_dialogue:express:2", message_id=chat_reply.message_id)
+        # Step 8: Finish dialogue -> summary & new dialogue options -> New dialogue starts Q1 of dialogue 4
+        await self._click(user_id, "ai_finish_dialogue:express:3", message_id=chat_reply.message_id)
         self.assertIsNone(await self._state_of(user_id))
         completed_msg = self._latest_chat_message(user_id)
         completed_cbs = [cb for _, cb, _ in _extract_buttons(completed_msg.reply_markup)]
-        self.assertIn("ai_gen_summary:express:2", completed_cbs)
-        self.assertIn("ai_continue_dialogue:express:2", completed_cbs)
+        self.assertIn("ai_gen_summary:express:3", completed_cbs)
+        self.assertIn("ai_continue_dialogue:express:3", completed_cbs)
         self.assertIn("ai_new_dialogue:express", completed_cbs)
 
         new_dlg_events = await self._click(user_id, "ai_new_dialogue:express", message_id=completed_msg.message_id)
@@ -709,19 +709,19 @@ class TopicLifecycleAndSettingsE2ETests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("7. <b>Пре-диалоговый тест:</b> Включен", adm_cfg_msg.text or "")
         self.assertIn("7/7 вопр., готов", adm_cfg_msg.text or "")
 
-        # Now walk full client E2E flow on diagnostics
+        # Now walk full client E2E flow on diagnostics (reset_dialogue_on_entry=True allocates dialogue_id=2)
         await self._send_text(user_id, "/menu")
         await self._click(user_id, "mode_diagnostics")
         welcome_msg = self._latest_chat_message(user_id)
         self.assertIn("⚡ Экспресс-тест блоков", welcome_msg.text or "")
         self.assertEqual(
             [(t, cb) for t, cb, _ in _extract_buttons(welcome_msg.reply_markup)],
-            [("Пройти тест", "ai_start_dialogue:diagnostics:1"), ("⬅️ Назад", "back_to_main_menu")],
+            [("Пройти тест", "ai_start_dialogue:diagnostics:2"), ("⬅️ Назад", "back_to_main_menu")],
         )
         self.assertIsNone(await self._state_of(user_id))
 
         # Click "Пройти тест" -> Question 1 of 7 appears immediately (never hangs!)
-        await self._click(user_id, "ai_start_dialogue:diagnostics:1", message_id=welcome_msg.message_id)
+        await self._click(user_id, "ai_start_dialogue:diagnostics:2", message_id=welcome_msg.message_id)
         self.assertIsNone(self.tg.messages[welcome_msg.message_id].reply_markup)
         self.assertEqual(await self._state_of(user_id), "UniversalTestStates:answering")
 
@@ -740,7 +740,7 @@ class TopicLifecycleAndSettingsE2ETests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Главный затык сейчас", result_msg.text or "")
         self.assertEqual(
             [cb for _, cb, _ in _extract_buttons(result_msg.reply_markup)],
-            ["ai_finish_dialogue:diagnostics:1"],
+            ["ai_finish_dialogue:diagnostics:2"],
         )
         self.assertEqual(await self._state_of(user_id), "UserStates:chatting")
 
@@ -768,22 +768,22 @@ class TopicLifecycleAndSettingsE2ETests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("💬 ИИ-Виталий", welcome_msg.text or "")
         self.assertEqual(
             [(t, cb) for t, cb, _ in _extract_buttons(welcome_msg.reply_markup)],
-            [("Начать разговор", "ai_start_dialogue:free_session:1"), ("⬅️ Назад", "back_to_main_menu")],
+            [("Начать разговор", "ai_start_dialogue:free_session:2"), ("⬅️ Назад", "back_to_main_menu")],
         )
 
         # Click "Начать разговор" with empty prerecorded_first_message -> MUST send non-silent invitation + finish button
-        click_events = await self._click(user_id, "ai_start_dialogue:free_session:1", message_id=welcome_msg.message_id)
+        click_events = await self._click(user_id, "ai_start_dialogue:free_session:2", message_id=welcome_msg.message_id)
         self.assertIsNone(self.tg.messages[welcome_msg.message_id].reply_markup)
         # Welcome message text itself was NOT overwritten or deleted
         self.assertIn("💬 ИИ-Виталий", self.tg.messages[welcome_msg.message_id].text or "")
         sent = [e for e in click_events if e["kind"] == "send_message"]
         self.assertEqual(len(sent), 1)
         self.assertIn("Напиши", sent[0]["text"])
-        self.assertEqual([cb for _, cb, _ in sent[0]["buttons"]], ["ai_finish_dialogue:free_session:1"])
+        self.assertEqual([cb for _, cb, _ in sent[0]["buttons"]], ["ai_finish_dialogue:free_session:2"])
         self.assertEqual(await self._state_of(user_id), "UserStates:chatting")
 
         # Double-click on same start button -> idempotent, zero duplicate messages
-        dup_events = await self._click(user_id, "ai_start_dialogue:free_session:1", message_id=welcome_msg.message_id)
+        dup_events = await self._click(user_id, "ai_start_dialogue:free_session:2", message_id=welcome_msg.message_id)
         self.assertEqual([e for e in dup_events if e["kind"] == "send_message"], [])
 
         # Send message -> Finish -> Click "Новый разговор" with empty prerecorded_first_message -> MUST NOT be silent
@@ -791,13 +791,13 @@ class TopicLifecycleAndSettingsE2ETests(unittest.IsolatedAsyncioTestCase):
             await self._send_text(user_id, "Хочу навести порядок в задачах")
 
         reply_msg = self._latest_chat_message(user_id)
-        await self._click(user_id, "ai_finish_dialogue:free_session:1", message_id=reply_msg.message_id)
+        await self._click(user_id, "ai_finish_dialogue:free_session:2", message_id=reply_msg.message_id)
         comp_msg = self._latest_chat_message(user_id)
         new_events = await self._click(user_id, "ai_new_dialogue:free_session", message_id=comp_msg.message_id)
         new_sent = [e for e in new_events if e["kind"] == "send_message"]
         self.assertEqual(len(new_sent), 1)
         self.assertIn("Начинаем новый разговор", new_sent[0]["text"])
-        self.assertEqual([cb for _, cb, _ in new_sent[0]["buttons"]], ["ai_finish_dialogue:free_session:2"])
+        self.assertEqual([cb for _, cb, _ in new_sent[0]["buttons"]], ["ai_finish_dialogue:free_session:3"])
         self.assertEqual(await self._state_of(user_id), "UserStates:chatting")
 
     # =========================================================================
@@ -1070,8 +1070,8 @@ class TopicLifecycleAndSettingsE2ETests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(visible_effects, f"User callback '{cb_data}' produced silence!")
 
         admin_callbacks = [
-            "admin_panel",
             "admin_clients_list_0",
+            "admin_panel",
             "admin_section_ai",
             "admin_ai_settings",
             "admin_ai_keys",
