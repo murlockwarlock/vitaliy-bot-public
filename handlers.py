@@ -5936,64 +5936,22 @@ def topic_admin_button_text(topic, section: str) -> str:
     return f"📝 {topic.name} {paid_icon}"
 
 
-_MAIN_MENU_TOPIC_ACTIONS = {
-    "mode_free_session": "free_session",
-    "mode_diagnostics": "diagnostics",
-    "mode_express": "express",
-    "menu_strategy_session": "strategy_session",
-    "mode_journal": "journal",
-    "mode_habits": "habits",
-}
-
-
-async def _resolve_menu_labels_by_topic_slug(session) -> dict[str, str]:
-    rows = (await session.scalars(
-        select(MenuButton)
-        .where(MenuButton.section_key.in_(("main", "thematic")))
-        .order_by(MenuButton.enabled.desc(), MenuButton.order_num.asc(), MenuButton.id.asc())
-    )).all()
-    labels: dict[str, str] = {}
-    for btn in rows:
-        label = btn.label or ""
-        if btn.content_key and not btn.label_override:
-            content_row = await session.get(Content, btn.content_key)
-            if content_row and content_row.button_text:
-                label = content_row.button_text
-        clean_label = " ".join(label.splitlines()).strip()
-        if not clean_label:
-            continue
-        if btn.section_key == "main":
-            action = btn.action_value or btn.legacy_callback or ""
-            mapped_slug = _MAIN_MENU_TOPIC_ACTIONS.get(action)
-            if mapped_slug:
-                labels.setdefault(mapped_slug, clean_label)
-        elif btn.section_key == "thematic" and btn.action_type == "callback":
-            stable_cb = btn.legacy_callback or btn.action_value or ""
-            if stable_cb.startswith("thematic_"):
-                resolved_slug = (btn.topic_slug or stable_cb.removeprefix("thematic_")).strip()
-                if resolved_slug:
-                    labels.setdefault(resolved_slug, clean_label)
-    return labels
-
-
-def _build_edit_topic_view(topic: Topic | None, slug: str, menu_label: str | None) -> tuple[str, InlineKeyboardMarkup]:
+def _build_edit_topic_view(topic: Topic | None, slug: str) -> tuple[str, InlineKeyboardMarkup]:
     topic_name = topic.name if topic else slug
     current_prompt = topic.system_prompt if topic and topic.system_prompt else "Стандартный (не задан)"
     is_paid = topic.is_paid if topic else True
 
     preview = current_prompt[:200] + "..." if len(current_prompt) > 200 else current_prompt
     paid_status = "💰 Платная" if is_paid else "🆓 Бесплатная"
-    menu_line = f"🧭 <b>Кнопка в меню:</b> {html.escape(menu_label)}\n" if menu_label else ""
 
     text = (
         f"⚙️ <b>Настройки темы: {html.escape(topic_name)}</b>\n"
         f"🆔 <b>ID темы:</b> <code>{html.escape(slug)}</code>\n"
-        f"{menu_line}"
         f"💳 <b>Доступ:</b> {paid_status}\n\n"
         f"📝 <b>Текущий системный промпт (начало):</b>\n"
         f"<i>{html.escape(preview)}</i>\n\n"
         f"👇 <b>Что можно сделать:</b>\n"
-        f"1. <b>Переименовать тему</b> — изменить название в админке или подогнать под кнопку меню.\n"
+        f"1. <b>Переименовать тему</b> — изменить отображаемое название в админке.\n"
         f"2. <b>Изменить промпт</b> — задать новую инструкцию для AI в этом режиме.\n"
         f"3. <b>Прикрепить файл</b> — выбрать документы из Базы Знаний, которые AI будет использовать для ответов в этой теме.\n"
         f"4. <b>Скачать</b> — получить текущий промпт файлом.\n"
@@ -6003,8 +5961,6 @@ def _build_edit_topic_view(topic: Topic | None, slug: str, menu_label: str | Non
     toggle_text = "🆓 Сделать бесплатной" if is_paid else "💰 Сделать платной"
     builder = InlineKeyboardBuilder()
     builder.button(text="✏️ Переименовать тему", callback_data=f"rename_topic_{slug}")
-    if menu_label and menu_label != topic_name:
-        builder.button(text="🔄 Синхронизировать с меню", callback_data=f"confirm_sync_topic_menu_name_{slug}")
     builder.button(text="✏️ Изменить промпт", callback_data=f"set_prompt_{slug}")
     builder.button(text="📥 Скачать текущий промпт (.txt)", callback_data=f"download_prompt_{slug}")
     builder.button(text="📎 База знаний (привязка)", callback_data=f"attach_kb_{slug}")
@@ -6037,7 +5993,6 @@ async def admin_topics_list(event, state: FSMContext | None = None):
             select(Topic).order_by(Topic.id.asc())
         )
         topics = topics.scalars().all()
-        menu_labels = await _resolve_menu_labels_by_topic_slug(session)
 
     grouped = group_topics_for_admin(topics)
     ordered_topics = [
@@ -6061,19 +6016,11 @@ async def admin_topics_list(event, state: FSMContext | None = None):
             label = dict(TOPIC_ADMIN_SECTION_ORDER).get(section, section)
             text_lines.extend(["", f"<b>{html.escape(label)}</b>"])
             current_section = section
-        menu_lbl = menu_labels.get(topic.slug)
-        if menu_lbl and menu_lbl != topic.name:
-            text_lines.append(f"• {html.escape(topic.name)} <i>(в меню: {html.escape(menu_lbl)})</i>")
-        else:
-            text_lines.append(f"• {html.escape(topic.name)}")
+        text_lines.append(f"• {html.escape(topic.name)}")
         builder.row(InlineKeyboardButton(
             text=topic_admin_button_text(topic, section),
             callback_data=f"edit_topic_{topic.slug}",
         ))
-    builder.row(InlineKeyboardButton(
-        text="🔄 Синхронизировать названия с меню",
-        callback_data="confirm_sync_topics_menu_names",
-    ))
     builder.row(*kb.standard_pagination_row(
         page,
         total_pages,
@@ -6095,13 +6042,12 @@ async def edit_topic_menu(callback: CallbackQuery, state: FSMContext | None = No
 
     async with async_session_maker() as session:
         topic = await session.scalar(select(Topic).where(Topic.slug == slug))
-        menu_labels = await _resolve_menu_labels_by_topic_slug(session)
 
     if not topic:
         await callback.answer("Тема не найдена.", show_alert=True)
         return
 
-    text, markup = _build_edit_topic_view(topic, slug, menu_labels.get(slug))
+    text, markup = _build_edit_topic_view(topic, slug)
     await send_smart_content(callback, text, None, markup)
     await callback.answer()
 
@@ -6113,7 +6059,6 @@ async def rename_topic_start(callback: CallbackQuery, state: FSMContext):
     slug = callback.data.removeprefix("rename_topic_")
     async with async_session_maker() as session:
         topic = await session.scalar(select(Topic).where(Topic.slug == slug))
-        menu_labels = await _resolve_menu_labels_by_topic_slug(session)
     if not topic:
         await callback.answer("Тема не найдена.", show_alert=True)
         return
@@ -6125,14 +6070,10 @@ async def rename_topic_start(callback: CallbackQuery, state: FSMContext):
     builder.button(text="⬅️ Назад", callback_data=f"edit_topic_{slug}")
     builder.adjust(1)
 
-    menu_hint = ""
-    if menu_labels.get(slug):
-        menu_hint = f"\nКнопка в меню: <b>{html.escape(menu_labels[slug])}</b>"
-
     prompt_text = (
         f"✏️ <b>Переименование темы</b>\n\n"
         f"🆔 ID темы: <code>{html.escape(slug)}</code>\n"
-        f"Текущее название: <b>{html.escape(topic.name)}</b>{menu_hint}\n\n"
+        f"Текущее название: <b>{html.escape(topic.name)}</b>\n\n"
         f"Отправьте новое название темы (до 120 символов):"
     )
     await send_smart_content(callback, prompt_text, None, builder.as_markup())
@@ -6169,134 +6110,10 @@ async def save_topic_name(message: Message, state: FSMContext):
             return
         topic.name = new_name
         await session.commit()
-        menu_labels = await _resolve_menu_labels_by_topic_slug(session)
-        text, markup = _build_edit_topic_view(topic, slug, menu_labels.get(slug))
+        text, markup = _build_edit_topic_view(topic, slug)
 
     await state.clear()
     await message.answer("✅ Название темы обновлено!\n\n" + text, reply_markup=markup, parse_mode="HTML")
-
-
-@router.callback_query(F.data.startswith("confirm_sync_topic_menu_name_"))
-async def confirm_sync_single_topic_menu_name(callback: CallbackQuery, state: FSMContext | None = None):
-    if not await require_permission(callback, AdminPermission.CONTENT, state=state):
-        return
-    await _clear_admin_navigation_state(state)
-    slug = callback.data.removeprefix("confirm_sync_topic_menu_name_")
-    async with async_session_maker() as session:
-        topic = await session.scalar(select(Topic).where(Topic.slug == slug))
-        menu_labels = await _resolve_menu_labels_by_topic_slug(session)
-    if not topic:
-        await callback.answer("Тема не найдена.", show_alert=True)
-        return
-    target_label = menu_labels.get(slug)
-    if not target_label:
-        await callback.answer("Для этой темы нет связанной кнопки меню.", show_alert=True)
-        return
-    if topic.name == target_label:
-        await callback.answer("Название уже совпадает с кнопкой меню.", show_alert=True)
-        return
-
-    builder = InlineKeyboardBuilder()
-    builder.button(text="✅ Подтвердить", callback_data=f"confirmed_sync_topic_menu_name_{slug}")
-    builder.button(text="⬅️ Отмена", callback_data=f"edit_topic_{slug}")
-    builder.adjust(1)
-
-    text = (
-        f"🔄 <b>Синхронизация названия темы с меню</b>\n\n"
-        f"🆔 ID темы: <code>{html.escape(slug)}</code>\n"
-        f"Было: {html.escape(topic.name)}\n"
-        f"Станет: <b>{html.escape(target_label)}</b>\n\n"
-        f"<i>ID темы, привязки, callback и пользовательские данные не меняются.</i>"
-    )
-    await send_smart_content(callback, text, None, builder.as_markup())
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("confirmed_sync_topic_menu_name_"))
-async def confirmed_sync_single_topic_menu_name(callback: CallbackQuery, state: FSMContext | None = None):
-    if not await require_permission(callback, AdminPermission.CONTENT, state=state):
-        return
-    await _clear_admin_navigation_state(state)
-    slug = callback.data.removeprefix("confirmed_sync_topic_menu_name_")
-    async with async_session_maker() as session:
-        topic = await session.scalar(select(Topic).where(Topic.slug == slug))
-        menu_labels = await _resolve_menu_labels_by_topic_slug(session)
-        if not topic:
-            await callback.answer("Тема не найдена.", show_alert=True)
-            return
-        target_label = menu_labels.get(slug)
-        if not target_label:
-            await callback.answer("Для этой темы нет связанной кнопки меню.", show_alert=True)
-            return
-        topic.name = target_label[:120]
-        await session.commit()
-        text, markup = _build_edit_topic_view(topic, slug, target_label)
-
-    await send_smart_content(callback, text, None, markup)
-    await callback.answer("✅ Название синхронизировано с меню")
-
-
-@router.callback_query(F.data == "confirm_sync_topics_menu_names")
-async def confirm_sync_topics_menu_names(callback: CallbackQuery, state: FSMContext | None = None):
-    if not await require_permission(callback, AdminPermission.CONTENT, state=state):
-        return
-    await _clear_admin_navigation_state(state)
-    async with async_session_maker() as session:
-        topics = (await session.scalars(select(Topic).order_by(Topic.id.asc()))).all()
-        menu_labels = await _resolve_menu_labels_by_topic_slug(session)
-
-    diffs = [
-        (t.slug, t.name, menu_labels[t.slug][:120])
-        for t in topics
-        if t.slug in menu_labels and menu_labels[t.slug][:120] != t.name
-    ]
-    if not diffs:
-        await callback.answer("Все названия тем уже совпадают с меню.", show_alert=True)
-        return
-
-    lines = [
-        "🔄 <b>Синхронизация названий тем с меню</b>",
-        "",
-        "Будут обновлены следующие названия:",
-        "",
-    ]
-    for slug, old_name, new_name in diffs:
-        lines.append(f"• <code>{html.escape(slug)}</code>: {html.escape(old_name)} → <b>{html.escape(new_name)}</b>")
-    lines.extend([
-        "",
-        "<i>Сами ID тем (slug), привязки, callback и пользовательские данные не изменятся.</i>",
-    ])
-
-    builder = InlineKeyboardBuilder()
-    builder.button(text="✅ Подтвердить синхронизацию", callback_data="confirmed_sync_topics_menu_names")
-    builder.button(text="⬅️ Отмена", callback_data="admin_topics_list")
-    builder.adjust(1)
-
-    await send_smart_content(callback, "\n".join(lines), None, builder.as_markup())
-    await callback.answer()
-
-
-@router.callback_query(F.data == "confirmed_sync_topics_menu_names")
-async def confirmed_sync_topics_menu_names(callback: CallbackQuery, state: FSMContext | None = None):
-    if not await require_permission(callback, AdminPermission.CONTENT, state=state):
-        return
-    await _clear_admin_navigation_state(state)
-    updated_count = 0
-    async with async_session_maker() as session:
-        topics = (await session.scalars(select(Topic).order_by(Topic.id.asc()))).all()
-        menu_labels = await _resolve_menu_labels_by_topic_slug(session)
-        for topic in topics:
-            target = menu_labels.get(topic.slug)
-            if target:
-                trimmed = target[:120]
-                if topic.name != trimmed:
-                    topic.name = trimmed
-                    updated_count += 1
-        if updated_count:
-            await session.commit()
-
-    await callback.answer(f"✅ Синхронизировано тем: {updated_count}")
-    await admin_topics_list(_callback_with_data(callback, "admin_topics_list"), state=state)
 
 
 @router.callback_query(F.data.startswith("download_prompt_"))

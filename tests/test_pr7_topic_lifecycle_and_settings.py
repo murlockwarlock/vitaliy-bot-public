@@ -74,23 +74,17 @@ from content_service import invalidate_content_cache
 from database import (
     AIConfig,
     Base,
-    Content,
     Message as DBMessage,
-    MenuButton,
     PaymentConfig,
-    PreTestClaim,
     TestAttempt,
     TestQuestion,
-    TestSession,
     TestSet,
     Topic,
     TopicDialogueConfig,
     User,
-    UserTopicSession,
     async_session_maker,
     engine,
     init_db,
-    run_data_migrations,
 )
 from time_utils import msk_now
 
@@ -498,15 +492,17 @@ class TopicLifecycleAndSettingsE2ETests(unittest.IsolatedAsyncioTestCase):
             cfg.summary_generation_enabled = True
             await session.commit()
 
-        # Step 1: Open /menu -> click mode_express (User starts at current_dialogue_id=1; reset_dialogue_on_entry=True allocates 2)
+        # Step 1: Open /menu -> click mode_express -> welcome + start button (no pre-test yet)
         await self._send_text(user_id, "/menu")
-        events = await self._click(user_id, "mode_express")
+        await self._click(user_id, "mode_express")
         welcome_msg = self._latest_chat_message(user_id)
         self.assertIn("🧩 Глубокий разбор мышления", welcome_msg.text or "")
-        self.assertEqual(
-            [(t, cb) for t, cb, _ in _extract_buttons(welcome_msg.reply_markup)],
-            [("Начать разбор", "ai_start_dialogue:express:2"), ("⬅️ Назад", "back_to_main_menu")],
-        )
+        w1_btns = [(t, cb) for t, cb, _ in _extract_buttons(welcome_msg.reply_markup)]
+        self.assertEqual([t for t, _ in w1_btns], ["Начать разбор", "⬅️ Назад"])
+        self.assertTrue(w1_btns[0][1].startswith("ai_start_dialogue:express:"))
+        self.assertEqual(w1_btns[1][1], "back_to_main_menu")
+        first_start_cb = w1_btns[0][1]
+        first_did = int(first_start_cb.rsplit(":", 1)[1])
         self.assertIsNone(await self._state_of(user_id))
         async with async_session_maker() as session:
             self.assertEqual(await session.scalar(select(func.count(TestAttempt.id))), 0)
@@ -518,28 +514,29 @@ class TopicLifecycleAndSettingsE2ETests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("mode_express", menu_cbs)
         self.assertIsNone(await self._state_of(user_id))
 
-        # Step 3: Re-enter mode_express -> dialogue_id=3; test stale button from dialogue_id=2
+        # Step 3: Re-enter mode_express -> allocates new dialogue_id; stale button from previous entry is rejected
         await self._click(user_id, "mode_express", message_id=menu_msg.message_id)
         welcome_msg_2 = self._latest_chat_message(user_id)
-        self.assertEqual(
-            [(t, cb) for t, cb, _ in _extract_buttons(welcome_msg_2.reply_markup)],
-            [("Начать разбор", "ai_start_dialogue:express:3"), ("⬅️ Назад", "back_to_main_menu")],
-        )
+        w2_btns = [(t, cb) for t, cb, _ in _extract_buttons(welcome_msg_2.reply_markup)]
+        self.assertEqual([t for t, _ in w2_btns], ["Начать разбор", "⬅️ Назад"])
+        active_start_cb = w2_btns[0][1]
+        active_did = int(active_start_cb.rsplit(":", 1)[1])
+        self.assertGreater(active_did, first_did)
 
-        stale_events = await self._click(user_id, "ai_start_dialogue:express:2", message_id=welcome_msg_2.message_id)
+        stale_events = await self._click(user_id, first_start_cb, message_id=welcome_msg_2.message_id)
         stale_alerts = [e for e in stale_events if e["kind"] == "callback_answer" and e["show_alert"]]
         self.assertEqual(len(stale_alerts), 1)
         self.assertIn("устарела", stale_alerts[0]["text"])
         self.assertIsNone(await self._state_of(user_id))
 
         # Step 4: Click "Начать разбор" + immediate double-click -> welcome markup cleared, Q1 sent ONCE
-        start_events = await self._click(user_id, "ai_start_dialogue:express:3", message_id=welcome_msg_2.message_id)
+        start_events = await self._click(user_id, active_start_cb, message_id=welcome_msg_2.message_id)
         self.assertIsNone(self.tg.messages[welcome_msg_2.message_id].reply_markup)
         q1_sends = [e for e in start_events if e["kind"] == "send_message" and "Вопрос 1 из 12" in e["text"]]
         self.assertEqual(len(q1_sends), 1)
         self.assertEqual(await self._state_of(user_id), "UniversalTestStates:answering")
 
-        dup_events = await self._click(user_id, "ai_start_dialogue:express:3", message_id=welcome_msg_2.message_id)
+        dup_events = await self._click(user_id, active_start_cb, message_id=welcome_msg_2.message_id)
         self.assertEqual([e for e in dup_events if e["kind"] == "send_message"], [])
         self.assertTrue(any(e["kind"] == "callback_answer" and "уже запущен" in (e["text"] or "") for e in dup_events))
 
@@ -599,12 +596,12 @@ class TopicLifecycleAndSettingsE2ETests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("Твой психологический портрет готов", portrait_msg.text or "")
             self.assertEqual(
                 [cb for _, cb, _ in _extract_buttons(portrait_msg.reply_markup)],
-                ["ai_finish_dialogue:express:3"],
+                [f"ai_finish_dialogue:express:{active_did}"],
             )
             self.assertEqual(await self._state_of(user_id), "UserStates:chatting")
             sdata = await self._state_data(user_id)
             self.assertEqual(sdata.get("current_topic_slug"), "express")
-            self.assertEqual(sdata.get("dialogue_id"), 3)
+            self.assertEqual(sdata.get("dialogue_id"), active_did)
 
             # Step 7: Working dialogue turn clears previous finish button and attaches it to new reply
             await self._send_text(user_id, "Откликается тема планирования и гибкости")
@@ -613,16 +610,16 @@ class TopicLifecycleAndSettingsE2ETests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("разберём этот сценарий", chat_reply.text or "")
             self.assertEqual(
                 [cb for _, cb, _ in _extract_buttons(chat_reply.reply_markup)],
-                ["ai_finish_dialogue:express:3"],
+                [f"ai_finish_dialogue:express:{active_did}"],
             )
 
-        # Step 8: Finish dialogue -> summary & new dialogue options -> New dialogue starts Q1 of dialogue 4
-        await self._click(user_id, "ai_finish_dialogue:express:3", message_id=chat_reply.message_id)
+        # Step 8: Finish dialogue -> summary & new dialogue options -> New dialogue starts Q1 of next session
+        await self._click(user_id, f"ai_finish_dialogue:express:{active_did}", message_id=chat_reply.message_id)
         self.assertIsNone(await self._state_of(user_id))
         completed_msg = self._latest_chat_message(user_id)
         completed_cbs = [cb for _, cb, _ in _extract_buttons(completed_msg.reply_markup)]
-        self.assertIn("ai_gen_summary:express:3", completed_cbs)
-        self.assertIn("ai_continue_dialogue:express:3", completed_cbs)
+        self.assertIn(f"ai_gen_summary:express:{active_did}", completed_cbs)
+        self.assertIn(f"ai_continue_dialogue:express:{active_did}", completed_cbs)
         self.assertIn("ai_new_dialogue:express", completed_cbs)
 
         new_dlg_events = await self._click(user_id, "ai_new_dialogue:express", message_id=completed_msg.message_id)
@@ -631,16 +628,16 @@ class TopicLifecycleAndSettingsE2ETests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any(e["kind"] == "send_message" and "Вопрос 1 из 12" in e["text"] for e in new_dlg_events))
 
     # =========================================================================
-    # 2. DIAGNOSTICS (7 QUESTIONS + TESTSET #3 MIGRATION HEAL)
+    # 2. DIAGNOSTICS (7 QUESTIONS) & EXPLICIT ADMIN ACTIVATION / PRESERVATION
     # =========================================================================
 
-    async def test_diagnostics_7_questions_migration_heal_and_full_e2e_lifecycle(self):
+    async def test_diagnostics_7_questions_explicit_activation_and_full_e2e_lifecycle(self):
         user_id = 700102
+        admin_id = 700900
         await self._seed_user(user_id)
+        await self._seed_user(admin_id, is_admin=True, admin_role=AdminRole.CONTENT_EDITOR.value)
 
         async with async_session_maker() as session:
-            # Reproduce exact prod condition: TestSet #1 has only 5 questions; TestSet #3 has 7 questions;
-            # diagnostics has test_set_id=3, button="Пройти тест", pre_dialogue_test_enabled=False.
             for idx in range(1, 6):
                 session.add(TestQuestion(test_set_id=1, order_num=idx, text=f"Старый вопрос {idx}", is_active=True))
 
@@ -680,48 +677,42 @@ class TopicLifecycleAndSettingsE2ETests(unittest.IsolatedAsyncioTestCase):
             diag_cfg.summary_generation_enabled = True
             await session.commit()
 
-            # Run migrations twice: must restore pre_dialogue_test_enabled=True and preserve test_set_id=3 & summary flag
-            await run_data_migrations(session)
-            await session.commit()
-            await run_data_migrations(session)
-            await session.commit()
-
+        # init_db() MUST NOT guess admin intent by TestSet #3 / slug / button text: pre_dialogue_test_enabled stays False!
+        await init_db()
+        await init_db()
+        async with async_session_maker() as session:
             diag_cfg_after = await session.scalar(select(TopicDialogueConfig).where(TopicDialogueConfig.topic_slug == "diagnostics"))
             self.assertEqual(diag_cfg_after.test_set_id, 3)
-            self.assertTrue(diag_cfg_after.pre_dialogue_test_enabled)
+            self.assertFalse(diag_cfg_after.pre_dialogue_test_enabled)
             self.assertTrue(diag_cfg_after.summary_generation_enabled)
 
-            # Verify one-time marker: if admin later disables pre_dialogue_test_enabled, migration does NOT override it
-            diag_cfg_after.pre_dialogue_test_enabled = False
-            await session.commit()
-            await run_data_migrations(session)
-            await session.commit()
-            self.assertFalse(
-                (await session.scalar(select(TopicDialogueConfig).where(TopicDialogueConfig.topic_slug == "diagnostics"))).pre_dialogue_test_enabled
-            )
-
-        # Admin re-selects TestSet #3 in UI -> Fix 4 explicitly turns pre_dialogue_test_enabled=True
-        admin_id = 700900
-        await self._seed_user(admin_id, is_admin=True, admin_role=AdminRole.CONTENT_EDITOR.value)
+        # Admin explicitly enables pre-test or selects ready TestSet #3 in UI -> pre_dialogue_test_enabled becomes True and survives init_db()
         await self._send_text(admin_id, "/admin")
         await self._click(admin_id, "cfg_set_testset_diagnostics_3")
         adm_cfg_msg = self._latest_chat_message(admin_id)
         self.assertIn("7. <b>Пре-диалоговый тест:</b> Включен", adm_cfg_msg.text or "")
         self.assertIn("7/7 вопр., готов", adm_cfg_msg.text or "")
 
-        # Now walk full client E2E flow on diagnostics (reset_dialogue_on_entry=True allocates dialogue_id=2)
+        await init_db()
+        async with async_session_maker() as session:
+            diag_cfg_enabled = await session.scalar(select(TopicDialogueConfig).where(TopicDialogueConfig.topic_slug == "diagnostics"))
+            self.assertEqual(diag_cfg_enabled.test_set_id, 3)
+            self.assertTrue(diag_cfg_enabled.pre_dialogue_test_enabled)
+
+        # Walk full client E2E flow on diagnostics
         await self._send_text(user_id, "/menu")
         await self._click(user_id, "mode_diagnostics")
         welcome_msg = self._latest_chat_message(user_id)
         self.assertIn("⚡ Экспресс-тест блоков", welcome_msg.text or "")
-        self.assertEqual(
-            [(t, cb) for t, cb, _ in _extract_buttons(welcome_msg.reply_markup)],
-            [("Пройти тест", "ai_start_dialogue:diagnostics:2"), ("⬅️ Назад", "back_to_main_menu")],
-        )
+        diag_btns = [(t, cb) for t, cb, _ in _extract_buttons(welcome_msg.reply_markup)]
+        self.assertEqual([t for t, _ in diag_btns], ["Пройти тест", "⬅️ Назад"])
+        diag_start_cb = diag_btns[0][1]
+        self.assertTrue(diag_start_cb.startswith("ai_start_dialogue:diagnostics:"))
+        diag_did = int(diag_start_cb.rsplit(":", 1)[1])
         self.assertIsNone(await self._state_of(user_id))
 
         # Click "Пройти тест" -> Question 1 of 7 appears immediately (never hangs!)
-        await self._click(user_id, "ai_start_dialogue:diagnostics:2", message_id=welcome_msg.message_id)
+        await self._click(user_id, diag_start_cb, message_id=welcome_msg.message_id)
         self.assertIsNone(self.tg.messages[welcome_msg.message_id].reply_markup)
         self.assertEqual(await self._state_of(user_id), "UniversalTestStates:answering")
 
@@ -740,9 +731,110 @@ class TopicLifecycleAndSettingsE2ETests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Главный затык сейчас", result_msg.text or "")
         self.assertEqual(
             [cb for _, cb, _ in _extract_buttons(result_msg.reply_markup)],
-            ["ai_finish_dialogue:diagnostics:2"],
+            [f"ai_finish_dialogue:diagnostics:{diag_did}"],
         )
         self.assertEqual(await self._state_of(user_id), "UserStates:chatting")
+
+    async def test_admin_settings_preserved_across_manual_disable_testset_reset_and_repeat_init_db(self):
+        """Targeted regression for admin config durability across repeated init_db() calls on diagnostics & express."""
+        admin_id = 700910
+        user_id = 700110
+        await self._seed_user(admin_id, is_admin=True, admin_role=AdminRole.CONTENT_EDITOR.value)
+        await self._seed_user(user_id)
+
+        async with async_session_maker() as session:
+            diag_ready_set = TestSet(
+                id=40,
+                title="Кастомный диагностический набор",
+                slug="custom_diag_ready",
+                is_enabled=True,
+                is_archived=False,
+            )
+            session.add(diag_ready_set)
+            profile_set = await session.scalar(select(TestSet).where(TestSet.slug == "express_psychological_profile"))
+            await session.flush()
+
+            # Make BOTH default TestSet #1 (7 q), custom TestSet #40 (7 q), and default profile_set (12 q) ready,
+            # so if init_db() had ANY bug restoring default sets or re-enabling ready sets, it would trigger immediately!
+            for idx in range(1, 8):
+                session.add(TestQuestion(test_set_id=1, order_num=idx, text=f"DefaultDiagQ{idx}", is_active=True))
+                session.add(TestQuestion(test_set_id=40, order_num=idx, text=f"CustomDiagQ{idx}", is_active=True))
+            for idx in range(1, 13):
+                session.add(TestQuestion(test_set_id=profile_set.id, order_num=idx, text=f"ProfileQ{idx}", is_active=True))
+
+            for slug, set_id in (("diagnostics", 40), ("express", profile_set.id)):
+                cfg = await session.scalar(select(TopicDialogueConfig).where(TopicDialogueConfig.topic_slug == slug))
+                cfg.welcome_text = f"Кастомное приветствие {slug}"
+                cfg.reset_dialogue_on_entry = False
+                cfg.start_dialogue_button_enabled = True
+                cfg.start_dialogue_button_text = f"Старт {slug}"
+                cfg.prerecorded_first_message = f"Первое сообщение {slug}"
+                cfg.pre_dialogue_test_enabled = True
+                cfg.test_set_id = set_id
+                cfg.summary_generation_enabled = True
+                cfg.summary_prompt = f"Промпт итогов {slug}"
+            await session.commit()
+            profile_set_id = profile_set.id
+
+        # 1. Manual disable of pre-test by admin -> repeated init_db() MUST NOT re-enable pre-test or overwrite settings
+        await self._send_text(admin_id, "/admin")
+        await self._click(admin_id, "admin_topic_dialogue_cfg_diagnostics")
+        await self._click(admin_id, "cfg_toggle_pretest_diagnostics")
+        self.assertIn("Выключен (набор выбран, но тест выключен)", self._latest_chat_message(admin_id).text or "")
+
+        await self._click(admin_id, "admin_topic_dialogue_cfg_express")
+        await self._click(admin_id, "cfg_toggle_pretest_express")
+        self.assertIn("Выключен (набор выбран, но тест выключен)", self._latest_chat_message(admin_id).text or "")
+
+        await init_db()
+        await init_db()
+
+        async with async_session_maker() as session:
+            for slug, expected_set_id in (("diagnostics", 40), ("express", profile_set_id)):
+                cfg = await session.scalar(select(TopicDialogueConfig).where(TopicDialogueConfig.topic_slug == slug))
+                self.assertEqual(cfg.test_set_id, expected_set_id)
+                self.assertFalse(cfg.pre_dialogue_test_enabled)
+                self.assertEqual(cfg.welcome_text, f"Кастомное приветствие {slug}")
+                self.assertFalse(cfg.reset_dialogue_on_entry)
+                self.assertTrue(cfg.start_dialogue_button_enabled)
+                self.assertEqual(cfg.start_dialogue_button_text, f"Старт {slug}")
+                self.assertEqual(cfg.prerecorded_first_message, f"Первое сообщение {slug}")
+                self.assertTrue(cfg.summary_generation_enabled)
+                self.assertEqual(cfg.summary_prompt, f"Промпт итогов {slug}")
+
+        # Verify runtime behavior with disabled pre-test: clicking start goes straight to chatting, zero TestAttempts
+        for mode_cb, slug in (("mode_diagnostics", "diagnostics"), ("mode_express", "express")):
+            await self._send_text(user_id, "/menu")
+            await self._click(user_id, mode_cb)
+            w_msg = self._latest_chat_message(user_id)
+            start_cb = [cb for _, cb, _ in _extract_buttons(w_msg.reply_markup) if cb and cb.startswith(f"ai_start_dialogue:{slug}:")][0]
+            await self._click(user_id, start_cb, message_id=w_msg.message_id)
+            self.assertEqual(await self._state_of(user_id), "UserStates:chatting")
+            self.assertIn(f"Первое сообщение {slug}", self._latest_chat_message(user_id).text or "")
+        async with async_session_maker() as session:
+            self.assertEqual(await session.scalar(select(func.count(TestAttempt.id))), 0)
+
+        # 2. Manual TestSet reset (cfg_set_testset_*_0) -> repeated init_db() MUST NOT restore default TestSet or enable pre-test
+        await self._click(admin_id, "cfg_set_testset_diagnostics_0")
+        self.assertIn("8. <b>Набор тестов (TestSet):</b> Не выбран", self._latest_chat_message(admin_id).text or "")
+        await self._click(admin_id, "cfg_set_testset_express_0")
+        self.assertIn("8. <b>Набор тестов (TestSet):</b> Не выбран", self._latest_chat_message(admin_id).text or "")
+
+        await init_db()
+        await init_db()
+
+        async with async_session_maker() as session:
+            for slug in ("diagnostics", "express"):
+                cfg = await session.scalar(select(TopicDialogueConfig).where(TopicDialogueConfig.topic_slug == slug))
+                self.assertIsNone(cfg.test_set_id)
+                self.assertFalse(cfg.pre_dialogue_test_enabled)
+                self.assertEqual(cfg.welcome_text, f"Кастомное приветствие {slug}")
+                self.assertFalse(cfg.reset_dialogue_on_entry)
+                self.assertTrue(cfg.start_dialogue_button_enabled)
+                self.assertEqual(cfg.start_dialogue_button_text, f"Старт {slug}")
+                self.assertEqual(cfg.prerecorded_first_message, f"Первое сообщение {slug}")
+                self.assertTrue(cfg.summary_generation_enabled)
+                self.assertEqual(cfg.summary_prompt, f"Промпт итогов {slug}")
 
     # =========================================================================
     # 3. FREE_SESSION & EMPTY PRERECORDED: NO SILENT BRANCHES ON START / NEW
@@ -766,24 +858,25 @@ class TopicLifecycleAndSettingsE2ETests(unittest.IsolatedAsyncioTestCase):
         await self._click(user_id, "mode_free_session")
         welcome_msg = self._latest_chat_message(user_id)
         self.assertIn("💬 ИИ-Виталий", welcome_msg.text or "")
-        self.assertEqual(
-            [(t, cb) for t, cb, _ in _extract_buttons(welcome_msg.reply_markup)],
-            [("Начать разговор", "ai_start_dialogue:free_session:2"), ("⬅️ Назад", "back_to_main_menu")],
-        )
+        fs_btns = [(t, cb) for t, cb, _ in _extract_buttons(welcome_msg.reply_markup)]
+        self.assertEqual([t for t, _ in fs_btns], ["Начать разговор", "⬅️ Назад"])
+        fs_start_cb = fs_btns[0][1]
+        self.assertTrue(fs_start_cb.startswith("ai_start_dialogue:free_session:"))
+        fs_did = int(fs_start_cb.rsplit(":", 1)[1])
 
         # Click "Начать разговор" with empty prerecorded_first_message -> MUST send non-silent invitation + finish button
-        click_events = await self._click(user_id, "ai_start_dialogue:free_session:2", message_id=welcome_msg.message_id)
+        click_events = await self._click(user_id, fs_start_cb, message_id=welcome_msg.message_id)
         self.assertIsNone(self.tg.messages[welcome_msg.message_id].reply_markup)
         # Welcome message text itself was NOT overwritten or deleted
         self.assertIn("💬 ИИ-Виталий", self.tg.messages[welcome_msg.message_id].text or "")
         sent = [e for e in click_events if e["kind"] == "send_message"]
         self.assertEqual(len(sent), 1)
         self.assertIn("Напиши", sent[0]["text"])
-        self.assertEqual([cb for _, cb, _ in sent[0]["buttons"]], ["ai_finish_dialogue:free_session:2"])
+        self.assertEqual([cb for _, cb, _ in sent[0]["buttons"]], [f"ai_finish_dialogue:free_session:{fs_did}"])
         self.assertEqual(await self._state_of(user_id), "UserStates:chatting")
 
         # Double-click on same start button -> idempotent, zero duplicate messages
-        dup_events = await self._click(user_id, "ai_start_dialogue:free_session:2", message_id=welcome_msg.message_id)
+        dup_events = await self._click(user_id, fs_start_cb, message_id=welcome_msg.message_id)
         self.assertEqual([e for e in dup_events if e["kind"] == "send_message"], [])
 
         # Send message -> Finish -> Click "Новый разговор" with empty prerecorded_first_message -> MUST NOT be silent
@@ -791,13 +884,15 @@ class TopicLifecycleAndSettingsE2ETests(unittest.IsolatedAsyncioTestCase):
             await self._send_text(user_id, "Хочу навести порядок в задачах")
 
         reply_msg = self._latest_chat_message(user_id)
-        await self._click(user_id, "ai_finish_dialogue:free_session:2", message_id=reply_msg.message_id)
+        await self._click(user_id, f"ai_finish_dialogue:free_session:{fs_did}", message_id=reply_msg.message_id)
         comp_msg = self._latest_chat_message(user_id)
         new_events = await self._click(user_id, "ai_new_dialogue:free_session", message_id=comp_msg.message_id)
         new_sent = [e for e in new_events if e["kind"] == "send_message"]
         self.assertEqual(len(new_sent), 1)
         self.assertIn("Начинаем новый разговор", new_sent[0]["text"])
-        self.assertEqual([cb for _, cb, _ in new_sent[0]["buttons"]], ["ai_finish_dialogue:free_session:3"])
+        new_finish_cb = new_sent[0]["buttons"][0][1]
+        self.assertTrue(new_finish_cb.startswith("ai_finish_dialogue:free_session:"))
+        self.assertGreater(int(new_finish_cb.rsplit(":", 1)[1]), fs_did)
         self.assertEqual(await self._state_of(user_id), "UserStates:chatting")
 
     # =========================================================================
@@ -937,10 +1032,10 @@ class TopicLifecycleAndSettingsE2ETests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(diag_cfg.pre_dialogue_test_enabled)
 
     # =========================================================================
-    # 6. TOPIC RENAMING, CONFIRMED MENU SYNC, SLUG PLACEMENT, ESCAPING & RBAC
+    # 6. TOPIC RENAMING (IMMUTABLE SLUG), SLUG PLACEMENT, ESCAPING & RBAC
     # =========================================================================
 
-    async def test_topic_renaming_confirmed_menu_sync_slug_placement_escaping_and_permissions(self):
+    async def test_topic_renaming_slug_placement_escaping_and_permissions(self):
         editor_id = 700902
         support_id = 700903
         hacker_id = 700904
@@ -950,41 +1045,41 @@ class TopicLifecycleAndSettingsE2ETests(unittest.IsolatedAsyncioTestCase):
         await self._seed_user(hacker_id, is_admin=False)
         await self._seed_user(client_id, is_admin=False)
 
-        # Seed historical user data + duplicate legacy topic to prove nothing is deleted or altered
         async with async_session_maker() as session:
             session.add(Topic(slug="sleep", name="Сон и восстановление", system_prompt="Legacy prompt", is_paid=False))
             session.add(DBMessage(user_id=client_id, topic_slug="express", dialogue_id=1, role="user", content="Важная история"))
-            btn_diag = await session.scalar(select(MenuButton).where(MenuButton.action_value == "mode_diagnostics"))
-            btn_diag.label = "⚡ Экспресс-тест блоков (3 мин)"
-            btn_diag.label_override = True
-            btn_expr = await session.scalar(select(MenuButton).where(MenuButton.action_value == "mode_express"))
-            btn_expr.label = "🧩 Глубокий разбор мышления"
-            btn_expr.label_override = True
             await session.commit()
 
-        # 1. RBAC: support & non-admin denied on topic rename & sync callbacks
+        # 1. RBAC: support & non-admin denied on topic edit & rename callbacks
         await self._send_text(support_id, "/admin")
         sup_ev = await self._click(support_id, "rename_topic_express")
         self.assertTrue(any(e["kind"] == "callback_answer" and e["show_alert"] for e in sup_ev))
 
         await self._send_text(hacker_id, "/menu")
-        hack_ev = await self._click(hacker_id, "confirm_sync_topics_menu_names")
+        hack_ev = await self._click(hacker_id, "rename_topic_express")
         self.assertTrue(any(e["kind"] == "callback_answer" and e["show_alert"] for e in hack_ev))
 
         # 2. Slug placement: shown on main `edit_topic_strategy_session`, NOT in `admin_topic_dialogue_cfg_strategy_session`
         await self._send_text(editor_id, "/admin")
         await self._click(editor_id, "admin_section_ai")
         await self._click(editor_id, "admin_topics_list")
+        topics_list_msg = self._latest_chat_message(editor_id)
+        topics_list_cbs = [cb for _, cb, _ in _extract_buttons(topics_list_msg.reply_markup)]
+        self.assertFalse(any(cb and "sync" in cb for cb in topics_list_cbs))
+
         await self._click(editor_id, "edit_topic_strategy_session")
         main_card = self._latest_chat_message(editor_id)
         self.assertIn("<code>strategy_session</code>", main_card.text or "")
+        main_card_cbs = [cb for _, cb, _ in _extract_buttons(main_card.reply_markup)]
+        self.assertIn("rename_topic_strategy_session", main_card_cbs)
+        self.assertFalse(any(cb and "sync" in cb for cb in main_card_cbs))
 
         await self._click(editor_id, "admin_topic_dialogue_cfg_strategy_session", message_id=main_card.message_id)
         dlg_cfg_card = self._latest_chat_message(editor_id)
         self.assertIn("Параметры диалога темы: Стратегическая сессия", dlg_cfg_card.text or "")
         self.assertNotIn("strategy_session", dlg_cfg_card.text or "")
 
-        # 3. Manual rename with HTML-sensitive characters + Cancel route check
+        # 3. Manual rename of Topic.name with immutable slug + HTML escaping + Cancel route + durability across init_db()
         await self._click(editor_id, "edit_topic_express", message_id=dlg_cfg_card.message_id)
         express_card = self._latest_chat_message(editor_id)
         self.assertIn("<code>express</code>", express_card.text or "")
@@ -1004,33 +1099,16 @@ class TopicLifecycleAndSettingsE2ETests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("🧩 Разбор &lt;AI &amp; Мышление&gt;", updated_card.text or "")
         self.assertIn("<code>express</code>", updated_card.text or "")
 
-        # 4. Bulk sync with confirmation (Cancel leaves unchanged; Confirm aligns with menu without touching slug/history/duplicates)
-        await self._click(editor_id, "admin_topics_list", message_id=updated_card.message_id)
-        topics_list_msg = self._latest_chat_message(editor_id)
-        await self._click(editor_id, "confirm_sync_topics_menu_names", message_id=topics_list_msg.message_id)
-        confirm_screen = self._latest_chat_message(editor_id)
-        self.assertIn("⚡ Экспресс-тест блоков (3 мин)", confirm_screen.text or "")
-        self.assertIn("🧩 Глубокий разбор мышления", confirm_screen.text or "")
-
-        # Cancel first -> names unchanged
-        await self._click(editor_id, "admin_topics_list", message_id=confirm_screen.message_id)
+        # Repeat init_db(): custom Topic.name, immutable slug, user history, and duplicate topics remain untouched
+        await init_db()
         async with async_session_maker() as session:
-            expr_db = await session.scalar(select(Topic).where(Topic.slug == "express"))
-            self.assertEqual(expr_db.name, "🧩 Разбор <AI & Мышление>")
-
-        # Confirm sync -> names updated, slugs/callbacks/history/duplicates completely preserved
-        await self._click(editor_id, "confirm_sync_topics_menu_names")
-        await self._click(editor_id, "confirmed_sync_topics_menu_names")
-
-        async with async_session_maker() as session:
-            diag_db = await session.scalar(select(Topic).where(Topic.slug == "diagnostics"))
             expr_db = await session.scalar(select(Topic).where(Topic.slug == "express"))
             legacy_sleep = await session.scalar(select(Topic).where(Topic.slug == "sleep"))
             hist_count = await session.scalar(
                 select(func.count(DBMessage.id)).where(DBMessage.user_id == client_id, DBMessage.topic_slug == "express")
             )
-            self.assertEqual(diag_db.name, "⚡ Экспресс-тест блоков (3 мин)")
-            self.assertEqual(expr_db.name, "🧩 Глубокий разбор мышления")
+            self.assertEqual(expr_db.slug, "express")
+            self.assertEqual(expr_db.name, "🧩 Разбор <AI & Мышление>")
             self.assertIsNotNone(legacy_sleep)
             self.assertEqual(hist_count, 1)
 
