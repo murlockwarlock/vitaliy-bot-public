@@ -36,6 +36,7 @@ from aiogram.methods import (
     EditMessageText,
     GetMe,
     SendAnimation,
+    SendAudio,
     SendChatAction,
     SendDocument,
     SendMediaGroup,
@@ -202,6 +203,17 @@ class FakeTelegramSession(BaseSession):
                 "buttons": _extract_buttons(markup),
             })
             return msg  # type: ignore[return-value]
+
+        if isinstance(method, SendAudio):
+            self.events.append({
+                "kind": "send_audio",
+                "chat_id": int(method.chat_id),
+                "audio": getattr(method, "audio", None),
+                "title": getattr(method, "title", None),
+                "performer": getattr(method, "performer", None),
+                "caption": getattr(method, "caption", None),
+            })
+            return True  # type: ignore[return-value]
 
         if isinstance(method, (SendPhoto, SendVideo, SendAnimation, SendDocument)):
             parse_mode = str(getattr(method, "parse_mode", None) or "")
@@ -1943,3 +1955,196 @@ class TopicLifecycleAndSettingsE2ETests(unittest.IsolatedAsyncioTestCase):
             1,
         )
         self.assertFalse(any("Запись Б" in c for c in user_role_contents))
+
+    async def test_tz_v5_remaining_items(self):
+        """Address items 1-8 from TZ v5 in PR #7."""
+        import html
+        from datetime import date
+        from aiogram.fsm.context import FSMContext
+        from sqlalchemy import delete
+        from database import (
+            Content,
+            FunnelConfig,
+            FunnelMeditation,
+            JournalEntry,
+            JournalQuestion,
+            QuickNote,
+            User,
+            Book,
+            MenuButton,
+            init_db,
+        )
+        import funnel
+        import handlers
+        import journal_handlers
+        import journal_keyboards
+        import journal_service
+        import keyboards
+
+        # --- Item 1: Referral link text normalization ---
+        user_id = 9501
+        await self._seed_user(user_id=user_id, balance=10.0)
+
+        # Seed legacy text into Content
+        async with async_session_maker() as session:
+            ref_content = await session.get(Content, "referral_link_text")
+            if not ref_content:
+                ref_content = Content(key="referral_link_text", text_content="Ваша бонусная ссылка")
+                session.add(ref_content)
+            else:
+                ref_content.text_content = "Ваша бонусная ссылка"
+            await session.commit()
+
+        # Re-run init_db content update
+        await init_db()
+
+        # Check in DB
+        async with async_session_maker() as session:
+            ref_content = await session.get(Content, "referral_link_text")
+            self.assertEqual(ref_content.text_content, "Твоя ссылка для приглашения")
+
+        # Check handler output via dispatcher click
+        await self._send_text(user_id, "/menu")
+        await self._click(user_id, "ref_create_link")
+        ref_msg = self._latest_chat_message(user_id)
+        self.assertIn("🔗 <b>Твоя ссылка для приглашения</b>", ref_msg.text)
+        self.assertNotIn("Ваша бонусная ссылка", ref_msg.text)
+
+        # --- Item 2 & 4: Dynamics menu & pluralization ---
+        self.assertEqual(journal_handlers.format_days_ru(1), "1 день")
+        self.assertEqual(journal_handlers.format_days_ru(2), "2 дня")
+        self.assertEqual(journal_handlers.format_days_ru(4), "4 дня")
+        self.assertEqual(journal_handlers.format_days_ru(5), "5 дней")
+        self.assertEqual(journal_handlers.format_days_ru(7), "7 дней")
+        self.assertEqual(journal_handlers.format_days_ru(11), "11 дней")
+        self.assertEqual(journal_handlers.format_days_ru(21), "21 день")
+        self.assertEqual(journal_handlers.format_days_ru(22), "22 дня")
+        self.assertEqual(journal_handlers.format_days_ru(25), "25 дней")
+
+        await self._click(user_id, "mode_journal")
+        await self._click(user_id, "j_dyn_menu")
+        dyn_menu_msg = self._latest_chat_message(user_id)
+        self.assertIn("Выбери период для анализа динамики", dyn_menu_msg.text)
+        self.assertNotIn("Выберите период", dyn_menu_msg.text)
+
+        # --- Item 3: Operational quick notes prompt ---
+        async with async_session_maker() as session:
+            session.add(QuickNote(user_id=user_id, text="Заметка для проверки списка"))
+            await session.commit()
+        await self._click(user_id, "mode_journal")
+        await self._click(user_id, "quick_notes")
+        notes_msg = self._latest_chat_message(user_id)
+        self.assertIn("Выбери запись, чтобы открыть полный текст:", notes_msg.text)
+        self.assertNotIn("Выберите запись", notes_msg.text)
+
+        # --- Item 5: Scale question visual confirmation «Твой ответ: 7» ---
+        entry_id = None
+        async with async_session_maker() as session:
+            snapshot = [
+                {
+                    "question_id": 991,
+                    "position": 1,
+                    "text": "Насколько ты доволен днем по шкале?",
+                    "question_type": "scale",
+                    "allow_custom_answer": False,
+                    "options": [{"text": str(i), "value": float(i)} for i in range(1, 11)],
+                }
+            ]
+            entry = JournalEntry(
+                user_id=user_id,
+                reflection_date=date(2026, 11, 25),
+                status="in_progress",
+                questions_snapshot_json=json.dumps(snapshot),
+            )
+            session.add(entry)
+            await session.commit()
+            entry_id = entry.id
+
+        fsm_key = StorageKey(bot_id=self.bot.id, chat_id=user_id, user_id=user_id)
+        state = FSMContext(storage=self.storage, key=fsm_key)
+        await state.set_state(journal_handlers.JournalStates.answering_question)
+        await state.update_data(entry_id=entry_id, position=1, total=1)
+
+        q_msg = await self.bot.send_message(
+            chat_id=user_id,
+            text="📔 <b>Вопрос 1 из 1</b>\n\nНасколько ты доволен днем по шкале?\n\nВыбери один вариант ниже.",
+            reply_markup=await journal_keyboards.configured_journal_question_keyboard(entry_id, 1, snapshot[0]),
+        )
+        await self._click(user_id, f"j_opt:{entry_id}:1:6", message_id=q_msg.message_id)
+
+        edited_q = self.tg.messages[q_msg.message_id]
+        self.assertIn("Твой ответ: 7", edited_q.text)
+        self.assertNotIn("Выбери один вариант ниже.", edited_q.text)
+        self.assertIsNone(edited_q.reply_markup)
+
+        # --- Item 6: Books library pagination hidden when single page ---
+        async with async_session_maker() as session:
+            await session.execute(delete(Book))
+            await session.execute(delete(MenuButton).where(MenuButton.section_key == "books"))
+            book = Book(id=1, title="Книга 1", description="Описание книги", url="https://example.com/b1")
+            session.add(book)
+            await session.commit()
+
+        single_page_kb = await keyboards.books_keyboard(page=0)
+        btn_texts = [b.text for row in single_page_kb.inline_keyboard for b in row]
+        self.assertIn("Книга 1", btn_texts)
+        self.assertIn("⬅️ Назад", btn_texts)
+        self.assertFalse(any("1/1" in t for t in btn_texts))
+
+        # --- Item 7: Audio practices send title matching practice title ---
+        async with async_session_maker() as session:
+            med = await session.scalar(select(FunnelMeditation).where(FunnelMeditation.file_type == "audio"))
+            if not med:
+                med = FunnelMeditation(
+                    title="Снятие созависимости 🔗✨",
+                    duration_minutes=15,
+                    file_type="audio",
+                    file_id="TEST_AUDIO_FILE_ID_11",
+                    is_active=True,
+                )
+                session.add(med)
+                await session.commit()
+            med_id = med.id
+            med_title = med.title
+
+        dummy_msg = Message(
+            message_id=self.tg._next_message_id + 1,
+            date=datetime.now(),
+            chat=Chat(id=user_id, type="private"),
+            from_user=TgUser(id=user_id, is_bot=False, first_name="User"),
+            text="/practice",
+        ).as_(self.bot)
+        self.tg.messages[dummy_msg.message_id] = dummy_msg
+        await funnel.send_meditation(dummy_msg, med_id, bot=self.bot)
+        audio_evs = [ev for ev in self.tg.events if ev.get("kind") == "send_audio"]
+        self.assertTrue(len(audio_evs) > 0)
+        self.assertEqual(audio_evs[-1].get("title"), med_title)
+        self.assertEqual(audio_evs[-1].get("performer"), "Виталий Наумов")
+
+        # --- Item 8: Admin funnel settings nurture status plural «выключены» / «включены» ---
+        admin_id = 9502
+        await self._seed_user(user_id=admin_id, is_admin=True)
+        async with async_session_maker() as session:
+            fcfg = await session.get(FunnelConfig, 1)
+            if not fcfg:
+                fcfg = FunnelConfig(id=1, nurture_enabled=False)
+                session.add(fcfg)
+            else:
+                fcfg.nurture_enabled = False
+            await session.commit()
+
+        await self._send_text(admin_id, "/admin")
+        await self._click(admin_id, "admin_funnel_config")
+        cfg_msg = self._latest_chat_message(admin_id)
+        self.assertIn("Напоминания после практики: <b>выключены</b>", cfg_msg.text)
+        self.assertNotIn("Напоминания после практики: <b>выключен</b>", cfg_msg.text)
+
+        async with async_session_maker() as session:
+            fcfg = await session.get(FunnelConfig, 1)
+            fcfg.nurture_enabled = True
+            await session.commit()
+
+        await self._click(admin_id, "admin_funnel_config")
+        cfg_msg2 = self._latest_chat_message(admin_id)
+        self.assertIn("Напоминания после практики: <b>включены</b>", cfg_msg2.text)
+        self.assertNotIn("Напоминания после практики: <b>включён</b>", cfg_msg2.text)

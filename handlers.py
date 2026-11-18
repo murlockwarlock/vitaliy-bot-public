@@ -4281,7 +4281,14 @@ async def ref_create_link(callback: CallbackQuery, bot: Bot):
 
     async with async_session_maker() as session:
         content = await session.get(Content, "referral_link_text")
-        header_text = content.text_content if content and content.text_content else "Твоя реферальная ссылка"
+        header_text = content.text_content if content and content.text_content else "Твоя ссылка для приглашения"
+        if header_text in {
+            "Ваша бонусная ссылка",
+            "🎁 Получить бонус (Ваша ссылка)",
+            "🎁 Получить бонус (Твоя ссылка)",
+            "Твоя реферальная ссылка",
+        }:
+            header_text = "Твоя ссылка для приглашения"
 
     safe_header = html.escape(header_text)
     safe_link = html.escape(link)

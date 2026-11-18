@@ -1451,10 +1451,24 @@ async def send_meditation(target, meditation_id: int, bot=None):
     listen_markup = await configured_meditation_listen_keyboard()
 
     if meditation.file_type == "audio" and meditation.file_id:
+        track_title = (meditation.title or "").strip() or None
         if len(caption) <= 1024:
-            await bot.send_audio(chat_id, meditation.file_id, caption=caption, parse_mode="HTML", reply_markup=listen_markup)
+            await bot.send_audio(
+                chat_id,
+                meditation.file_id,
+                caption=caption,
+                parse_mode="HTML",
+                reply_markup=listen_markup,
+                title=track_title,
+                performer="Виталий Наумов",
+            )
         else:
-            await bot.send_audio(chat_id, meditation.file_id)
+            await bot.send_audio(
+                chat_id,
+                meditation.file_id,
+                title=track_title,
+                performer="Виталий Наумов",
+            )
             await bot.send_message(chat_id, caption, parse_mode="HTML", reply_markup=listen_markup)
     elif meditation.file_type == "video" and meditation.file_id:
         if len(caption) <= 1024:
@@ -2910,7 +2924,7 @@ async def show_admin_funnel_config(target):
         intervals = parse_reminder_intervals(config.reminder_intervals)
         n_touches = len(intervals)
         timeouts_status = "включены" if config.meditation_timeouts_enabled else "выключены"
-        nurture_status = "включён" if config.nurture_enabled else "выключен"
+        nurture_status = "включены" if config.nurture_enabled else "выключены"
         remarketing_status = "включён" if config.remarketing_enabled else "выключен"
         text = (
             f"<b>⚙️ Настройки воронки</b>\n\n"
@@ -3589,7 +3603,12 @@ async def admin_fmed_edit(callback: CallbackQuery, state: FSMContext):
                 if meditation.file_type == "video":
                     await callback.message.answer_video(meditation.file_id, caption="Текущее видео")
                 elif meditation.file_type == "audio":
-                    await callback.message.answer_audio(meditation.file_id, caption="Текущее аудио")
+                    await callback.message.answer_audio(
+                        meditation.file_id,
+                        caption="Текущее аудио",
+                        title=(meditation.title or "").strip() or None,
+                        performer="Виталий Наумов",
+                    )
             except Exception:
                 pass
         if hasattr(callback.message, "answer") and callable(callback.message.answer):

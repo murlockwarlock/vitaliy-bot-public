@@ -1538,7 +1538,7 @@ async def init_db():
             ("journal_intro", "📔 Дневник саморефлексии\n\nЗапиши, что сегодня было важным, и заметь изменения.", None),
             ("closed_club_intro", "Текст 'Закрытый клуб'", None),
             ("referral_intro", "Текст 'Реферальная программа'", None),
-            ("referral_link_text", "🎁 Получить бонус (Твоя ссылка)", None),
+            ("referral_link_text", "Твоя ссылка для приглашения", None),
             ("vitaly_intro", "Текст 'Виталий Наумов'", None),
             ("books_intro", "Текст раздела 'Книги'", None),
             ("extended_menu_intro", "Выбери раздел:", None),
@@ -2262,8 +2262,13 @@ async def run_data_migrations(session: AsyncSession):
         choice_intro.text_content = choice_intro.text_content.replace("Выберите практику", "Выбери практику")
 
     ref_link = await session.get(Content, "referral_link_text")
-    if ref_link and ref_link.text_content == "🎁 Получить бонус (Ваша ссылка)":
-        ref_link.text_content = "🎁 Получить бонус (Твоя ссылка)"
+    if ref_link and (not ref_link.text_content or ref_link.text_content in {
+        "Ваша бонусная ссылка",
+        "🎁 Получить бонус (Ваша ссылка)",
+        "🎁 Получить бонус (Твоя ссылка)",
+        "Твоя реферальная ссылка",
+    }):
+        ref_link.text_content = "Твоя ссылка для приглашения"
 
     disc = await session.get(Content, "disclaimer_text")
     if disc and disc.text_content == "<i>Бот не заменяет консультацию специалиста. Если вы в кризисной ситуации, обратитесь к профессионалу.</i>":

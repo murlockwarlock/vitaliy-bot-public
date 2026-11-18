@@ -59,13 +59,28 @@ from journal_service import (
     get_or_create_journal_settings,
 )
 from time_utils import msk_now
-from universal_tests import QUESTION_TYPE_TEXT, normalize_question_type
+from universal_tests import QUESTION_TYPE_SCALE, QUESTION_TYPE_TEXT, normalize_question_type
 
 logger = logging.getLogger("journal_handlers")
 _quick_note_save_locks: dict[int, asyncio.Lock] = {}
 _quick_note_msg_locks: dict[tuple[int, int], asyncio.Lock] = {}
 _quick_note_handoff_locks: dict[tuple[int, int], asyncio.Lock] = {}
 _QUICK_NOTE_PAGE_SIZE = 10
+
+
+def format_days_ru(days: int) -> str:
+    n = abs(int(days))
+    rem100 = n % 100
+    rem10 = n % 10
+    if 11 <= rem100 <= 19:
+        form = "дней"
+    elif rem10 == 1:
+        form = "день"
+    elif 2 <= rem10 <= 4:
+        form = "дня"
+    else:
+        form = "дней"
+    return f"{days} {form}"
 
 router = Router(name="journal")
 
@@ -365,7 +380,7 @@ async def _render_quick_notes(
         "",
     ])
     if notes:
-        lines.append("Выберите запись, чтобы открыть полный текст:")
+        lines.append("Выбери запись, чтобы открыть полный текст:")
         for note in notes:
             created_at = note.created_at.strftime("%d.%m.%Y %H:%M") if note.created_at else "дата неизвестна"
             preview = " ".join((note.text or "").split())
@@ -1477,9 +1492,28 @@ async def cb_journal_option(callback: CallbackQuery, state: FSMContext, bot: Bot
 
     await callback.answer()
     try:
-        await callback.message.edit_reply_markup(reply_markup=None)
+        q_type = normalize_question_type(question.get("question_type")) if question else None
+        if q_type == QUESTION_TYPE_SCALE:
+            if getattr(callback.message, "html_text", None):
+                base_html = callback.message.html_text
+            else:
+                base_html = html.escape(callback.message.text or "")
+            confirm_line = f"Твой ответ: {html.escape(str(answer_text))}"
+            if "Выбери один вариант ниже." in base_html:
+                updated_html = base_html.replace("Выбери один вариант ниже.", confirm_line)
+            else:
+                updated_html = f"{base_html}\n\n{confirm_line}"
+            if hasattr(callback.message, "edit_text"):
+                await callback.message.edit_text(updated_html, reply_markup=None, parse_mode="HTML")
+            else:
+                await callback.message.edit_reply_markup(reply_markup=None)
+        else:
+            await callback.message.edit_reply_markup(reply_markup=None)
     except Exception:
-        pass
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
     await _continue_after_journal_answer(
         callback.message,
         state,
@@ -1775,7 +1809,7 @@ async def cb_journal_dynamics_menu(callback: CallbackQuery, bot: Bot) -> None:
 
     token8 = uuid.uuid4().hex[:8]
     kb = journal_dynamics_menu_keyboard(token8)
-    text_msg = "📈 <b>Выберите период для анализа динамики</b>:\n\nИИ проанализирует изменения, закономерности и ключевые точки роста."
+    text_msg = "📈 <b>Выбери период для анализа динамики</b>:\n\nИИ проанализирует изменения, закономерности и ключевые точки роста."
     await callback.message.edit_text(text_msg, reply_markup=kb, parse_mode="HTML")
     await callback.answer()
 
@@ -1793,10 +1827,11 @@ async def cb_journal_run_dynamics(callback: CallbackQuery, bot: Bot) -> None:
 
     prefix, token8 = callback.data.split(":")
     days = 7 if prefix == "j_d7" else 21
+    days_label = format_days_ru(days)
     user_id = callback.from_user.id
 
     await callback.answer("⏳ Анализирую динамику...")
-    await callback.message.edit_text(f"⏳ Анализирую ваши записи за {days} дней, пожалуйста, подождите...")
+    await callback.message.edit_text(f"⏳ Анализирую записи за {days_label}, пожалуйста, подожди...")
 
     from ai_integration import generate_journal_dynamics_analysis
     success, result_text = await generate_journal_dynamics_analysis(
@@ -1815,7 +1850,7 @@ async def cb_journal_run_dynamics(callback: CallbackQuery, bot: Bot) -> None:
     if success:
         from md_utils import markdown_to_html, remove_markdown, split_html_message
 
-        formatted_html = f"📈 <b>Анализ динамики за {days} дней</b>:\n\n{markdown_to_html(result_text)}"
+        formatted_html = f"📈 <b>Анализ динамики за {days_label}</b>:\n\n{markdown_to_html(result_text)}"
         chunks = split_html_message(formatted_html, 4090) or [formatted_html]
         for idx, chunk in enumerate(chunks):
             markup = kb if idx == len(chunks) - 1 else None
@@ -1825,7 +1860,7 @@ async def cb_journal_run_dynamics(callback: CallbackQuery, bot: Bot) -> None:
                 else:
                     await bot.send_message(chat_id, chunk, reply_markup=markup, parse_mode="HTML")
             except Exception:
-                plain_text = f"📈 Анализ динамики за {days} дней:\n\n{remove_markdown(result_text)}"
+                plain_text = f"📈 Анализ динамики за {days_label}:\n\n{remove_markdown(result_text)}"
                 plain_chunks = split_html_message(plain_text, 4090) or [plain_text]
                 fallback_chunk = plain_chunks[min(idx, len(plain_chunks) - 1)]
                 if idx == 0:
