@@ -1838,12 +1838,13 @@ async def start_strategy_session(target, state: FSMContext, bot=None, *, origin:
         funnel_state.strategy_origin = "funnel" if origin == "funnel" else "main"
         await set_stage(session, funnel_state, "strategy_chat", active=True, reminder_enabled=True)
         await register_event(session, user_id, "strategy_chat", "strategy_chat_started", meditation_id=funnel_state.meditation_id)
-        intro = await session.get(Content, "strategy_session_intro")
+        intro = await session.get(Content, "strategy_session_intro", options=[selectinload(Content.media)])
         first_message = (
-            f"{intro.text_content if intro else ''}\n\n"
-            "Знаком(а) ли ты уже с Виталием и методом Транскоучинг? "
-            "И какой запрос тебе хочется прояснить на стратегической сессии?"
-        ).strip()
+            (intro.text_content or "").strip()
+            if intro and intro.text_content and intro.text_content.strip()
+            else "Это диалог про стратегическую сессию. Напиши, что тебя волнует, или задай вопрос о формате."
+        )
+        intro_media = list(intro.media) if intro and intro.media else None
         session.add(DBMessage(
             user_id=user_id,
             dialogue_id=dialogue_id,
@@ -1855,7 +1856,7 @@ async def start_strategy_session(target, state: FSMContext, bot=None, *, origin:
 
     await state.set_state(FunnelStates.strategy_chat)
     await state.update_data(strategy_dialogue_id=dialogue_id)
-    await send_content(target, first_message, None, await configured_strategy_offer_keyboard(origin == "funnel"), bot)
+    await send_content(target, first_message, intro_media, await configured_strategy_offer_keyboard(origin == "funnel"), bot)
 
 
 async def open_landing(

@@ -74,8 +74,16 @@ from content_service import invalidate_content_cache
 from database import (
     AIConfig,
     Base,
+    Content,
+    Habit,
+    JOURNAL_NOTE_DEFAULT_PROMPT,
+    JournalAnswer,
+    JournalEntry,
+    JournalQuestion,
+    MenuButton,
     Message as DBMessage,
     PaymentConfig,
+    QuickNote,
     TestAttempt,
     TestQuestion,
     TestSet,
@@ -367,6 +375,7 @@ class TopicLifecycleAndSettingsE2ETests(unittest.IsolatedAsyncioTestCase):
         for r in self._ROUTERS:
             r._parent_router = None
         await self.bot.session.close()
+        await engine.dispose()
 
     async def _seed_user(
         self,
@@ -1036,6 +1045,11 @@ class TopicLifecycleAndSettingsE2ETests(unittest.IsolatedAsyncioTestCase):
         await self._seed_user(user_id)
 
         async with async_session_maker() as session:
+            intro_row = await session.get(Content, "strategy_session_intro")
+            intro_row.text_content = (
+                "Это разговор о стратегической сессии: помогу понять, нужна ли она тебе сейчас "
+                "и с каким запросом на неё идти."
+            )
             sleep_cfg = await session.scalar(select(TopicDialogueConfig).where(TopicDialogueConfig.topic_slug == "sleep_recovery"))
             sleep_cfg.welcome_text = "🌙 Сон и восстановление. Посмотрим, что мешает отдыхать."
             sleep_cfg.reset_dialogue_on_entry = False
@@ -1043,13 +1057,16 @@ class TopicLifecycleAndSettingsE2ETests(unittest.IsolatedAsyncioTestCase):
             sleep_cfg.start_dialogue_button_text = "Начать"
             sleep_cfg.prerecorded_first_message = "Что сейчас происходит со сном?"
             await session.commit()
+        invalidate_content_cache()
 
-        # Part A: Strategy session from main menu
+        # Part A: Strategy session from main menu uses strategy_session_intro without hardcoded question
         await self._send_text(user_id, "/menu")
         await self._click(user_id, "menu_strategy_session")
         self.assertEqual(await self._state_of(user_id), "FunnelStates:strategy_chat")
         strat_msg = self._latest_chat_message(user_id)
-        self.assertIn("Транскоучинг", strat_msg.text or "")
+        self.assertIn("Это разговор о стратегической сессии", strat_msg.text or "")
+        self.assertNotIn("Знаком(а) ли ты уже с Виталием", strat_msg.text or "")
+        self.assertNotIn("методом Транскоучинг", strat_msg.text or "")
         strat_cbs = [cb for _, cb, _ in _extract_buttons(strat_msg.reply_markup)]
         self.assertIn("funnel_open_landing", strat_cbs)
         self.assertIn("funnel_to_main", strat_cbs)
@@ -1314,3 +1331,360 @@ class TopicLifecycleAndSettingsE2ETests(unittest.IsolatedAsyncioTestCase):
                 or (e["kind"] == "callback_answer" and e.get("text"))
             ]
             self.assertTrue(visible_effects, f"Admin callback '{cb_data}' produced silence!")
+
+    # =========================================================================
+    # 8. TZ v4 ADDITIONS: JOURNAL DYNAMICS (#4-#5), ADMIN DUPLICATES (#8),
+    #    OPERATIONAL QUICK NOTES AI & CRISIS SAFETY (#9), HABITS (#11-#12)
+    # =========================================================================
+
+    async def test_journal_dynamics_markdown_html_and_14_question_context(self):
+        from journal_service import build_journal_dynamics_context
+
+        user_id = 700201
+        await self._seed_user(user_id)
+        today = msk_now().date()
+
+        q_texts = [
+            "Какие цели выполнил(а)?",
+            "Удовлетворённость продуктивностью 1–10",
+            "Что нужно для 10 в продуктивности?",
+            "Какой ресурс поможет в целях?",
+            "Чему новому научился(ась)?",
+            "Удовлетворённость обучением 1–10",
+            "Что нужно для 10 в обучении?",
+            "Какой ресурс поможет в обучении?",
+            "Какие эмоции испытывал(а)?",
+            "Удовлетворённость эмоциями 1–10",
+            "Что нужно для 10 в эмоциях?",
+            "Какой ресурс поддержит эмоционально?",
+            "Метафора сегодняшнего дня",
+            "Три простых первых шага (1–25 мин)",
+        ]
+        async with async_session_maker() as session:
+            await session.execute(database.text("DELETE FROM journal_questions"))
+            for idx, q_text in enumerate(q_texts, start=1):
+                session.add(JournalQuestion(order_num=idx, text=q_text, is_active=True))
+            e1 = JournalEntry(
+                user_id=user_id,
+                reflection_date=today - timedelta(days=1),
+                status="completed",
+                questions_snapshot_json="[]",
+                summary_text="Спокойный рабочий день.",
+                tomorrow_focus="Лечь спать до 23:00",
+                metadata_json='{"keep":["служебный_ключ_keep"],"gratitude":[]}',
+            )
+            e2 = JournalEntry(
+                user_id=user_id,
+                reflection_date=today,
+                status="completed",
+                questions_snapshot_json="[]",
+                summary_text="Больше энергии и ясности.",
+                metadata_json='{"keep":["второй_keep"],"let_go":["let_go_val"],"gratitude":[]}',
+            )
+            session.add_all([e1, e2])
+            await session.flush()
+            session.add_all([
+                JournalAnswer(entry_id=e1.id, position=1, question_text_snapshot=q_texts[0], answer_text="Закрыл отчёт"),
+                JournalAnswer(entry_id=e1.id, position=2, question_text_snapshot=q_texts[1], answer_text="6"),
+                JournalAnswer(entry_id=e1.id, position=13, question_text_snapshot=q_texts[12], answer_text="Туманное утро", is_skipped=False),
+                JournalAnswer(entry_id=e1.id, position=14, question_text_snapshot=q_texts[13], answer_text="", is_skipped=True),
+                JournalAnswer(entry_id=e2.id, position=1, question_text_snapshot=q_texts[0], answer_text="Провёл переговоры"),
+                JournalAnswer(entry_id=e2.id, position=2, question_text_snapshot=q_texts[1], answer_text="8"),
+                JournalAnswer(entry_id=e2.id, position=13, question_text_snapshot=q_texts[12], answer_text="Чистый горизонт"),
+                JournalAnswer(entry_id=e2.id, position=14, question_text_snapshot=q_texts[13], answer_text="10 минут прогулки сегодня"),
+            ])
+            await session.commit()
+
+            user_prompt, _, count = await build_journal_dynamics_context(session, user_id, days=21)
+
+        self.assertEqual(count, 2)
+        self.assertIn("14 вопросов", user_prompt)
+        self.assertIn("Закрыл отчёт", user_prompt)
+        self.assertIn("Чистый горизонт", user_prompt)
+        self.assertIn("10 минут прогулки сегодня", user_prompt)
+        self.assertNotIn("служебный_ключ_keep", user_prompt)
+        self.assertNotIn("let_go_val", user_prompt)
+        self.assertNotIn("источники благодарности", user_prompt)
+
+        await self._send_text(user_id, "/menu")
+        await self._click(user_id, "mode_journal")
+        await self._click(user_id, "j_dyn_menu")
+        dyn_menu = self._latest_chat_message(user_id)
+        d21_cb = next(cb for _, cb, _ in _extract_buttons(dyn_menu.reply_markup) if cb.startswith("j_d21:"))
+
+        raw_md = (
+            "## Что повторяется\n\n"
+            "- **Продуктивность** выросла с *6* до **8**\n"
+            "- Метафора сменилась с «тумана» на **чистый горизонт**"
+        )
+        with patch("ai_integration.generate_journal_dynamics_analysis", new=AsyncMock(return_value=(True, raw_md))):
+            await self._click(user_id, d21_cb, message_id=dyn_menu.message_id)
+
+        rendered = self._latest_chat_message(user_id)
+        self.assertIn("<b>Что повторяется</b>", rendered.text or "")
+        self.assertIn("• <b>Продуктивность</b>", rendered.text or "")
+        self.assertIn("<i>6</i>", rendered.text or "")
+        self.assertNotIn("## ", rendered.text or "")
+        self.assertNotIn("**", rendered.text or "")
+
+    async def test_admin_hides_legacy_duplicate_topics_preserving_db_and_exposes_journal_note(self):
+        editor_id = 700202
+        client_id = 700203
+        await self._seed_user(editor_id, is_admin=True, admin_role=AdminRole.CONTENT_EDITOR.value)
+        await self._seed_user(client_id)
+
+        async with async_session_maker() as session:
+            session.add_all([
+                Topic(slug="sleep", name="Сон и восстановление", system_prompt="Старый промпт сна"),
+                Topic(slug="motivation", name="Мотивация и цели", system_prompt="Старый промпт мотивации"),
+                Topic(slug="emotions", name="Эмоциональный интеллект", system_prompt="Старый промпт эмоций"),
+                DBMessage(user_id=client_id, dialogue_id=1, role="user", content="Архив сна", topic_slug="sleep"),
+            ])
+            await session.commit()
+            thematic_btn = await session.scalar(
+                select(MenuButton).where(MenuButton.section_key == "thematic").limit(1)
+            )
+            thematic_btn_id = thematic_btn.id if thematic_btn else None
+
+        await self._send_text(editor_id, "/admin")
+        await self._click(editor_id, "admin_topics_list_0")
+        page0_cbs = [cb for _, cb, _ in _extract_buttons(self._latest_chat_message(editor_id).reply_markup)]
+        await self._click(editor_id, "admin_topics_list_1")
+        page1_cbs = [cb for _, cb, _ in _extract_buttons(self._latest_chat_message(editor_id).reply_markup)]
+        all_topic_cbs = set(page0_cbs + page1_cbs)
+
+        # Canonical working slugs & journal_note are visible; legacy duplicate slugs are hidden
+        self.assertIn("edit_topic_sleep_recovery", all_topic_cbs)
+        self.assertIn("edit_topic_motivation_goals", all_topic_cbs)
+        self.assertIn("edit_topic_emotional_intelligence", all_topic_cbs)
+        self.assertIn("edit_topic_journal_note", all_topic_cbs)
+        self.assertNotIn("edit_topic_sleep", all_topic_cbs)
+        self.assertNotIn("edit_topic_motivation", all_topic_cbs)
+        self.assertNotIn("edit_topic_emotions", all_topic_cbs)
+
+        if thematic_btn_id is not None:
+            await self._click(editor_id, f"admin_menu_button_topic:{thematic_btn_id}")
+            picker_cbs = [cb for _, cb, _ in _extract_buttons(self._latest_chat_message(editor_id).reply_markup)]
+            self.assertTrue(any(cb.endswith(":sleep_recovery") for cb in picker_cbs))
+            self.assertFalse(any(cb.endswith(":sleep") for cb in picker_cbs))
+            self.assertFalse(any(cb.endswith(":motivation") for cb in picker_cbs))
+            self.assertFalse(any(cb.endswith(":emotions") for cb in picker_cbs))
+            self.assertFalse(any(cb.endswith(":journal_note") for cb in picker_cbs))
+
+        # Admin can open and edit `journal_note` prompt
+        await self._click(editor_id, "edit_topic_journal_note")
+        note_card = self._latest_chat_message(editor_id)
+        self.assertIn("<code>journal_note</code>", note_card.text or "")
+
+        # DB rows & user history on legacy topics remain 100% intact
+        async with async_session_maker() as session:
+            for legacy_slug in ("sleep", "motivation", "emotions"):
+                self.assertIsNotNone(await session.scalar(select(Topic).where(Topic.slug == legacy_slug)))
+            preserved_msgs = await session.scalar(
+                select(func.count(DBMessage.id)).where(DBMessage.user_id == client_id, DBMessage.topic_slug == "sleep")
+            )
+            self.assertEqual(preserved_msgs, 1)
+
+    async def test_quick_notes_ai_breakdown_crisis_on_save_data_tags_and_free_session_continuation(self):
+        user_id = 700204
+        crisis_user_id = 700205
+        await self._seed_user(user_id)
+        await self._seed_user(crisis_user_id)
+
+        # 9.1: Silent save -> "✅ Запись сохранена." + 3 buttons (AI is NOT called on save)
+        await self._send_text(user_id, "/menu")
+        await self._click(user_id, "mode_journal")
+        await self._click(user_id, "quick_notes")
+        await self._click(user_id, "quick_note_new:0")
+
+        with patch("ai_integration._generate_chat_response", new=AsyncMock()) as mock_llm_on_save:
+            await self._send_text(user_id, "Сорвался на коллегу из-за сроков, внутри злость и усталость.")
+            mock_llm_on_save.assert_not_awaited()
+
+        saved_msg = self._latest_chat_message(user_id)
+        self.assertEqual(saved_msg.text, "✅ Запись сохранена.")
+        saved_btns = [(lbl, cb) for lbl, cb, _ in _extract_buttons(saved_msg.reply_markup)]
+        self.assertEqual(
+            [lbl for lbl, _ in saved_btns],
+            ["💬 Разобрать с ИИ", "➕ Ещё запись", "⬅️ В дневник"],
+        )
+        ai_cb = saved_btns[0][1]
+        self.assertTrue(ai_cb.startswith("quick_note_ai:"))
+
+        # 9.5: Opened note in list also has "💬 Разобрать с ИИ"
+        note_id = int(ai_cb.split(":")[1])
+        await self._click(user_id, f"quick_note_view:{note_id}:0")
+        detail_msg = self._latest_chat_message(user_id)
+        detail_btns = [lbl for lbl, _, _ in _extract_buttons(detail_msg.reply_markup)]
+        self.assertIn("💬 Разобрать с ИИ", detail_btns)
+
+        # 9.2: Click "💬 Разобрать с ИИ" -> uses journal_note prompt, shows "💬 Продолжить с ИИ-Виталием" · "⬅️ В дневник"
+        captured_messages = []
+
+        async def _fake_note_llm(ai_cfg, client, model, messages, **kwargs):
+            captured_messages.extend(messages)
+            return SimpleNamespace(
+                text=(
+                    "Ты сорвался из-за дедлайна и сейчас чувствуешь злость вместе с усталостью. "
+                    "Похоже, за этим стоит потребность в предсказуемости и передышке. "
+                    "В какой момент сегодня усталость стала выше твоей планки?"
+                ),
+                raw_payload={},
+                http_status=200,
+                finish_reason="stop",
+                diagnostics={},
+            )
+
+        with patch("ai_integration._generate_chat_response", side_effect=_fake_note_llm):
+            await self._click(user_id, ai_cb, message_id=detail_msg.message_id)
+
+        self.assertTrue(any(JOURNAL_NOTE_DEFAULT_PROMPT[:80] in (m.get("content") or "") for m in captured_messages))
+        ai_reply_msg = self._latest_chat_message(user_id)
+        self.assertIn("потребность в предсказуемости", ai_reply_msg.text or "")
+        ai_reply_btns = [(lbl, cb) for lbl, cb, _ in _extract_buttons(ai_reply_msg.reply_markup)]
+        self.assertEqual(
+            [lbl for lbl, _ in ai_reply_btns],
+            ["💬 Продолжить с ИИ-Виталием", "⬅️ В дневник"],
+        )
+        cont_cb = ai_reply_btns[0][1]
+        self.assertTrue(cont_cb.startswith("quick_note_cont:"))
+
+        # Click "💬 Продолжить с ИИ-Виталием" -> enters free_session with note + AI reply in context
+        await self._click(user_id, cont_cb, message_id=ai_reply_msg.message_id)
+        self.assertEqual(await self._state_of(user_id), "UserStates:chatting")
+
+        free_captured = []
+
+        async def _fake_free_llm(ai_cfg, client, model, messages, **kwargs):
+            free_captured.extend(messages)
+            return SimpleNamespace(
+                text="Слышу, что перегрузка накопилась ещё с утра. Что могло бы дать тебе 15 минут тишины?",
+                raw_payload={},
+                http_status=200,
+                finish_reason="stop",
+                diagnostics={},
+            )
+
+        with patch("ai_integration._generate_chat_response", side_effect=_fake_free_llm):
+            await self._send_text(user_id, "Да, усталость накопилась ещё с утра.")
+
+        joined_ctx = "\n".join(str(m.get("content") or "") for m in free_captured)
+        self.assertIn("Сорвался на коллегу из-за сроков", joined_ctx)
+        self.assertIn("потребность в предсказуемости", joined_ctx)
+        self.assertIn("усталость накопилась ещё с утра", joined_ctx)
+
+        # 9.3: <DATA> clinical_detected & crisis_detected in AI response
+        await self._click(user_id, "quick_note_new:0")
+        await self._send_text(user_id, "Стоит ли мне пить антидепрессанты без рецепта?")
+        med_saved = self._latest_chat_message(user_id)
+        med_ai_cb = [cb for _, cb, _ in _extract_buttons(med_saved.reply_markup)][0]
+
+        async def _fake_clinical_llm(*args, **kwargs):
+            return SimpleNamespace(
+                text='Вопросы о лекарствах лучше обсудить с врачом.\n<DATA>{"events":["clinical_detected"]}</DATA>',
+                raw_payload={},
+                http_status=200,
+                finish_reason="stop",
+                diagnostics={},
+            )
+
+        with patch("ai_integration._generate_chat_response", side_effect=_fake_clinical_llm), patch(
+            "ai_integration.schedule_automation_events"
+        ) as mock_sched_clin:
+            await self._click(user_id, med_ai_cb, message_id=med_saved.message_id)
+
+        clin_msg = self._latest_chat_message(user_id)
+        self.assertIn("обсудить с врачом", clin_msg.text or "")
+        self.assertNotIn("<DATA>", clin_msg.text or "")
+        self.assertTrue(
+            any("clinical_detected" in (call.kwargs.get("events") or ()) for call in mock_sched_clin.call_args_list)
+        )
+
+        # 9.3b: Indirect risk note where AI emits <DATA>{"events":["crisis_detected"]}</DATA> -> contacts + flag + alert
+        await self._click(user_id, "mode_journal")
+        await self._click(user_id, "quick_notes")
+        await self._click(user_id, "quick_note_new:0")
+        await self._send_text(user_id, "Иногда хочется просто исчезнуть и не просыпаться.")
+        ind_saved = self._latest_chat_message(user_id)
+        ind_ai_cb = [cb for _, cb, _ in _extract_buttons(ind_saved.reply_markup)][0]
+
+        async def _fake_ai_crisis_llm(*args, **kwargs):
+            return SimpleNamespace(
+                text='Слышу, как тебе сейчас тяжело. Ты сейчас в безопасности? Напиши живому человеку рядом.\n<DATA>{"events":["crisis_detected"]}</DATA>',
+                raw_payload={},
+                http_status=200,
+                finish_reason="stop",
+                diagnostics={},
+            )
+
+        with patch("ai_integration._generate_chat_response", side_effect=_fake_ai_crisis_llm), patch(
+            "ai_integration.schedule_automation_events"
+        ) as mock_sched_ai_crisis:
+            ev_ai_crisis = await self._click(user_id, ind_ai_cb, message_id=ind_saved.message_id)
+
+        ai_crisis_texts = [e["text"] for e in ev_ai_crisis if e["kind"] == "send_message"]
+        self.assertTrue(any("Ты сейчас в безопасности?" in t and "<DATA>" not in t for t in ai_crisis_texts))
+        self.assertTrue(any("112" in t and "8-800-100-49-94" in t for t in ai_crisis_texts))
+        self.assertTrue(
+            any("crisis_detected" in (call.kwargs.get("events") or ()) for call in mock_sched_ai_crisis.call_args_list)
+        )
+        async with async_session_maker() as session:
+            u_after_ai_crisis = await session.get(User, user_id)
+            self.assertIsNotNone(u_after_ai_crisis.crisis_detected_at)
+
+        # 9.4 (MANDATORY): Crisis marker detected IMMEDIATELY upon saving operational note without clicking AI
+        await self._send_text(crisis_user_id, "/menu")
+        await self._click(crisis_user_id, "mode_journal")
+        await self._click(crisis_user_id, "quick_notes")
+        await self._click(crisis_user_id, "quick_note_new:0")
+
+        with patch("ai_integration.schedule_automation_events") as mock_sched_crisis:
+            ev_crisis_save = await self._send_text(crisis_user_id, "Мне незачем жить, хочу покончить с собой")
+
+        sent_texts = [e["text"] for e in ev_crisis_save if e["kind"] == "send_message"]
+        self.assertTrue(any("✅ Запись сохранена." in t for t in sent_texts))
+        self.assertTrue(any("112" in t and "8-800-100-49-94" in t for t in sent_texts))
+        self.assertTrue(
+            any("crisis_detected" in (call.kwargs.get("events") or ()) for call in mock_sched_crisis.call_args_list)
+        )
+        async with async_session_maker() as session:
+            flagged_user = await session.get(User, crisis_user_id)
+            self.assertIsNotNone(flagged_user.crisis_detected_at)
+
+    async def test_habits_manual_time_change_buttons_and_empty_my_habits_screen(self):
+        user_id = 700206
+        await self._seed_user(user_id)
+
+        # #12: Empty "Мои привычки" shows clear empty state + buttons (not silent!)
+        await self._send_text(user_id, "/menu")
+        await self._click(user_id, "mode_habits")
+        habits_menu = self._latest_chat_message(user_id)
+        ev_empty = await self._click(user_id, "habit_my_list", message_id=habits_menu.message_id)
+        self.assertTrue(any(e["kind"] in {"edit_text", "send_message"} for e in ev_empty))
+        empty_msg = self._latest_chat_message(user_id)
+        self.assertIn("Пока нет привычек", empty_msg.text or "")
+        empty_cbs = [cb for _, cb, _ in _extract_buttons(empty_msg.reply_markup)]
+        self.assertIn("habit_open_catalog", empty_cbs)
+        self.assertIn("habit_create_new", empty_cbs)
+        self.assertIn("mode_habits", empty_cbs)
+
+        # #11: Manual habit time edit includes "📋 Мои привычки" and "⬅️ В раздел привычек"
+        async with async_session_maker() as session:
+            h = Habit(user_id=user_id, name="Чтение 20 минут", time_target="09:00", is_active=True)
+            session.add(h)
+            await session.commit()
+            habit_id = h.id
+
+        await self._click(user_id, "habit_my_list", message_id=empty_msg.message_id)
+        await self._click(user_id, f"habit_edit_time_{habit_id}")
+        await self._send_text(user_id, "21:30")
+        done_msg = self._latest_chat_message(user_id)
+        self.assertIn("21:30", done_msg.text or "")
+        done_btns = [(lbl, cb) for lbl, cb, _ in _extract_buttons(done_msg.reply_markup)]
+        self.assertEqual(
+            done_btns,
+            [
+                ("📋 Мои привычки", "habit_my_list"),
+                ("⬅️ В раздел привычек", "mode_habits"),
+            ],
+        )

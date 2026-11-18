@@ -2678,6 +2678,23 @@ async def cb_accept_disclaimer(callback: CallbackQuery, state: FSMContext, bot: 
     elif flow_type == "journal_start":
         from journal_handlers import handle_journal_start
         await handle_journal_start(event=callback, bot=bot, state=state)
+    elif flow_type == "quick_note_ai":
+        from journal_handlers import run_quick_note_ai_analysis
+        await run_quick_note_ai_analysis(
+            callback,
+            bot,
+            note_id=int(payload.get("note_id", 0)),
+            page=int(payload.get("page", 0)),
+        )
+    elif flow_type == "quick_note_cont":
+        from journal_handlers import run_quick_note_continue_in_free_session
+        await run_quick_note_continue_in_free_session(
+            callback,
+            state,
+            bot,
+            note_id=int(payload.get("note_id", 0)),
+            asst_msg_id=int(payload.get("asst_msg_id", 0)),
+        )
     else:
         await send_main_menu(callback, bot=bot)
 
@@ -3504,13 +3521,20 @@ async def habit_edit_time_manual_input(message: Message, state: FSMContext):
     data = await state.get_data()
     name = await _set_habit_time(message.from_user.id, data.get("habit_id"), time_target)
     if name is None:
-        await message.answer("❌ Привычка не найдена.")
+        err_kb = InlineKeyboardBuilder()
+        err_kb.button(text="⬅️ В раздел привычек", callback_data="mode_habits")
+        await message.answer("❌ Привычка не найдена.", reply_markup=err_kb.as_markup())
         await state.clear()
         return
     await state.clear()
+    nav_kb = InlineKeyboardBuilder()
+    nav_kb.button(text="📋 Мои привычки", callback_data="habit_my_list")
+    nav_kb.button(text="⬅️ В раздел привычек", callback_data="mode_habits")
+    nav_kb.adjust(1)
     await message.answer(
         f"✅ Для привычки <b>«{html.escape(name)}»</b> установлено время <b>{time_target}</b>.",
         parse_mode="HTML",
+        reply_markup=nav_kb.as_markup(),
     )
 
 
@@ -3524,9 +3548,26 @@ async def habit_my_list(callback: CallbackQuery, bot: Bot):
             select(Habit).where(Habit.user_id == callback.from_user.id).order_by(Habit.time_target)
         )
         habits = habits.scalars().all()
+        conf = await session.get(HabitConfig, 1)
+        habit_mode = conf.mode if conf and conf.mode else "hybrid"
 
     if not habits:
-        await mode_habits(callback, bot)
+        empty_builder = InlineKeyboardBuilder()
+        if habit_mode in {"catalog", "hybrid"}:
+            empty_builder.button(text="📂 Выбрать из каталога", callback_data="habit_open_catalog")
+        if habit_mode in {"custom", "hybrid"}:
+            empty_builder.button(text="➕ Создать свою", callback_data="habit_create_new")
+        empty_builder.button(text="⬅️ В раздел привычек", callback_data="mode_habits")
+        empty_builder.adjust(1)
+        if habit_mode == "catalog":
+            empty_text = "📋 <b>Мои привычки</b>\n\nПока нет привычек. Выбери из каталога."
+        elif habit_mode == "custom":
+            empty_text = "📋 <b>Мои привычки</b>\n\nПока нет привычек. Создай свою."
+        else:
+            empty_text = "📋 <b>Мои привычки</b>\n\nПока нет привычек. Выбери из каталога или создай свою."
+        await send_smart_content(callback, empty_text, None, empty_builder.as_markup(), bot)
+        if callback.data == "habit_my_list":
+            await callback.answer()
         return
 
     timezone_text = format_habit_timezone(user.habit_timezone if user else None)
@@ -3546,6 +3587,8 @@ async def habit_my_list(callback: CallbackQuery, bot: Bot):
     builder.adjust(1)
 
     await send_smart_content(callback, text, None, builder.as_markup(), bot)
+    if callback.data == "habit_my_list":
+        await callback.answer()
 
 
 def habit_delete_confirmation_text(name: str) -> str:
@@ -4991,8 +5034,13 @@ async def admin_menu_button_topic_picker(callback: CallbackQuery):
     if not button or button.section_key != "thematic":
         await callback.answer("Выбор темы доступен только для тематических кнопок.", show_alert=True)
         return
+    visible_topics = [
+        t
+        for t in filter_visible_admin_topics(topics, keep_slug=button.topic_slug)
+        if t.slug != "journal_note" or t.slug == button.topic_slug
+    ]
     builder = InlineKeyboardBuilder()
-    for topic in topics:
+    for topic in visible_topics:
         marker = "✅ " if topic.slug == button.topic_slug else ""
         paid = "платная" if topic.is_paid else "бесплатная"
         builder.button(
@@ -5903,9 +5951,30 @@ TOPIC_ADMIN_SECTION_SLUGS = {
         "motivation_goals",
         "emotional_intelligence",
     ),
-    "journal": ("journal",),
+    "journal": ("journal", "journal_note"),
     "non_ai": ("habits",),
 }
+LEGACY_DUPLICATE_TOPIC_REPLACEMENTS = {
+    "sleep": "sleep_recovery",
+    "motivation": "motivation_goals",
+    "emotions": "emotional_intelligence",
+}
+
+
+def filter_visible_admin_topics(topics, *, keep_slug: str | None = None) -> list:
+    present_slugs = {
+        str(getattr(topic, "slug", "") or "").strip()
+        for topic in topics
+    }
+    keep_norm = str(keep_slug or "").strip()
+    visible = []
+    for topic in topics:
+        slug = str(getattr(topic, "slug", "") or "").strip()
+        replacement = LEGACY_DUPLICATE_TOPIC_REPLACEMENTS.get(slug)
+        if replacement and replacement in present_slugs and slug != keep_norm:
+            continue
+        visible.append(topic)
+    return visible
 
 
 def classify_topic_admin_section(topic) -> str:
@@ -5925,7 +5994,7 @@ def group_topics_for_admin(topics) -> dict[str, list]:
         for section, slugs in TOPIC_ADMIN_SECTION_SLUGS.items()
         for index, slug in enumerate(slugs)
     }
-    for topic in topics:
+    for topic in filter_visible_admin_topics(topics):
         grouped[classify_topic_admin_section(topic)].append(topic)
     for section, topics_in_section in grouped.items():
         topics_in_section.sort(

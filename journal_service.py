@@ -939,28 +939,71 @@ async def build_journal_dynamics_context(
     if len(entries) < 2:
         return "", "", len(entries)
 
+    entry_ids = [e.id for e in entries]
+    answers_stmt = (
+        select(JournalAnswer)
+        .where(JournalAnswer.entry_id.in_(entry_ids))
+        .order_by(JournalAnswer.entry_id.asc(), JournalAnswer.position.asc())
+    )
+    all_answers = (await session.scalars(answers_stmt)).all()
+    answers_by_entry: dict[int, list[JournalAnswer]] = {}
+    for ans in all_answers:
+        answers_by_entry.setdefault(ans.entry_id, []).append(ans)
+
+    active_questions = (
+        await session.scalars(
+            select(JournalQuestion)
+            .where(JournalQuestion.is_active == True)
+            .order_by(JournalQuestion.order_num.asc(), JournalQuestion.id.asc())
+        )
+    ).all()
+
+    questionnaire_header = ""
+    if active_questions:
+        q_lines = [f"{idx}. {q.text}" for idx, q in enumerate(active_questions, start=1)]
+        questionnaire_header = (
+            f"Актуальная структура анкеты дневника ({len(active_questions)} вопросов):\n"
+            + "\n".join(q_lines)
+            + "\n\n"
+        )
+
     lines = []
     for e in entries:
-        day_block = f"Дата: {e.reflection_date}"
-        if e.summary_text:
-            day_block += f"\nИтог дня: {e.summary_text}"
-        if e.metadata_json and e.metadata_json != "{}":
-            day_block += f"\nТеги и метаданные: {e.metadata_json}"
-        lines.append(day_block)
+        day_lines = [f"Дата: {e.reflection_date}"]
+        entry_answers = answers_by_entry.get(e.id, [])
+        skipped_positions: list[str] = []
+        for ans in entry_answers:
+            if ans.is_skipped:
+                skipped_positions.append(str(ans.position))
+                continue
+            if ans.answer_text and ans.answer_text.strip():
+                day_lines.append(
+                    f"Вопрос {ans.position} ({ans.question_text_snapshot}): {ans.answer_text.strip()}"
+                )
+        if skipped_positions:
+            day_lines.append(f"Пропущены вопросы №: {', '.join(skipped_positions)}")
+        if e.summary_text and e.summary_text.strip():
+            day_lines.append(f"Итог дня: {e.summary_text.strip()}")
+        if e.tomorrow_focus and e.tomorrow_focus.strip():
+            day_lines.append(f"Фокус на завтра: {e.tomorrow_focus.strip()}")
+        lines.append("\n".join(day_lines))
 
     history_block = "\n---\n".join(lines)
     user_prompt = (
         f"Анализ динамики саморефлексии пользователя за период последних {days} дней "
-        f"(с {start_date} по {today}, завершено записей: {len(entries)}):\n\n"
-        f"{history_block}\n\n"
-        "Проведи глубокий, поддерживающий анализ динамики за этот период:\n"
-        "- повторяющиеся темы и фокусы внимания;\n"
-        "- эмоциональные изменения и паттерны переживаний;\n"
-        "- источники благодарности и ресурса;\n"
-        "- ключевые события и уроки;\n"
-        "- позитивные сдвиги и точки опоры;\n"
-        "- бережные рекомендации и один конкретный бережный фокус на следующий период.\n\n"
-        "Категорически запрещено: ставить диагнозы, выдумывать несуществующие тренды, давать категоричные советы."
+        f"(с {start_date} по {today}, завершено записей: {len(entries)}).\n\n"
+        f"{questionnaire_header}"
+        f"ЗАПИСИ ПОЛЬЗОВАТЕЛЯ ЗА ПЕРИОД:\n\n{history_block}\n\n"
+        "Проведи бережный, поддерживающий анализ динамики на «ты», опираясь ТОЛЬКО на реальные ответы и итоги выше:\n"
+        "- повторяющиеся темы и динамика по блокам анкеты (цели и продуктивность, обучение и новое, эмоции и оценки по шкалам 1–10, если они заполнены);\n"
+        "- какие внутренние ресурсы, опоры и условия движения к 10/10 человек сам называет;\n"
+        "- как меняются метафоры дня и какие простые первые шаги намечаются;\n"
+        "- один бережный и конкретный фокус внимания на следующий период.\n\n"
+        "Строгие правила:\n"
+        "- Категорически запрещено упоминать служебные имена полей или ключей (keep, let_go, gratitude, metadata и т.п.).\n"
+        "- Не упрекай и не оценивай пользователя за пропущенные вопросы или за отсутствие тем, которых нет в актуальной анкете (например, отдельного поля благодарности).\n"
+        "- Не додумывай факты, выводы или тренды, которых нет в приведённых ответах.\n"
+        "- Не ставь диагнозов и не давай категоричных директивных советов."
     )
 
     topic = await session.scalar(select(Topic).where(Topic.slug == "journal"))

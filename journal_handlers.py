@@ -21,7 +21,9 @@ from database import (
     JournalEntry,
     JournalQuestion,
     JournalSettings,
+    Message as DBMessage,
     QuickNote,
+    Topic,
     User,
     async_session_maker,
 )
@@ -38,8 +40,10 @@ from journal_keyboards import (
     journal_question_keyboard,
     journal_reminder_time_keyboard,
     journal_snooze_menu_keyboard,
+    quick_note_ai_result_keyboard,
     quick_note_detail_keyboard,
     quick_note_input_keyboard,
+    quick_note_saved_keyboard,
     quick_notes_keyboard,
     configured_journal_entry_keyboard,
     configured_journal_menu_keyboard,
@@ -451,7 +455,7 @@ async def cb_quick_note_view(
             f"📅 <b>Дата и время:</b> {html.escape(created_at)}\n\n"
             f"{html.escape(chunk)}"
         )
-        markup = quick_note_detail_keyboard(page) if index == len(chunks) - 1 else None
+        markup = quick_note_detail_keyboard(page, note_id=note.id) if index == len(chunks) - 1 else None
         if index == 0:
             await send_smart_content(callback, detail_text, None, markup, bot=bot)
         else:
@@ -519,22 +523,25 @@ async def msg_quick_note_save(message: Message, state: FSMContext, bot: Bot) -> 
             await state.clear()
             return
 
+        crisis_triggered_now = False
         async with async_session_maker() as session:
             existing = await session.scalar(
                 select(QuickNote).where(QuickNote.operation_key == operation_key)
             )
             if existing is None:
-                session.add(QuickNote(
+                note_obj = QuickNote(
                     user_id=user_id,
                     text=text,
                     operation_key=operation_key,
-                ))
+                )
+                session.add(note_obj)
                 if not await check_paid_access(message, bot, topic_slug="journal"):
                     await session.rollback()
                     await state.clear()
                     return
                 try:
                     await session.commit()
+                    existing = note_obj
                 except IntegrityError:
                     await session.rollback()
                     existing = await session.scalar(
@@ -542,10 +549,312 @@ async def msg_quick_note_save(message: Message, state: FSMContext, bot: Bot) -> 
                     )
                     if existing is None:
                         raise
+            note_id = existing.id
+
+            # Mandatory immediate crisis marker check upon saving, independent of AI button
+            from ai_integration import _apply_crisis_marker_protection
+            from crisis_safety import find_crisis_marker, get_crisis_marker_settings
+
+            crisis_was_detected_in_turn(user_id)
+            matched_marker = await _apply_crisis_marker_protection(
+                session,
+                user_id=user_id,
+                user_text=text,
+                bot=bot,
+                dialogue_id=1,
+                scope="topic",
+                topic_slug="journal_note",
+                alert_metadata={"journal": "quick_note", "quick_note_id": note_id},
+            )
+            crisis_triggered_now = crisis_was_detected_in_turn(user_id) or bool(matched_marker)
+            if not crisis_triggered_now:
+                _, marker_enabled, markers = await get_crisis_marker_settings(session)
+                if marker_enabled and find_crisis_marker(text, markers):
+                    user_row = await session.get(User, user_id)
+                    if user_row and user_row.crisis_detected_at:
+                        crisis_triggered_now = True
 
         page = data.get("quick_note_page", 0)
         await state.clear()
-        await _render_quick_notes(message, bot, page, notice="✅ Оперативная запись сохранена.")
+        await message.answer(
+            "✅ Запись сохранена.",
+            parse_mode="HTML",
+            reply_markup=quick_note_saved_keyboard(note_id, page),
+        )
+        if crisis_triggered_now:
+            await send_crisis_contacts_if_active(bot, user_id, message.chat.id)
+
+
+async def run_quick_note_ai_analysis(
+    callback: CallbackQuery,
+    bot: Bot,
+    note_id: int,
+    page: int = 0,
+) -> None:
+    user_id = callback.from_user.id
+    chat_id = callback.message.chat.id
+
+    async with async_session_maker() as session:
+        topic_note = await session.scalar(select(Topic).where(Topic.slug == "journal_note"))
+    access_slug = "journal_note" if topic_note is not None else "journal"
+    if not await check_paid_access(callback, bot, topic_slug=access_slug):
+        return
+
+    async with async_session_maker() as session:
+        note = await session.scalar(
+            select(QuickNote).where(
+                QuickNote.id == note_id,
+                QuickNote.user_id == user_id,
+            )
+        )
+    if note is None:
+        await callback.answer("Запись не найдена или принадлежит другому пользователю.", show_alert=True)
+        return
+
+    if not await check_and_request_ai_disclaimer(
+        bot,
+        user_id,
+        chat_id,
+        flow_type="quick_note_ai",
+        payload={"note_id": note_id, "page": page},
+    ):
+        await callback.answer()
+        return
+
+    await callback.answer("⏳ Разбираю запись...")
+    waiting = None
+    try:
+        waiting = await bot.send_message(chat_id, "⏳ Разбираю запись…")
+    except Exception:
+        waiting = None
+
+    from ai_dialogue_service import allocate_global_dialogue_id
+    from ai_integration import get_ai_response_for_topic
+    from handlers import send_safe_response
+
+    crisis_was_detected_in_turn(user_id)
+    async with async_session_maker() as session:
+        note_dialogue_id = await allocate_global_dialogue_id(session, user_id)
+        await session.commit()
+
+    try:
+        ai_text = await get_ai_response_for_topic(
+            user_id=user_id,
+            user_prompt=note.text,
+            user_name=getattr(callback.from_user, "first_name", None) or "пользователь",
+            topic_slug="journal_note",
+            dialogue_id=note_dialogue_id,
+            bot=bot,
+            chat_id=chat_id,
+            alert_user_text=note.text,
+            alert_metadata={"journal": "quick_note_ai", "quick_note_id": note.id},
+        )
+    finally:
+        if waiting is not None and getattr(waiting, "message_id", None) is not None:
+            try:
+                await bot.delete_message(chat_id, waiting.message_id)
+            except Exception:
+                pass
+
+    crisis_now = crisis_was_detected_in_turn(user_id)
+    if not crisis_now:
+        from crisis_safety import find_crisis_marker, get_crisis_marker_settings
+
+        async with async_session_maker() as session:
+            _, marker_enabled, markers = await get_crisis_marker_settings(session)
+            if marker_enabled and find_crisis_marker(note.text, markers):
+                user_row = await session.get(User, user_id)
+                if user_row and user_row.crisis_detected_at:
+                    crisis_now = True
+
+    if not ai_text or ai_text.lstrip().startswith("⚠️"):
+        from aiogram.utils.keyboard import InlineKeyboardBuilder
+
+        err_kb = InlineKeyboardBuilder()
+        err_kb.button(text="⬅️ В дневник", callback_data="mode_journal")
+        await send_safe_response(
+            chat_id,
+            ai_text or "⚠️ Не удалось разобрать запись. Попробуй позже.",
+            bot,
+            None if crisis_now else err_kb.as_markup(),
+        )
+        if crisis_now:
+            await send_crisis_contacts_if_active(bot, user_id, chat_id)
+        return
+
+    async with async_session_maker() as session:
+        user_msg = DBMessage(
+            user_id=user_id,
+            dialogue_id=note_dialogue_id,
+            role="user",
+            content=note.text,
+            topic_slug="journal_note",
+        )
+        asst_msg = DBMessage(
+            user_id=user_id,
+            dialogue_id=note_dialogue_id,
+            role="assistant",
+            content=ai_text,
+            topic_slug="journal_note",
+        )
+        session.add_all([user_msg, asst_msg])
+        await session.commit()
+        asst_msg_id = asst_msg.id
+
+    reply_markup = None if crisis_now else quick_note_ai_result_keyboard(note.id, asst_msg_id)
+    await send_safe_response(chat_id, ai_text, bot, reply_markup)
+    if crisis_now:
+        await send_crisis_contacts_if_active(bot, user_id, chat_id)
+
+
+@router.callback_query(F.data.startswith("quick_note_ai:"))
+async def cb_quick_note_ai(callback: CallbackQuery, bot: Bot) -> None:
+    parts = callback.data.split(":")
+    try:
+        note_id = int(parts[1])
+        page = max(0, int(parts[2])) if len(parts) > 2 else 0
+    except (TypeError, ValueError, IndexError):
+        await callback.answer("Запись не найдена.", show_alert=True)
+        return
+    await run_quick_note_ai_analysis(callback, bot, note_id=note_id, page=page)
+
+
+async def run_quick_note_continue_in_free_session(
+    callback: CallbackQuery,
+    state: FSMContext,
+    bot: Bot,
+    note_id: int,
+    asst_msg_id: int,
+) -> None:
+    user_id = callback.from_user.id
+    chat_id = callback.message.chat.id
+
+    if not await check_paid_access(callback, bot, topic_slug="free_session"):
+        return
+
+    async with async_session_maker() as session:
+        note = await session.scalar(
+            select(QuickNote).where(
+                QuickNote.id == note_id,
+                QuickNote.user_id == user_id,
+            )
+        )
+        asst_msg = await session.scalar(
+            select(DBMessage).where(
+                DBMessage.id == asst_msg_id,
+                DBMessage.user_id == user_id,
+                DBMessage.role == "assistant",
+                DBMessage.topic_slug == "journal_note",
+            )
+        )
+    if note is None or asst_msg is None:
+        await callback.answer("Запись или разбор не найдены.", show_alert=True)
+        return
+
+    if not await check_and_request_ai_disclaimer(
+        bot,
+        user_id,
+        chat_id,
+        flow_type="quick_note_cont",
+        payload={"note_id": note_id, "asst_msg_id": asst_msg_id},
+    ):
+        await callback.answer()
+        return
+
+    from handlers import (
+        UserStates,
+        _remember_ai_response_message,
+        allocate_next_dialogue_id,
+        send_safe_response,
+        set_active_topic_dialogue_id,
+    )
+    import keyboards as main_kb
+
+    state_data = await state.get_data()
+    if (
+        await state.get_state() == UserStates.chatting.state
+        and isinstance(state_data, dict)
+        and state_data.get("current_topic_slug") == "free_session"
+        and state_data.get("quick_note_source_asst_id") == asst_msg_id
+    ):
+        await callback.answer("Диалог уже открыт")
+        return
+
+    try:
+        await bot.edit_message_reply_markup(
+            chat_id=chat_id,
+            message_id=callback.message.message_id,
+            reply_markup=None,
+        )
+    except Exception:
+        pass
+
+    async with async_session_maker() as session:
+        free_dialogue_id = await allocate_next_dialogue_id(session, user_id, "free_session")
+        await set_active_topic_dialogue_id(
+            session,
+            user_id,
+            "free_session",
+            free_dialogue_id,
+            monotonic=False,
+        )
+        session.add_all([
+            DBMessage(
+                user_id=user_id,
+                dialogue_id=free_dialogue_id,
+                role="user",
+                content=f"Оперативная запись из дневника:\n{note.text}",
+                topic_slug="free_session",
+            ),
+            DBMessage(
+                user_id=user_id,
+                dialogue_id=free_dialogue_id,
+                role="assistant",
+                content=asst_msg.content,
+                topic_slug="free_session",
+            ),
+        ])
+        user = await session.get(User, user_id)
+        if user:
+            user.current_topic_slug = "free_session"
+            if not user.current_dialogue_id or free_dialogue_id > user.current_dialogue_id:
+                user.current_dialogue_id = free_dialogue_id
+        await session.commit()
+
+    await state.clear()
+    await state.set_state(UserStates.chatting)
+    markup = await main_kb.ai_response_keyboard_for_topic("free_session", free_dialogue_id)
+    sent_msg = await send_safe_response(
+        chat_id,
+        "💬 **Продолжаем с ИИ-Виталием**\n\nТвоя запись и разбор уже в контексте диалога. Напиши, что откликается или с чем хочешь поработать дальше.",
+        bot,
+        markup,
+    )
+    await _remember_ai_response_message(state, sent_msg)
+    await state.update_data(
+        current_topic_slug="free_session",
+        dialogue_id=free_dialogue_id,
+        quick_note_source_asst_id=asst_msg_id,
+    )
+    await callback.answer("Продолжаем с ИИ-Виталием")
+
+
+@router.callback_query(F.data.startswith("quick_note_cont:"))
+async def cb_quick_note_continue(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+    parts = callback.data.split(":")
+    try:
+        note_id = int(parts[1])
+        asst_msg_id = int(parts[2])
+    except (TypeError, ValueError, IndexError):
+        await callback.answer("Запись или разбор не найдены.", show_alert=True)
+        return
+    await run_quick_note_continue_in_free_session(
+        callback,
+        state,
+        bot,
+        note_id=note_id,
+        asst_msg_id=asst_msg_id,
+    )
 
 
 @router.callback_query(F.data == "j_video")
@@ -1346,8 +1655,25 @@ async def cb_journal_run_dynamics(callback: CallbackQuery, bot: Bot) -> None:
 
     kb = journal_dynamics_menu_keyboard(uuid.uuid4().hex[:8])
     if success:
-        formatted = f"📈 <b>Анализ динамики за {days} дней</b>:\n\n{html.escape(result_text)}"
-        await callback.message.edit_text(formatted, reply_markup=kb, parse_mode="HTML")
+        from md_utils import markdown_to_html, remove_markdown, split_html_message
+
+        formatted_html = f"📈 <b>Анализ динамики за {days} дней</b>:\n\n{markdown_to_html(result_text)}"
+        chunks = split_html_message(formatted_html, 4090) or [formatted_html]
+        for idx, chunk in enumerate(chunks):
+            markup = kb if idx == len(chunks) - 1 else None
+            try:
+                if idx == 0:
+                    await callback.message.edit_text(chunk, reply_markup=markup, parse_mode="HTML")
+                else:
+                    await bot.send_message(chat_id, chunk, reply_markup=markup, parse_mode="HTML")
+            except Exception:
+                plain_text = f"📈 Анализ динамики за {days} дней:\n\n{remove_markdown(result_text)}"
+                plain_chunks = split_html_message(plain_text, 4090) or [plain_text]
+                fallback_chunk = plain_chunks[min(idx, len(plain_chunks) - 1)]
+                if idx == 0:
+                    await callback.message.edit_text(fallback_chunk, reply_markup=markup, parse_mode=None)
+                else:
+                    await bot.send_message(chat_id, fallback_chunk, reply_markup=markup, parse_mode=None)
     else:
         await callback.message.edit_text(result_text, reply_markup=kb)
 

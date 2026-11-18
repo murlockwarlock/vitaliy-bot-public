@@ -13,7 +13,15 @@ from typing import Any, Dict, List, Optional
 from openai import AsyncOpenAI
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
-from database import async_session_maker, AIConfig, Message, User, Topic, JournalEntry
+from database import (
+    AIConfig,
+    JOURNAL_NOTE_DEFAULT_PROMPT,
+    JournalEntry,
+    Message,
+    Topic,
+    User,
+    async_session_maker,
+)
 from logging_config import get_logger
 from vector_store import get_collection
 from kie_client import (
@@ -617,7 +625,12 @@ async def get_ai_response_for_topic(
                         select(Topic).where(Topic.id == topic.id).options(selectinload(Topic.knowledge_base_files))
                     )
 
-            system_prompt_text = topic.system_prompt if topic and topic.system_prompt else "Ты полезный помощник."
+            if topic and topic.system_prompt and topic.system_prompt.strip():
+                system_prompt_text = topic.system_prompt
+            elif active_topic_slug == "journal_note":
+                system_prompt_text = JOURNAL_NOTE_DEFAULT_PROMPT
+            else:
+                system_prompt_text = "Ты полезный помощник."
             if topic_slug == "funnel_demo" and prompt_variables:
                 for variable_name, variable_value in prompt_variables.items():
                     placeholder = "{" + str(variable_name) + "}"
