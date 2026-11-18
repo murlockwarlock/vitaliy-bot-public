@@ -63,6 +63,8 @@ from universal_tests import QUESTION_TYPE_TEXT, normalize_question_type
 
 logger = logging.getLogger("journal_handlers")
 _quick_note_save_locks: dict[int, asyncio.Lock] = {}
+_quick_note_msg_locks: dict[tuple[int, int], asyncio.Lock] = {}
+_quick_note_handoff_locks: dict[tuple[int, int], asyncio.Lock] = {}
 _QUICK_NOTE_PAGE_SIZE = 10
 
 router = Router(name="journal")
@@ -706,47 +708,104 @@ async def run_quick_note_ai_analysis(
             await send_crisis_contacts_if_active(bot, user_id, chat_id)
         return
 
-    asst_msg_id = None
-    async with async_session_maker() as session:
-        if res.cached:
+    asst_msg_id = await _ensure_quick_note_breakdown_message(
+        user_id=user_id,
+        note_id=note.id,
+        note_text=note.text,
+        ai_text=res.text,
+    )
+
+    reply_markup = None if crisis_now else quick_note_ai_result_keyboard(note.id, asst_msg_id)
+    await send_safe_response(chat_id, res.text, bot, reply_markup)
+    if crisis_now:
+        await send_crisis_contacts_if_active(bot, user_id, chat_id)
+
+
+async def _ensure_quick_note_breakdown_message(
+    *,
+    user_id: int,
+    note_id: int,
+    note_text: str,
+    ai_text: str,
+) -> int:
+    """Return the single assistant DBMessage.id explicitly bound to `note_id` (`message_kind='quick_note:<id>'`)."""
+    from ai_dialogue_service import allocate_global_dialogue_id
+
+    note_kind = f"quick_note:{note_id}"
+    msg_claim_key = f"quick_note_msg:{note_id}"
+    lock = _quick_note_msg_locks.setdefault((user_id, note_id), asyncio.Lock())
+    async with lock:
+        async with async_session_maker() as session:
             existing_asst = await session.scalar(
                 select(DBMessage)
                 .where(
                     DBMessage.user_id == user_id,
                     DBMessage.role == "assistant",
                     DBMessage.topic_slug == "journal_note",
-                    DBMessage.content == res.text,
+                    DBMessage.message_kind == note_kind,
                 )
-                .order_by(DBMessage.id.desc())
+                .order_by(DBMessage.id.asc())
                 .limit(1)
             )
             if existing_asst is not None:
-                asst_msg_id = existing_asst.id
+                return existing_asst.id
 
-        if asst_msg_id is None:
+            won_claim = False
+            claim_op = None
+            try:
+                async with session.begin_nested():
+                    claim_op = JournalAiOperation(
+                        operation_key=msg_claim_key,
+                        user_id=user_id,
+                        operation_type="quick_note_msg",
+                        status="succeeded",
+                        token_cost=0.0,
+                        completed_at=msk_now(),
+                    )
+                    session.add(claim_op)
+                    await session.flush()
+                    won_claim = True
+            except IntegrityError:
+                won_claim = False
+
+            if not won_claim:
+                existing_asst = await session.scalar(
+                    select(DBMessage)
+                    .where(
+                        DBMessage.user_id == user_id,
+                        DBMessage.role == "assistant",
+                        DBMessage.topic_slug == "journal_note",
+                        DBMessage.message_kind == note_kind,
+                    )
+                    .order_by(DBMessage.id.asc())
+                    .limit(1)
+                )
+                if existing_asst is not None:
+                    return existing_asst.id
+
             note_dialogue_id = await allocate_global_dialogue_id(session, user_id)
             user_msg = DBMessage(
                 user_id=user_id,
                 dialogue_id=note_dialogue_id,
                 role="user",
-                content=note.text,
+                content=note_text,
                 topic_slug="journal_note",
+                message_kind=note_kind,
             )
             asst_msg = DBMessage(
                 user_id=user_id,
                 dialogue_id=note_dialogue_id,
                 role="assistant",
-                content=res.text,
+                content=ai_text,
                 topic_slug="journal_note",
+                message_kind=note_kind,
             )
             session.add_all([user_msg, asst_msg])
+            await session.flush()
+            if claim_op is not None:
+                claim_op.result_text = str(asst_msg.id)
             await session.commit()
-            asst_msg_id = asst_msg.id
-
-    reply_markup = None if crisis_now else quick_note_ai_result_keyboard(note.id, asst_msg_id)
-    await send_safe_response(chat_id, res.text, bot, reply_markup)
-    if crisis_now:
-        await send_crisis_contacts_if_active(bot, user_id, chat_id)
+            return asst_msg.id
 
 
 @router.callback_query(F.data.startswith("quick_note_ai:"))
@@ -774,6 +833,7 @@ async def run_quick_note_continue_in_free_session(
     if not await check_paid_access(callback, bot, topic_slug="free_session"):
         return
 
+    note_kind = f"quick_note:{note_id}"
     async with async_session_maker() as session:
         note = await session.scalar(
             select(QuickNote).where(
@@ -787,6 +847,7 @@ async def run_quick_note_continue_in_free_session(
                 DBMessage.user_id == user_id,
                 DBMessage.role == "assistant",
                 DBMessage.topic_slug == "journal_note",
+                DBMessage.message_kind == note_kind,
             )
         )
     if note is None or asst_msg is None:
@@ -812,73 +873,128 @@ async def run_quick_note_continue_in_free_session(
     )
     import keyboards as main_kb
 
-    state_data = await state.get_data()
-    if (
-        await state.get_state() == UserStates.chatting.state
-        and isinstance(state_data, dict)
-        and state_data.get("current_topic_slug") == "free_session"
-        and state_data.get("quick_note_source_asst_id") == asst_msg_id
-    ):
-        await callback.answer("Диалог уже открыт")
-        return
+    handoff_key = f"quick_note_handoff:{note_id}"
+    handoff_lock = _quick_note_handoff_locks.setdefault((user_id, note_id), asyncio.Lock())
+    async with handoff_lock:
+        try:
+            await bot.edit_message_reply_markup(
+                chat_id=chat_id,
+                message_id=callback.message.message_id,
+                reply_markup=None,
+            )
+        except Exception:
+            pass
 
-    try:
-        await bot.edit_message_reply_markup(
-            chat_id=chat_id,
-            message_id=callback.message.message_id,
-            reply_markup=None,
+        created_now = False
+        free_dialogue_id: int | None = None
+
+        async with async_session_maker() as session:
+            existing_handoff = await session.scalar(
+                select(JournalAiOperation).where(JournalAiOperation.operation_key == handoff_key)
+            )
+            if existing_handoff is not None and (existing_handoff.result_text or "").isdigit():
+                candidate_did = int(existing_handoff.result_text)
+                existing_seed_cnt = await session.scalar(
+                    select(func.count(DBMessage.id)).where(
+                        DBMessage.user_id == user_id,
+                        DBMessage.topic_slug == "free_session",
+                        DBMessage.dialogue_id == candidate_did,
+                    )
+                )
+                if existing_seed_cnt and existing_seed_cnt > 0:
+                    free_dialogue_id = candidate_did
+
+            if free_dialogue_id is None:
+                handoff_op = existing_handoff
+                won_handoff = existing_handoff is not None
+                if handoff_op is None:
+                    try:
+                        async with session.begin_nested():
+                            handoff_op = JournalAiOperation(
+                                operation_key=handoff_key,
+                                user_id=user_id,
+                                operation_type="quick_note_handoff",
+                                status="succeeded",
+                                token_cost=0.0,
+                                completed_at=msk_now(),
+                            )
+                            session.add(handoff_op)
+                            await session.flush()
+                            won_handoff = True
+                    except IntegrityError:
+                        won_handoff = False
+                        handoff_op = await session.scalar(
+                            select(JournalAiOperation).where(JournalAiOperation.operation_key == handoff_key)
+                        )
+
+                if not won_handoff and handoff_op is not None and (handoff_op.result_text or "").isdigit():
+                    free_dialogue_id = int(handoff_op.result_text)
+                else:
+                    free_dialogue_id = await allocate_next_dialogue_id(session, user_id, "free_session")
+                    if handoff_op is not None:
+                        handoff_op.result_text = str(free_dialogue_id)
+                    session.add_all([
+                        DBMessage(
+                            user_id=user_id,
+                            dialogue_id=free_dialogue_id,
+                            role="user",
+                            content=f"Оперативная запись из дневника:\n{note.text}",
+                            topic_slug="free_session",
+                            message_kind=handoff_key,
+                        ),
+                        DBMessage(
+                            user_id=user_id,
+                            dialogue_id=free_dialogue_id,
+                            role="assistant",
+                            content=asst_msg.content,
+                            topic_slug="free_session",
+                            message_kind=handoff_key,
+                        ),
+                    ])
+                    created_now = True
+
+            await set_active_topic_dialogue_id(
+                session,
+                user_id,
+                "free_session",
+                free_dialogue_id,
+                monotonic=False,
+            )
+            user = await session.get(User, user_id)
+            if user:
+                user.current_topic_slug = "free_session"
+                if not user.current_dialogue_id or free_dialogue_id > user.current_dialogue_id:
+                    user.current_dialogue_id = free_dialogue_id
+            await session.commit()
+
+        state_data = await state.get_data()
+        already_in_this_dialogue = (
+            not created_now
+            and await state.get_state() == UserStates.chatting.state
+            and isinstance(state_data, dict)
+            and state_data.get("current_topic_slug") == "free_session"
+            and state_data.get("dialogue_id") == free_dialogue_id
         )
-    except Exception:
-        pass
+        if already_in_this_dialogue:
+            await callback.answer("Диалог уже открыт")
+            return
 
-    async with async_session_maker() as session:
-        free_dialogue_id = await allocate_next_dialogue_id(session, user_id, "free_session")
-        await set_active_topic_dialogue_id(
-            session,
-            user_id,
-            "free_session",
-            free_dialogue_id,
-            monotonic=False,
+        await state.clear()
+        await state.set_state(UserStates.chatting)
+        markup = await main_kb.ai_response_keyboard_for_topic("free_session", free_dialogue_id)
+        sent_msg = await send_safe_response(
+            chat_id,
+            "💬 **Продолжаем с ИИ-Виталием**\n\nТвоя запись и разбор уже в контексте диалога. Напиши, что откликается или с чем хочешь поработать дальше.",
+            bot,
+            markup,
         )
-        session.add_all([
-            DBMessage(
-                user_id=user_id,
-                dialogue_id=free_dialogue_id,
-                role="user",
-                content=f"Оперативная запись из дневника:\n{note.text}",
-                topic_slug="free_session",
-            ),
-            DBMessage(
-                user_id=user_id,
-                dialogue_id=free_dialogue_id,
-                role="assistant",
-                content=asst_msg.content,
-                topic_slug="free_session",
-            ),
-        ])
-        user = await session.get(User, user_id)
-        if user:
-            user.current_topic_slug = "free_session"
-            if not user.current_dialogue_id or free_dialogue_id > user.current_dialogue_id:
-                user.current_dialogue_id = free_dialogue_id
-        await session.commit()
-
-    await state.clear()
-    await state.set_state(UserStates.chatting)
-    markup = await main_kb.ai_response_keyboard_for_topic("free_session", free_dialogue_id)
-    sent_msg = await send_safe_response(
-        chat_id,
-        "💬 **Продолжаем с ИИ-Виталием**\n\nТвоя запись и разбор уже в контексте диалога. Напиши, что откликается или с чем хочешь поработать дальше.",
-        bot,
-        markup,
-    )
-    await _remember_ai_response_message(state, sent_msg)
-    await state.update_data(
-        current_topic_slug="free_session",
-        dialogue_id=free_dialogue_id,
-        quick_note_source_asst_id=asst_msg_id,
-    )
-    await callback.answer("Продолжаем с ИИ-Виталием")
+        await _remember_ai_response_message(state, sent_msg)
+        await state.update_data(
+            current_topic_slug="free_session",
+            dialogue_id=free_dialogue_id,
+            quick_note_source_asst_id=asst_msg_id,
+        )
+        await callback.answer("Продолжаем с ИИ-Виталием")
 
 
 @router.callback_query(F.data.startswith("quick_note_cont:"))

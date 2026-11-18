@@ -373,6 +373,8 @@ class TopicLifecycleAndSettingsE2ETests(unittest.IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self) -> None:
         handlers._ai_start_locks.clear()
+        journal_handlers._quick_note_msg_locks.clear()
+        journal_handlers._quick_note_handoff_locks.clear()
         for r in self._ROUTERS:
             r._parent_router = None
         await self.bot.session.close()
@@ -1827,3 +1829,117 @@ class TopicLifecycleAndSettingsE2ETests(unittest.IsolatedAsyncioTestCase):
                 )
             )
             self.assertEqual(free_msgs, 0)
+
+    async def test_quick_note_idempotency_concurrent_continue_repeat_and_identical_reply_isolation(self):
+        user_id = 700209
+        await self._seed_user(user_id, balance=100.0)
+
+        async with async_session_maker() as session:
+            note_a = QuickNote(user_id=user_id, text="Запись А: тревога перед публичным выступлением", operation_key="idem-a")
+            note_b = QuickNote(user_id=user_id, text="Запись Б: конфликт с партнёром из-за планов", operation_key="idem-b")
+            session.add_all([note_a, note_b])
+            await session.commit()
+            note_a_id, note_b_id = note_a.id, note_b.id
+
+        await self._send_text(user_id, "/menu")
+
+        identical_ai_reply = "Похоже, здесь задета важная внутренняя потребность. Что в этой ситуации откликается сильнее всего?"
+
+        async def _same_reply_llm(*args, **kwargs):
+            return SimpleNamespace(
+                text=identical_ai_reply,
+                raw_payload={},
+                http_status=200,
+                finish_reason="stop",
+                diagnostics={},
+            )
+
+        # Analyze both notes with identical AI text, then re-fetch both from cache
+        with patch("ai_integration._generate_chat_response", side_effect=_same_reply_llm):
+            await self._click(user_id, f"quick_note_ai:{note_a_id}:0")
+            msg_a_first = self._latest_chat_message(user_id)
+            cont_a_1 = [cb for _, cb, _ in _extract_buttons(msg_a_first.reply_markup) if cb.startswith("quick_note_cont:")][0]
+
+            await self._click(user_id, f"quick_note_ai:{note_b_id}:0")
+            msg_b_first = self._latest_chat_message(user_id)
+            cont_b_1 = [cb for _, cb, _ in _extract_buttons(msg_b_first.reply_markup) if cb.startswith("quick_note_cont:")][0]
+
+            # Cached replays must reuse each note's own bound DBMessage and create zero duplicate DBMessage rows
+            await self._click(user_id, f"quick_note_ai:{note_a_id}:0")
+            cont_a_2 = [
+                cb for _, cb, _ in _extract_buttons(self._latest_chat_message(user_id).reply_markup)
+                if cb.startswith("quick_note_cont:")
+            ][0]
+            await self._click(user_id, f"quick_note_ai:{note_b_id}:0")
+            msg_b_cached = self._latest_chat_message(user_id)
+            cont_b_2 = [cb for _, cb, _ in _extract_buttons(msg_b_cached.reply_markup) if cb.startswith("quick_note_cont:")][0]
+
+        self.assertEqual(cont_a_1, cont_a_2)
+        self.assertEqual(cont_b_1, cont_b_2)
+        asst_a_id = int(cont_a_1.split(":")[2])
+        asst_b_id = int(cont_b_1.split(":")[2])
+        self.assertNotEqual(asst_a_id, asst_b_id)
+
+        # Cross-note mismatch (`note_a_id` with `asst_b_id`) must be rejected
+        ev_mismatch = await self._click(user_id, f"quick_note_cont:{note_a_id}:{asst_b_id}")
+        self.assertTrue(
+            any("не найдены" in (e.get("text") or "").lower() for e in ev_mismatch if e["kind"] == "callback_answer")
+        )
+
+        async with async_session_maker() as session:
+            jnote_msgs = (
+                await session.scalars(
+                    select(DBMessage).where(DBMessage.user_id == user_id, DBMessage.topic_slug == "journal_note")
+                )
+            ).all()
+            # Strictly 2 messages (user + assistant) per note = 4 total, zero duplicates
+            self.assertEqual(len(jnote_msgs), 4)
+
+        # Concurrent double-click on note_a transfer -> strictly ONE free_session dialogue and ONE pair of seed messages
+        await asyncio.gather(
+            self._click(user_id, cont_a_1, message_id=msg_a_first.message_id),
+            self._click(user_id, cont_a_1, message_id=msg_a_first.message_id),
+        )
+        self.assertEqual(await self._state_of(user_id), "UserStates:chatting")
+
+        # Repeat click while already in free_session AND repeat click after leaving to /menu -> still ONE dialogue, no duplicate seed rows
+        await self._click(user_id, cont_a_1, message_id=msg_a_first.message_id)
+        await self._send_text(user_id, "/menu")
+        await self._click(user_id, cont_a_1, message_id=msg_a_first.message_id)
+        self.assertEqual(await self._state_of(user_id), "UserStates:chatting")
+
+        async with async_session_maker() as session:
+            free_seed_msgs = (
+                await session.scalars(
+                    select(DBMessage)
+                    .where(DBMessage.user_id == user_id, DBMessage.topic_slug == "free_session")
+                    .order_by(DBMessage.id.asc())
+                )
+            ).all()
+            self.assertEqual(len({m.dialogue_id for m in free_seed_msgs}), 1)
+            self.assertEqual(len(free_seed_msgs), 2)
+            self.assertIn("Запись А: тревога перед публичным выступлением", free_seed_msgs[0].content)
+            self.assertNotIn("Запись Б", free_seed_msgs[0].content)
+
+        # Follow-up turn in free_session sees exact single-copy context for note_a
+        captured_free_ctx = []
+
+        async def _capture_free_llm(ai_cfg, client, model, messages, **kwargs):
+            captured_free_ctx.extend(messages)
+            return SimpleNamespace(
+                text="Давай посмотрим, чья оценка на выступлении кажется тебе самой значимой.",
+                raw_payload={},
+                http_status=200,
+                finish_reason="stop",
+                diagnostics={},
+            )
+
+        with patch("ai_integration._generate_chat_response", side_effect=_capture_free_llm):
+            await self._send_text(user_id, "Боюсь ошибиться перед руководителем.")
+
+        user_role_contents = [m["content"] for m in captured_free_ctx if m.get("role") == "user"]
+        self.assertEqual(
+            sum(1 for c in user_role_contents if "Запись А: тревога перед публичным выступлением" in c),
+            1,
+        )
+        self.assertFalse(any("Запись Б" in c for c in user_role_contents))
