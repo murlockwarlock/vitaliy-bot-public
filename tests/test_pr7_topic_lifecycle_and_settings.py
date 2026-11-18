@@ -77,6 +77,7 @@ from database import (
     Content,
     Habit,
     JOURNAL_NOTE_DEFAULT_PROMPT,
+    JournalAiOperation,
     JournalAnswer,
     JournalEntry,
     JournalQuestion,
@@ -385,6 +386,7 @@ class TopicLifecycleAndSettingsE2ETests(unittest.IsolatedAsyncioTestCase):
         is_admin: bool = False,
         admin_role: str | None = None,
         accepted_disclaimer: bool = True,
+        balance: float = 0.0,
     ) -> None:
         async with async_session_maker() as session:
             session.add(
@@ -396,6 +398,7 @@ class TopicLifecycleAndSettingsE2ETests(unittest.IsolatedAsyncioTestCase):
                     age=34,
                     is_admin=is_admin,
                     admin_role=admin_role,
+                    balance=balance,
                     ai_disclaimer_accepted_at=msk_now() if accepted_disclaimer else None,
                     ai_disclaimer_version=1 if accepted_disclaimer else 0,
                     ai_disclaimer_shown=accepted_disclaimer,
@@ -1688,3 +1691,139 @@ class TopicLifecycleAndSettingsE2ETests(unittest.IsolatedAsyncioTestCase):
                 ("⬅️ В раздел привычек", "mode_habits"),
             ],
         )
+
+    async def test_quick_note_ai_token_billing_double_click_blocked_user_and_provider_error_retry(self):
+        user_id = 700207
+        poor_id = 700208
+        await self._seed_user(user_id, balance=20.0)
+        await self._seed_user(poor_id, balance=5.0)
+
+        async with async_session_maker() as session:
+            pay_cfg = await session.get(PaymentConfig, 1)
+            pay_cfg.mode = "token"
+            pay_cfg.cost_per_message = 10.0
+            jnote_topic = await session.scalar(select(Topic).where(Topic.slug == "journal_note"))
+            jnote_topic.is_paid = True
+            n1 = QuickNote(user_id=user_id, text="Тяжело делегировать задачи команде.", operation_key="tok-op-1")
+            n2 = QuickNote(user_id=user_id, text="Заметка для бесплатной проверки.", operation_key="tok-op-2")
+            n3 = QuickNote(user_id=user_id, text="Заметка перед блокировкой.", operation_key="tok-op-3")
+            n_poor = QuickNote(user_id=poor_id, text="Мало токенов.", operation_key="tok-op-poor")
+            session.add_all([n1, n2, n3, n_poor])
+            await session.commit()
+            n1_id, n2_id, n3_id, n_poor_id = n1.id, n2.id, n3.id, n_poor.id
+
+        await self._send_text(user_id, "/menu")
+        await self._send_text(poor_id, "/menu")
+
+        # 1. Insufficient tokens in token mode -> blocked before AI, balance untouched
+        with patch("ai_integration._generate_chat_response", new=AsyncMock()) as mock_poor_llm:
+            ev_poor = await self._click(poor_id, f"quick_note_ai:{n_poor_id}:0")
+            mock_poor_llm.assert_not_awaited()
+        self.assertTrue(
+            any("Недостаточно токенов" in (e.get("text") or "") for e in ev_poor)
+        )
+        async with async_session_maker() as session:
+            self.assertEqual((await session.get(User, poor_id)).balance, 5.0)
+
+        # 2. Provider error -> atomic refund (20 -> 10 -> 20), NO DBMessage saved, NO continue button, retry shown
+        with patch(
+            "ai_integration._generate_chat_response",
+            new=AsyncMock(side_effect=RuntimeError("Upstream 502 Bad Gateway")),
+        ), patch("ai_integration.send_terminal_ai_failure_alert", new=AsyncMock()):
+            await self._click(user_id, f"quick_note_ai:{n1_id}:0")
+
+        err_msg = self._latest_chat_message(user_id)
+        err_btns = [(lbl, cb) for lbl, cb, _ in _extract_buttons(err_msg.reply_markup)]
+        self.assertFalse(any(cb.startswith("quick_note_cont:") for _, cb in err_btns))
+        self.assertIn(("🔄 Попробовать снова", f"quick_note_ai:{n1_id}:0"), err_btns)
+
+        async with async_session_maker() as session:
+            self.assertEqual((await session.get(User, user_id)).balance, 20.0)
+            failed_op = await session.scalar(
+                select(JournalAiOperation).where(JournalAiOperation.operation_key == f"quick_note_ai:{n1_id}:1")
+            )
+            self.assertIsNotNone(failed_op)
+            self.assertEqual(failed_op.status, "failed")
+            self.assertIsNotNone(failed_op.charged_at)
+            self.assertIsNotNone(failed_op.refunded_at)
+            saved_jnote_msgs = await session.scalar(
+                select(func.count(DBMessage.id)).where(
+                    DBMessage.user_id == user_id, DBMessage.topic_slug == "journal_note"
+                )
+            )
+            self.assertEqual(saved_jnote_msgs, 0)
+
+        # 3. Retry with concurrent double-click -> 1 AI call, 1 charge (20 -> 10); valid reply starting with "⚠️" succeeds
+        llm_calls = 0
+
+        async def _slow_valid_llm(*args, **kwargs):
+            nonlocal llm_calls
+            llm_calls += 1
+            await asyncio.sleep(0.05)
+            return SimpleNamespace(
+                text="⚠️ Похоже, контроль даёт тебе ощущение безопасности, но забирает ресурс. Что случится, если отдать одну мелкую задачу?",
+                raw_payload={},
+                http_status=200,
+                finish_reason="stop",
+                diagnostics={},
+            )
+
+        with patch("ai_integration._generate_chat_response", side_effect=_slow_valid_llm):
+            await asyncio.gather(
+                self._click(user_id, f"quick_note_ai:{n1_id}:0", message_id=err_msg.message_id),
+                self._click(user_id, f"quick_note_ai:{n1_id}:0", message_id=err_msg.message_id),
+            )
+
+        self.assertEqual(llm_calls, 1)
+        ok_msg = self._latest_chat_message(user_id)
+        ok_btns = [(lbl, cb) for lbl, cb, _ in _extract_buttons(ok_msg.reply_markup)]
+        cont_cbs = [cb for _, cb in ok_btns if cb.startswith("quick_note_cont:")]
+        self.assertEqual(len(cont_cbs), 1)
+
+        async with async_session_maker() as session:
+            self.assertEqual((await session.get(User, user_id)).balance, 10.0)
+
+        # Repeat click after success -> cached result, 0 new AI calls, 0 new token charges
+        with patch("ai_integration._generate_chat_response", side_effect=_slow_valid_llm):
+            await self._click(user_id, f"quick_note_ai:{n1_id}:0")
+        self.assertEqual(llm_calls, 1)
+        async with async_session_maker() as session:
+            self.assertEqual((await session.get(User, user_id)).balance, 10.0)
+
+        # 4. Free journal_note topic (`is_paid = False`) in token mode -> 0 tokens charged
+        async with async_session_maker() as session:
+            jnote_topic = await session.scalar(select(Topic).where(Topic.slug == "journal_note"))
+            jnote_topic.is_paid = False
+            await session.commit()
+
+        with patch("ai_integration._generate_chat_response", side_effect=_slow_valid_llm):
+            await self._click(user_id, f"quick_note_ai:{n2_id}:0")
+        self.assertEqual(llm_calls, 2)
+        async with async_session_maker() as session:
+            self.assertEqual((await session.get(User, user_id)).balance, 10.0)
+
+        # 5. Blocked user (`User.is_blocked = True`) cannot run AI breakdown OR transfer into free_session
+        async with async_session_maker() as session:
+            u = await session.get(User, user_id)
+            u.is_blocked = True
+            await session.commit()
+
+        with patch("ai_integration._generate_chat_response", new=AsyncMock()) as mock_blocked_llm:
+            ev_blk_ai = await self._click(user_id, f"quick_note_ai:{n3_id}:0")
+            mock_blocked_llm.assert_not_awaited()
+        self.assertTrue(
+            any("заблокирован" in (e.get("text") or "").lower() for e in ev_blk_ai if e["kind"] == "callback_answer")
+        )
+
+        ev_blk_cont = await self._click(user_id, cont_cbs[0], message_id=ok_msg.message_id)
+        self.assertTrue(
+            any("заблокирован" in (e.get("text") or "").lower() for e in ev_blk_cont if e["kind"] == "callback_answer")
+        )
+        self.assertIsNone(await self._state_of(user_id))
+        async with async_session_maker() as session:
+            free_msgs = await session.scalar(
+                select(func.count(DBMessage.id)).where(
+                    DBMessage.user_id == user_id, DBMessage.topic_slug == "free_session"
+                )
+            )
+            self.assertEqual(free_msgs, 0)

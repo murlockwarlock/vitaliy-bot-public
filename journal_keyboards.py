@@ -182,6 +182,14 @@ def quick_note_ai_result_keyboard(note_id: int, asst_msg_id: int) -> InlineKeybo
     return builder.as_markup()
 
 
+def quick_note_ai_error_keyboard(note_id: int, page: int = 0) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🔄 Попробовать снова", callback_data=f"quick_note_ai:{note_id}:{page}")
+    builder.button(text="⬅️ В дневник", callback_data="mode_journal")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
 def quick_note_detail_keyboard(page: int = 0, note_id: int | None = None) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     if note_id is not None:

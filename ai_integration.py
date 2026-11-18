@@ -1794,3 +1794,515 @@ async def generate_journal_dynamics_analysis(
                     except Exception as alert_exc:
                         logger.warning("Failed to dispatch journal dynamics terminal AI alert: %s", alert_exc)
                     return False, "⚠️ Не удалось сформировать анализ динамики. Попробуйте позже."
+
+
+@dataclass
+class QuickNoteAiResult:
+    status: str  # "succeeded" | "already_running" | "insufficient_tokens" | "blocked" | "not_found" | "failed"
+    text: str = ""
+    cached: bool = False
+
+
+async def generate_journal_quick_note_analysis(
+    note_id: int,
+    user_id: int,
+    chat_id: int,
+    bot: Optional[Any] = None,
+) -> QuickNoteAiResult:
+    """
+    Generate AI breakdown for an operational QuickNote using Topic('journal_note'):
+    - Enforces User.is_blocked and QuickNote ownership before billing;
+    - Uses JournalAiOperation for concurrency/replay deduplication, atomic token debit,
+      lease heartbeat, and atomic token refund on any generation failure;
+    - Returns structured QuickNoteAiResult (never relies on text-prefix heuristics).
+    """
+    from ai_dialogue_service import build_ai_user_profile_context
+    from database import JournalAiOperation, QuickNote
+    from journal_service import (
+        InsufficientTokensError,
+        finalize_journal_ai_operation_failure,
+        finalize_journal_ai_operation_success,
+        initiate_journal_ai_operation,
+        run_lease_heartbeat,
+    )
+    from time_utils import msk_now
+
+    async with async_session_maker() as session:
+        user = await session.get(User, user_id)
+        if not user:
+            return QuickNoteAiResult(status="not_found", text="⚠️ Пользователь не найден.")
+        if user.is_blocked:
+            return QuickNoteAiResult(status="blocked", text="⛔️ Ты заблокирован(а) администратором.")
+
+        note = await session.scalar(
+            select(QuickNote).where(QuickNote.id == note_id, QuickNote.user_id == user_id)
+        )
+        if note is None or not (note.text or "").strip():
+            return QuickNoteAiResult(status="not_found", text="⚠️ Запись не найдена.")
+        note_text = note.text.strip()
+
+        topic = await session.scalar(
+            select(Topic)
+            .where(Topic.slug == "journal_note")
+            .options(selectinload(Topic.knowledge_base_files))
+        )
+        effective_topic_slug = "journal_note" if topic is not None else "journal"
+
+        now = msk_now()
+        key_prefix = f"quick_note_ai:{note_id}:"
+        existing_ops = (
+            await session.scalars(
+                select(JournalAiOperation)
+                .where(
+                    JournalAiOperation.user_id == user_id,
+                    JournalAiOperation.operation_type == "quick_note_ai",
+                    JournalAiOperation.operation_key.like(f"{key_prefix}%"),
+                )
+                .order_by(JournalAiOperation.id.asc())
+            )
+        ).all()
+
+        for old_op in existing_ops:
+            if old_op.status == "running" and old_op.lease_until and old_op.lease_until <= now:
+                await finalize_journal_ai_operation_failure(session, old_op.id, old_op.owner_token)
+                await session.refresh(old_op)
+
+        for old_op in reversed(existing_ops):
+            if old_op.status == "succeeded" and old_op.result_text and old_op.result_text.strip():
+                return QuickNoteAiResult(status="succeeded", text=old_op.result_text, cached=True)
+            if old_op.status == "running" and (old_op.lease_until is None or old_op.lease_until > now):
+                return QuickNoteAiResult(
+                    status="already_running",
+                    text="⏳ Разбор этой записи уже формируется, подожди немного.",
+                )
+
+        failed_count = sum(1 for old_op in existing_ops if old_op.status == "failed")
+        op_key = f"quick_note_ai:{note_id}:{failed_count + 1}"
+
+        try:
+            op, won = await initiate_journal_ai_operation(
+                session=session,
+                operation_key=op_key,
+                user_id=user_id,
+                operation_type="quick_note_ai",
+                entry_id=None,
+                topic_slug=effective_topic_slug,
+            )
+        except InsufficientTokensError:
+            return QuickNoteAiResult(
+                status="insufficient_tokens",
+                text="❌ Недостаточно токенов для разбора записи.",
+            )
+        except PermissionError:
+            return QuickNoteAiResult(
+                status="blocked",
+                text="⛔️ Ты заблокирован(а) администратором.",
+            )
+
+        if not won or op is None:
+            if op is not None and op.status == "succeeded" and op.result_text and op.result_text.strip():
+                return QuickNoteAiResult(status="succeeded", text=op.result_text, cached=True)
+            return QuickNoteAiResult(
+                status="already_running",
+                text="⏳ Разбор этой записи уже формируется, подожди немного.",
+            )
+
+        op_id = op.id
+        op_owner_token = op.owner_token
+
+        await _apply_crisis_marker_protection(
+            session,
+            user_id=user_id,
+            user_text=note_text,
+            bot=bot,
+            dialogue_id=1,
+            scope="topic",
+            topic_slug="journal_note",
+            alert_metadata={"journal": "quick_note_ai", "quick_note_id": note_id},
+        )
+
+        ai_config, embedding_client, chat_client, model_name, error_text = await _prepare_clients(session)
+        if error_text:
+            await finalize_journal_ai_operation_failure(session, op_id, op_owner_token)
+            return QuickNoteAiResult(status="failed", text=error_text)
+
+        sys_prompt = (
+            topic.system_prompt
+            if (topic and topic.system_prompt and topic.system_prompt.strip())
+            else JOURNAL_NOTE_DEFAULT_PROMPT
+        )
+        docs_ids = [f.id for f in topic.knowledge_base_files] if topic else []
+        profile_context = build_ai_user_profile_context(user)
+        real_username = getattr(user, "username", None)
+        effective_name = (getattr(user, "name", None) or getattr(user, "first_name", None) or "пользователь").strip()
+        primary_prov = normalize_provider(ai_config.provider)
+        primary_mod = model_name or DEFAULT_PROVIDER_MODELS.get(primary_prov, "unknown")
+        fallback_provider, fallback_model, fallback_client = _prepare_fallback_client(ai_config)
+        ai_cfg_snapshot = AIConfig(
+            provider=ai_config.provider,
+            openai_api_key=ai_config.openai_api_key,
+            openai_model=ai_config.openai_model,
+            deepseek_api_key=ai_config.deepseek_api_key,
+            deepseek_model=ai_config.deepseek_model,
+            kie_api_key=ai_config.kie_api_key,
+            kie_base_url=ai_config.kie_base_url,
+            kie_model=ai_config.kie_model,
+            openrouter_api_key=ai_config.openrouter_api_key,
+            openrouter_model=ai_config.openrouter_model,
+            temperature=float(getattr(ai_config, "temperature", 0.7) or 0.7),
+            allow_fallback=bool(getattr(ai_config, "allow_fallback", False)),
+            fallback_provider=getattr(ai_config, "fallback_provider", None),
+            fallback_model=getattr(ai_config, "fallback_model", None),
+        )
+
+    heartbeat_task = asyncio.create_task(run_lease_heartbeat(op_id, op_owner_token))
+    request_group_id = uuid.uuid4().hex[:12]
+
+    try:
+        rag_context = ""
+        if docs_ids and embedding_client:
+            try:
+                chunks = await search_relevant_chunks(note_text, docs_ids, embedding_client)
+                if chunks:
+                    context_text = "\n\n".join(chunks)
+                    rag_context = (
+                        "ВАЖНО: При ответе используй следующую информацию из Базы Знаний:\n"
+                        f"--- НАЧАЛО БАЗЫ ЗНАНИЙ ---\n{context_text}\n--- КОНЕЦ БАЗЫ ЗНАНИЙ ---\n"
+                        "Если в базе нет ответа, отвечай, опираясь на свои знания, но придерживайся роли."
+                    )
+            except Exception as rag_exc:
+                logger.warning("Quick note RAG lookup failed for note_id=%s: %s", note_id, rag_exc)
+
+        full_system = sys_prompt
+        if profile_context:
+            full_system += f"\n\nПрофиль пользователя:\n{profile_context}"
+        if rag_context:
+            full_system += f"\n\n{rag_context}"
+        full_system += GLOBAL_TONE_INSTRUCTION
+
+        messages = [
+            {"role": "system", "content": full_system},
+            {"role": "user", "content": note_text},
+        ]
+        request_capture = {"quick_note_id": note_id, "messages": messages}
+
+        async with ai_typing_action(bot, chat_id):
+            start_ts = time.monotonic()
+            try:
+                logger.info(
+                    "Quick note AI request: op_id=%s user_id=%s note_id=%s prov=%s",
+                    op_id,
+                    user_id,
+                    note_id,
+                    primary_prov,
+                )
+                ai_res = await _generate_chat_response(ai_cfg_snapshot, chat_client, model_name, messages)
+                latency_ms = int((time.monotonic() - start_ts) * 1000)
+                raw_text = (
+                    ai_res
+                    if isinstance(ai_res, str)
+                    else (getattr(ai_res, "text", "") or "")
+                )
+                preview_clean, _, _ = extract_service_data(raw_text)
+                if not preview_clean or not preview_clean.strip():
+                    raise ValueError("Empty AI response text for quick note")
+
+                payload_str = (
+                    json.dumps(ai_res.raw_payload, ensure_ascii=False)
+                    if hasattr(ai_res, "raw_payload") and isinstance(ai_res.raw_payload, (dict, list))
+                    else str(getattr(ai_res, "raw_payload", None))
+                    if getattr(ai_res, "raw_payload", None) is not None
+                    else None
+                )
+
+                async with async_session_maker() as session:
+                    clean_text = await _process_ai_automation_and_clean_text(
+                        session,
+                        raw_text=raw_text,
+                        user_id=user_id,
+                        dialogue_id=1,
+                        scope="topic",
+                        topic_slug="journal_note",
+                        bot=bot,
+                        user_text=note_text,
+                        alert_metadata={"journal": "quick_note_ai", "quick_note_id": note_id},
+                    )
+                    await record_ai_attempt_log(
+                        session=session,
+                        user_id=user_id,
+                        dialogue_id=1,
+                        topic_slug="journal_note",
+                        request_type="journal_note",
+                        provider=primary_prov,
+                        model=primary_mod,
+                        status="success",
+                        latency_ms=latency_ms,
+                        prompt_summary=note_text[:500],
+                        clean_text=clean_text,
+                        raw_response=raw_text,
+                        request_capture=request_capture,
+                        provider_response_payload=payload_str,
+                        http_status=getattr(ai_res, "http_status", None),
+                        finish_reason=getattr(ai_res, "finish_reason", None),
+                        diagnostics={"quick_note_id": note_id, **(getattr(ai_res, "diagnostics", {}) or {})},
+                        request_group_id=request_group_id,
+                        attempt_no=1,
+                        attempt_role="primary",
+                    )
+                    await session.commit()
+                    await _stop_journal_heartbeat(heartbeat_task)
+                    finalized = await finalize_journal_ai_operation_success(
+                        session, op_id, op_owner_token, clean_text
+                    )
+                    if not finalized:
+                        return QuickNoteAiResult(
+                            status="failed",
+                            text="⚠️ Запрос уже завершён или был восстановлен после сбоя. Повтори действие при необходимости.",
+                        )
+                    return QuickNoteAiResult(status="succeeded", text=clean_text, cached=False)
+
+            except Exception as e:
+                latency_ms = int((time.monotonic() - start_ts) * 1000)
+                primary_cls, _ = classify_external_error(e, provider=primary_prov)
+                logger.error("Quick note AI primary error (%s): %s", primary_prov, e)
+
+                async with async_session_maker() as session:
+                    log_id_1 = await record_ai_attempt_log(
+                        session=session,
+                        user_id=user_id,
+                        dialogue_id=1,
+                        topic_slug="journal_note",
+                        request_type="journal_note",
+                        provider=primary_prov,
+                        model=primary_mod,
+                        status="error",
+                        latency_ms=latency_ms,
+                        prompt_summary=note_text[:500],
+                        error_type=type(e).__name__,
+                        error_message=str(e),
+                        error_classification=primary_cls,
+                        http_status=getattr(e, "status_code", getattr(e, "http_status", None)),
+                        request_capture=request_capture,
+                        diagnostics={"quick_note_id": note_id},
+                        request_group_id=request_group_id,
+                        attempt_no=1,
+                        attempt_role="primary",
+                    )
+                    await session.commit()
+
+                primary_attempt_info = {
+                    "provider": primary_prov,
+                    "model": primary_mod,
+                    "status": "error",
+                    "classification": primary_cls,
+                }
+
+                if fallback_client and fallback_provider:
+                    fb_start = time.monotonic()
+                    try:
+                        logger.info(
+                            "Attempting quick note AI fallback to %s (%s)",
+                            fallback_provider,
+                            fallback_model,
+                        )
+                        if fallback_provider == "KIE":
+                            dummy_cfg = AIConfig(
+                                provider="KIE",
+                                kie_api_key=ai_cfg_snapshot.kie_api_key,
+                                kie_base_url=ai_cfg_snapshot.kie_base_url,
+                                temperature=ai_cfg_snapshot.temperature,
+                            )
+                            fb_ai_res = await _generate_chat_response(dummy_cfg, None, fallback_model, messages)
+                        else:
+                            dummy_cfg = AIConfig(provider=fallback_provider, temperature=ai_cfg_snapshot.temperature)
+                            fb_ai_res = await _generate_chat_response(dummy_cfg, fallback_client, fallback_model, messages)
+
+                        fb_latency = int((time.monotonic() - fb_start) * 1000)
+                        fb_raw_text = (
+                            fb_ai_res
+                            if isinstance(fb_ai_res, str)
+                            else (getattr(fb_ai_res, "text", "") or "")
+                        )
+                        fb_preview, _, _ = extract_service_data(fb_raw_text)
+                        if not fb_preview or not fb_preview.strip():
+                            raise ValueError("Empty AI fallback response text for quick note")
+
+                        fb_payload_str = (
+                            json.dumps(fb_ai_res.raw_payload, ensure_ascii=False)
+                            if hasattr(fb_ai_res, "raw_payload") and isinstance(fb_ai_res.raw_payload, (dict, list))
+                            else str(getattr(fb_ai_res, "raw_payload", None))
+                            if getattr(fb_ai_res, "raw_payload", None) is not None
+                            else None
+                        )
+
+                        async with async_session_maker() as session:
+                            fb_clean_text = await _process_ai_automation_and_clean_text(
+                                session,
+                                raw_text=fb_raw_text,
+                                user_id=user_id,
+                                dialogue_id=1,
+                                scope="topic",
+                                topic_slug="journal_note",
+                                bot=bot,
+                                user_text=note_text,
+                                alert_metadata={"journal": "quick_note_ai", "quick_note_id": note_id},
+                            )
+                            log_id_2 = await record_ai_attempt_log(
+                                session=session,
+                                user_id=user_id,
+                                dialogue_id=1,
+                                topic_slug="journal_note",
+                                request_type="journal_note",
+                                provider=fallback_provider,
+                                model=fallback_model,
+                                status="success",
+                                latency_ms=fb_latency,
+                                prompt_summary=note_text[:500],
+                                clean_text=fb_clean_text,
+                                raw_response=fb_raw_text,
+                                request_capture=request_capture,
+                                provider_response_payload=fb_payload_str,
+                                http_status=getattr(fb_ai_res, "http_status", None),
+                                finish_reason=getattr(fb_ai_res, "finish_reason", None),
+                                diagnostics={"quick_note_id": note_id, **(getattr(fb_ai_res, "diagnostics", {}) or {})},
+                                request_group_id=request_group_id,
+                                attempt_no=2,
+                                attempt_role="fallback",
+                            )
+                            await session.commit()
+                            await _stop_journal_heartbeat(heartbeat_task)
+                            finalized = await finalize_journal_ai_operation_success(
+                                session, op_id, op_owner_token, fb_clean_text
+                            )
+
+                        ai_log_ids = [i for i in (log_id_1, log_id_2) if i is not None]
+                        provider_attempts = [
+                            primary_attempt_info,
+                            {"provider": fallback_provider, "model": fallback_model, "status": "success"},
+                        ]
+                        try:
+                            await send_ai_fallback_used_alert(
+                                bot=bot,
+                                user_id=user_id,
+                                chat_id=chat_id,
+                                username=real_username,
+                                full_name=effective_name,
+                                request_type="journal_note",
+                                primary_provider=primary_prov,
+                                primary_model=primary_mod,
+                                fallback_provider=fallback_provider,
+                                fallback_model=fallback_model,
+                                primary_error=str(e),
+                                ai_log_ids=ai_log_ids,
+                                provider_attempts=provider_attempts,
+                            )
+                        except Exception as alert_exc:
+                            logger.warning("Failed to dispatch quick note AI fallback alert: %s", alert_exc)
+
+                        if not finalized:
+                            return QuickNoteAiResult(
+                                status="failed",
+                                text="⚠️ Запрос уже завершён или был восстановлен после сбоя. Повтори действие при необходимости.",
+                            )
+                        return QuickNoteAiResult(status="succeeded", text=fb_clean_text, cached=False)
+
+                    except Exception as fb_err:
+                        fb_latency = int((time.monotonic() - fb_start) * 1000)
+                        fb_cls, _ = classify_external_error(fb_err, provider=fallback_provider)
+                        logger.error("Quick note AI fallback error (%s): %s", fallback_provider, fb_err)
+
+                        async with async_session_maker() as session:
+                            log_id_2 = await record_ai_attempt_log(
+                                session=session,
+                                user_id=user_id,
+                                dialogue_id=1,
+                                topic_slug="journal_note",
+                                request_type="journal_note",
+                                provider=fallback_provider,
+                                model=fallback_model,
+                                status="error",
+                                latency_ms=fb_latency,
+                                prompt_summary=note_text[:500],
+                                error_type=type(fb_err).__name__,
+                                error_message=str(fb_err),
+                                error_classification=fb_cls,
+                                http_status=getattr(fb_err, "status_code", getattr(fb_err, "http_status", None)),
+                                request_capture=request_capture,
+                                diagnostics={"quick_note_id": note_id},
+                                request_group_id=request_group_id,
+                                attempt_no=2,
+                                attempt_role="fallback",
+                            )
+                            await session.commit()
+                            await _stop_journal_heartbeat(heartbeat_task)
+                            await finalize_journal_ai_operation_failure(session, op_id, op_owner_token)
+
+                        ai_log_ids = [i for i in (log_id_1, log_id_2) if i is not None]
+                        provider_attempts = [
+                            primary_attempt_info,
+                            {"provider": fallback_provider, "model": fallback_model, "status": "error", "classification": fb_cls},
+                        ]
+                        try:
+                            await send_terminal_ai_failure_alert(
+                                bot=bot,
+                                user_id=user_id,
+                                chat_id=chat_id,
+                                username=real_username,
+                                full_name=effective_name,
+                                primary_provider=primary_prov,
+                                primary_model=primary_mod,
+                                fallback_provider=fallback_provider,
+                                fallback_model=fallback_model,
+                                error_message=f"Primary: {e} | Fallback: {fb_err}",
+                                ai_log_ids=ai_log_ids,
+                                exception=fb_err,
+                                classification=fb_cls,
+                                request_type="journal_note",
+                                provider_attempts=provider_attempts,
+                            )
+                        except Exception as alert_exc:
+                            logger.warning("Failed to dispatch quick note terminal AI alert: %s", alert_exc)
+                        return QuickNoteAiResult(
+                            status="failed",
+                            text="⚠️ Не удалось разобрать запись сейчас. Попробуй повторить запрос чуть позже.",
+                        )
+
+                await _stop_journal_heartbeat(heartbeat_task)
+                async with async_session_maker() as session:
+                    await finalize_journal_ai_operation_failure(session, op_id, op_owner_token)
+
+                ai_log_ids = [log_id_1] if log_id_1 is not None else []
+                provider_attempts = [primary_attempt_info]
+                try:
+                    await send_terminal_ai_failure_alert(
+                        bot=bot,
+                        user_id=user_id,
+                        chat_id=chat_id,
+                        username=real_username,
+                        full_name=effective_name,
+                        primary_provider=primary_prov,
+                        primary_model=primary_mod,
+                        fallback_provider="none",
+                        fallback_model="none",
+                        error_message=str(e),
+                        details="Fallback is disabled or not configured",
+                        ai_log_ids=ai_log_ids,
+                        exception=e,
+                        classification=primary_cls,
+                        request_type="journal_note",
+                        provider_attempts=provider_attempts,
+                    )
+                except Exception as alert_exc:
+                    logger.warning("Failed to dispatch quick note terminal AI alert: %s", alert_exc)
+                return QuickNoteAiResult(
+                    status="failed",
+                    text="⚠️ Не удалось разобрать запись сейчас. Попробуй повторить запрос чуть позже.",
+                )
+    except BaseException:
+        await _stop_journal_heartbeat(heartbeat_task)
+        try:
+            async with async_session_maker() as session:
+                await finalize_journal_ai_operation_failure(session, op_id, op_owner_token)
+        except Exception:
+            pass
+        raise

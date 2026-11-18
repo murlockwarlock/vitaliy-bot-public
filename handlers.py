@@ -2191,6 +2191,14 @@ async def check_paid_access(event, bot: Bot, topic_slug: str | None = None, sect
     user_id = event.from_user.id
     async with async_session_maker() as session:
         user = await session.get(User, user_id)
+        if not user:
+            return False
+        if user.is_blocked:
+            if hasattr(event, "data") and hasattr(event, "message"):
+                await event.answer("⛔️ Ты заблокирован(а) администратором.", show_alert=True)
+            elif hasattr(event, "answer") and callable(event.answer):
+                await event.answer("⛔️ Ты заблокирован(а) администратором.")
+            return False
         if user.is_admin:
             return True
 

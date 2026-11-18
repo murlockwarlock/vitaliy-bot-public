@@ -363,6 +363,7 @@ async def initiate_journal_ai_operation(
     user_id: int,
     operation_type: str,
     entry_id: int | None = None,
+    topic_slug: str = "journal",
 ) -> tuple[JournalAiOperation, bool]:
     """
     Initiate or reuse a JournalAiOperation:
@@ -390,8 +391,12 @@ async def initiate_journal_ai_operation(
     user = await session.get(User, user_id)
     if not user:
         raise ValueError("Пользователь не найден.")
+    if user.is_blocked:
+        raise PermissionError("Пользователь заблокирован.")
 
-    topic = await session.scalar(select(Topic).where(Topic.slug == "journal"))
+    topic = await session.scalar(select(Topic).where(Topic.slug == topic_slug))
+    if topic is None and topic_slug != "journal":
+        topic = await session.scalar(select(Topic).where(Topic.slug == "journal"))
     payment_cfg = await session.get(PaymentConfig, 1)
 
     # Billable check

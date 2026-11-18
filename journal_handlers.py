@@ -17,11 +17,13 @@ from sqlalchemy.orm import selectinload
 
 from database import (
     Content,
+    JournalAiOperation,
     JournalAnswer,
     JournalEntry,
     JournalQuestion,
     JournalSettings,
     Message as DBMessage,
+    PaymentConfig,
     QuickNote,
     Topic,
     User,
@@ -40,6 +42,7 @@ from journal_keyboards import (
     journal_question_keyboard,
     journal_reminder_time_keyboard,
     journal_snooze_menu_keyboard,
+    quick_note_ai_error_keyboard,
     quick_note_ai_result_keyboard,
     quick_note_detail_keyboard,
     quick_note_input_keyboard,
@@ -596,9 +599,31 @@ async def run_quick_note_ai_analysis(
 
     async with async_session_maker() as session:
         topic_note = await session.scalar(select(Topic).where(Topic.slug == "journal_note"))
+        user_row = await session.get(User, user_id)
+        pay_cfg = await session.get(PaymentConfig, 1)
+        already_paid_in_token_mode = False
+        if (
+            user_row
+            and not user_row.is_blocked
+            and pay_cfg
+            and pay_cfg.mode == "token"
+        ):
+            succeeded_op = await session.scalar(
+                select(JournalAiOperation.id)
+                .where(
+                    JournalAiOperation.user_id == user_id,
+                    JournalAiOperation.operation_type == "quick_note_ai",
+                    JournalAiOperation.operation_key.like(f"quick_note_ai:{note_id}:%"),
+                    JournalAiOperation.status == "succeeded",
+                )
+                .limit(1)
+            )
+            already_paid_in_token_mode = succeeded_op is not None
+
     access_slug = "journal_note" if topic_note is not None else "journal"
-    if not await check_paid_access(callback, bot, topic_slug=access_slug):
-        return
+    if not already_paid_in_token_mode:
+        if not await check_paid_access(callback, bot, topic_slug=access_slug):
+            return
 
     async with async_session_maker() as session:
         note = await session.scalar(
@@ -629,25 +654,17 @@ async def run_quick_note_ai_analysis(
         waiting = None
 
     from ai_dialogue_service import allocate_global_dialogue_id
-    from ai_integration import get_ai_response_for_topic
+    from ai_integration import generate_journal_quick_note_analysis
     from handlers import send_safe_response
+    import keyboards as main_kb
 
     crisis_was_detected_in_turn(user_id)
-    async with async_session_maker() as session:
-        note_dialogue_id = await allocate_global_dialogue_id(session, user_id)
-        await session.commit()
-
     try:
-        ai_text = await get_ai_response_for_topic(
+        res = await generate_journal_quick_note_analysis(
+            note_id=note.id,
             user_id=user_id,
-            user_prompt=note.text,
-            user_name=getattr(callback.from_user, "first_name", None) or "пользователь",
-            topic_slug="journal_note",
-            dialogue_id=note_dialogue_id,
-            bot=bot,
             chat_id=chat_id,
-            alert_user_text=note.text,
-            alert_metadata={"journal": "quick_note_ai", "quick_note_id": note.id},
+            bot=bot,
         )
     finally:
         if waiting is not None and getattr(waiting, "message_id", None) is not None:
@@ -655,6 +672,17 @@ async def run_quick_note_ai_analysis(
                 await bot.delete_message(chat_id, waiting.message_id)
             except Exception:
                 pass
+
+    if res.status == "already_running":
+        return
+
+    if res.status == "blocked":
+        await bot.send_message(chat_id, res.text)
+        return
+
+    if res.status == "insufficient_tokens":
+        await bot.send_message(chat_id, res.text, reply_markup=main_kb.token_alert_keyboard())
+        return
 
     crisis_now = crisis_was_detected_in_turn(user_id)
     if not crisis_now:
@@ -667,42 +695,56 @@ async def run_quick_note_ai_analysis(
                 if user_row and user_row.crisis_detected_at:
                     crisis_now = True
 
-    if not ai_text or ai_text.lstrip().startswith("⚠️"):
-        from aiogram.utils.keyboard import InlineKeyboardBuilder
-
-        err_kb = InlineKeyboardBuilder()
-        err_kb.button(text="⬅️ В дневник", callback_data="mode_journal")
+    if res.status != "succeeded":
         await send_safe_response(
             chat_id,
-            ai_text or "⚠️ Не удалось разобрать запись. Попробуй позже.",
+            res.text or "⚠️ Не удалось разобрать запись. Попробуй повторить запрос позже.",
             bot,
-            None if crisis_now else err_kb.as_markup(),
+            None if crisis_now else quick_note_ai_error_keyboard(note.id, page),
         )
         if crisis_now:
             await send_crisis_contacts_if_active(bot, user_id, chat_id)
         return
 
+    asst_msg_id = None
     async with async_session_maker() as session:
-        user_msg = DBMessage(
-            user_id=user_id,
-            dialogue_id=note_dialogue_id,
-            role="user",
-            content=note.text,
-            topic_slug="journal_note",
-        )
-        asst_msg = DBMessage(
-            user_id=user_id,
-            dialogue_id=note_dialogue_id,
-            role="assistant",
-            content=ai_text,
-            topic_slug="journal_note",
-        )
-        session.add_all([user_msg, asst_msg])
-        await session.commit()
-        asst_msg_id = asst_msg.id
+        if res.cached:
+            existing_asst = await session.scalar(
+                select(DBMessage)
+                .where(
+                    DBMessage.user_id == user_id,
+                    DBMessage.role == "assistant",
+                    DBMessage.topic_slug == "journal_note",
+                    DBMessage.content == res.text,
+                )
+                .order_by(DBMessage.id.desc())
+                .limit(1)
+            )
+            if existing_asst is not None:
+                asst_msg_id = existing_asst.id
+
+        if asst_msg_id is None:
+            note_dialogue_id = await allocate_global_dialogue_id(session, user_id)
+            user_msg = DBMessage(
+                user_id=user_id,
+                dialogue_id=note_dialogue_id,
+                role="user",
+                content=note.text,
+                topic_slug="journal_note",
+            )
+            asst_msg = DBMessage(
+                user_id=user_id,
+                dialogue_id=note_dialogue_id,
+                role="assistant",
+                content=res.text,
+                topic_slug="journal_note",
+            )
+            session.add_all([user_msg, asst_msg])
+            await session.commit()
+            asst_msg_id = asst_msg.id
 
     reply_markup = None if crisis_now else quick_note_ai_result_keyboard(note.id, asst_msg_id)
-    await send_safe_response(chat_id, ai_text, bot, reply_markup)
+    await send_safe_response(chat_id, res.text, bot, reply_markup)
     if crisis_now:
         await send_crisis_contacts_if_active(bot, user_id, chat_id)
 
