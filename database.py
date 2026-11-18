@@ -2471,15 +2471,6 @@ async def run_data_migrations(session: AsyncSession):
                 summary_generation_enabled=False if is_diagnostics else is_thematic,
                 summary_prompt=None,
             ))
-        elif is_diagnostics or is_express:
-            if existing_cfg.pre_dialogue_test_enabled:
-                configured_set = (
-                    await session.get(TestSet, existing_cfg.test_set_id)
-                    if existing_cfg.test_set_id
-                    else None
-                )
-                if not scenario_ready(configured_set, t.slug):
-                    existing_cfg.pre_dialogue_test_enabled = False
 
     funnel_topic = await session.scalar(select(Topic).where(Topic.slug == "funnel_demo"))
     if funnel_topic and funnel_topic.system_prompt and "show_offer" not in funnel_topic.system_prompt:

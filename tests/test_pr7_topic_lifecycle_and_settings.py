@@ -836,6 +836,138 @@ class TopicLifecycleAndSettingsE2ETests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(cfg.summary_generation_enabled)
                 self.assertEqual(cfg.summary_prompt, f"Промпт итогов {slug}")
 
+    async def test_unready_testset_preserves_enabled_flag_across_restart_recovers_and_disabled_test_enters_dialogue(self):
+        """Regression: TestSet becomes unready -> init_db() preserves pre_dialogue_test_enabled -> runtime shows error without DB mutation -> restored TestSet works; disabled pre-test enters dialogue even when bound TestSet is unready."""
+        user_id = 700112
+        await self._seed_user(user_id)
+
+        async with async_session_maker() as session:
+            profile_set = await session.scalar(select(TestSet).where(TestSet.slug == "express_psychological_profile"))
+            q7 = None
+            for idx in range(1, 8):
+                q = TestQuestion(
+                    test_set_id=1,
+                    order_num=idx,
+                    text=f"DiagQ{idx}",
+                    question_type="choice",
+                    answer_options_json=json.dumps([{"text": "Да", "value": 1}], ensure_ascii=False),
+                    is_active=True,
+                )
+                session.add(q)
+                if idx == 7:
+                    q7 = q
+            q12 = None
+            for idx in range(1, 13):
+                q = TestQuestion(
+                    test_set_id=profile_set.id,
+                    order_num=idx,
+                    text=f"ExprQ{idx}",
+                    question_type="choice",
+                    answer_options_json=json.dumps([{"text": "Да", "value": 1}], ensure_ascii=False),
+                    is_active=True,
+                )
+                session.add(q)
+                if idx == 12:
+                    q12 = q
+            await session.flush()
+            q7_id = q7.id
+            q12_id = q12.id
+            profile_set_id = profile_set.id
+
+            diag_cfg = await session.scalar(select(TopicDialogueConfig).where(TopicDialogueConfig.topic_slug == "diagnostics"))
+            diag_cfg.welcome_text = "Приветствие диагностики"
+            diag_cfg.start_dialogue_button_enabled = True
+            diag_cfg.start_dialogue_button_text = "Пройти тест"
+            diag_cfg.pre_dialogue_test_enabled = True
+            diag_cfg.test_set_id = 1
+
+            expr_cfg = await session.scalar(select(TopicDialogueConfig).where(TopicDialogueConfig.topic_slug == "express"))
+            expr_cfg.welcome_text = "Приветствие экспресс"
+            expr_cfg.start_dialogue_button_enabled = False
+            expr_cfg.pre_dialogue_test_enabled = True
+            expr_cfg.test_set_id = profile_set_id
+
+            # 1. TestSets become unready (6/7 for diagnostics, 11/12 for express)
+            q7.is_active = False
+            q12.is_active = False
+            await session.commit()
+
+        # 2. Restart (init_db() twice): pre_dialogue_test_enabled MUST stay True in DB
+        await init_db()
+        await init_db()
+        async with async_session_maker() as session:
+            diag_cfg = await session.scalar(select(TopicDialogueConfig).where(TopicDialogueConfig.topic_slug == "diagnostics"))
+            expr_cfg = await session.scalar(select(TopicDialogueConfig).where(TopicDialogueConfig.topic_slug == "express"))
+            self.assertTrue(diag_cfg.pre_dialogue_test_enabled)
+            self.assertEqual(diag_cfg.test_set_id, 1)
+            self.assertTrue(expr_cfg.pre_dialogue_test_enabled)
+            self.assertEqual(expr_cfg.test_set_id, profile_set_id)
+
+        # 3. Enabled but unready pre-test -> clear user-facing error WITHOUT mutating DB settings
+        await self._send_text(user_id, "/menu")
+        ev_diag_err = await self._click(user_id, "mode_diagnostics")
+        self.assertTrue(any("Анкета настраивается" in e.get("text", "") and "6 из 7" in e.get("text", "") for e in ev_diag_err))
+        self.assertIsNone(await self._state_of(user_id))
+
+        await self._send_text(user_id, "/menu")
+        ev_expr_err = await self._click(user_id, "mode_express")
+        self.assertTrue(any("Анкета настраивается" in e.get("text", "") and "11 из 12" in e.get("text", "") for e in ev_expr_err))
+        self.assertIsNone(await self._state_of(user_id))
+
+        async with async_session_maker() as session:
+            diag_cfg = await session.scalar(select(TopicDialogueConfig).where(TopicDialogueConfig.topic_slug == "diagnostics"))
+            expr_cfg = await session.scalar(select(TopicDialogueConfig).where(TopicDialogueConfig.topic_slug == "express"))
+            self.assertTrue(diag_cfg.pre_dialogue_test_enabled)
+            self.assertTrue(expr_cfg.pre_dialogue_test_enabled)
+            # 4. Restore TestSet readiness without touching TopicDialogueConfig
+            (await session.get(TestQuestion, q7_id)).is_active = True
+            (await session.get(TestQuestion, q12_id)).is_active = True
+            await session.commit()
+
+        # Restored TestSet works immediately!
+        await self._send_text(user_id, "/menu")
+        await self._click(user_id, "mode_diagnostics")
+        w_diag = self._latest_chat_message(user_id)
+        self.assertIn("Приветствие диагностики", w_diag.text or "")
+        diag_start = [cb for _, cb, _ in _extract_buttons(w_diag.reply_markup) if cb and cb.startswith("ai_start_dialogue:diagnostics:")][0]
+        ev_diag_q1 = await self._click(user_id, diag_start, message_id=w_diag.message_id)
+        self.assertTrue(any("Вопрос 1 из 7" in e.get("text", "") for e in ev_diag_q1))
+        self.assertEqual(await self._state_of(user_id), "UniversalTestStates:answering")
+        await self._click(user_id, "test_exit")
+
+        await self._send_text(user_id, "/menu")
+        ev_expr_q1 = await self._click(user_id, "mode_express")
+        self.assertTrue(any("Вопрос 1 из 12" in e.get("text", "") for e in ev_expr_q1))
+        self.assertEqual(await self._state_of(user_id), "UniversalTestStates:answering")
+        await self._click(user_id, "test_exit")
+
+        # 5. Disabled pre-test with UNREADY bound TestSet -> user enters AI dialogue cleanly (no setup error!)
+        async with async_session_maker() as session:
+            (await session.get(TestQuestion, q7_id)).is_active = False
+            (await session.get(TestQuestion, q12_id)).is_active = False
+            diag_cfg = await session.scalar(select(TopicDialogueConfig).where(TopicDialogueConfig.topic_slug == "diagnostics"))
+            diag_cfg.pre_dialogue_test_enabled = False
+            expr_cfg = await session.scalar(select(TopicDialogueConfig).where(TopicDialogueConfig.topic_slug == "express"))
+            expr_cfg.pre_dialogue_test_enabled = False
+            expr_cfg.prerecorded_first_message = "Диалог без теста открыт."
+            await session.commit()
+
+        await init_db()
+
+        await self._send_text(user_id, "/menu")
+        await self._click(user_id, "mode_diagnostics")
+        w_diag_off = self._latest_chat_message(user_id)
+        self.assertNotIn("Анкета настраивается", w_diag_off.text or "")
+        diag_off_start = [cb for _, cb, _ in _extract_buttons(w_diag_off.reply_markup) if cb and cb.startswith("ai_start_dialogue:diagnostics:")][0]
+        await self._click(user_id, diag_off_start, message_id=w_diag_off.message_id)
+        self.assertEqual(await self._state_of(user_id), "UserStates:chatting")
+        self.assertNotIn("Анкета настраивается", self._latest_chat_message(user_id).text or "")
+
+        await self._send_text(user_id, "/menu")
+        await self._click(user_id, "mode_express")
+        self.assertEqual(await self._state_of(user_id), "UserStates:chatting")
+        self.assertIn("Диалог без теста открыт.", self._latest_chat_message(user_id).text or "")
+
     # =========================================================================
     # 3. FREE_SESSION & EMPTY PRERECORDED: NO SILENT BRANCHES ON START / NEW
     # =========================================================================

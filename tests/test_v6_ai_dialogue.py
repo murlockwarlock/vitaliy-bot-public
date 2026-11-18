@@ -223,6 +223,9 @@ class AiDialoguePlatformV6Tests(unittest.IsolatedAsyncioTestCase):
         user_id = 20002
         async with async_session_maker() as session:
             session.add(User(id=user_id, first_name="User2", ai_disclaimer_accepted_at=None))
+            diag_cfg = await session.scalar(select(TopicDialogueConfig).where(TopicDialogueConfig.topic_slug == "diagnostics"))
+            if diag_cfg:
+                diag_cfg.pre_dialogue_test_enabled = True
             await session.commit()
 
         state = AsyncMock()
@@ -1206,6 +1209,7 @@ class AiDialoguePlatformV6Tests(unittest.IsolatedAsyncioTestCase):
                 test_set_id=1,
                 prerecorded_first_message="Записанное сообщение ассистента",
             ))
+            session.add(TestQuestion(test_set_id=1, text="Gate question"))
             await session.commit()
 
         state = AsyncMock()

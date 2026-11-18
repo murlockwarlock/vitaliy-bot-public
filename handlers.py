@@ -2410,33 +2410,40 @@ async def _activate_ai_mode_inner(
                     return "callback_answered"
                 return None
 
+        pre_test_enabled = bool(cfg and cfg.pre_dialogue_test_enabled)
         if (
-            current_tsess
+            pre_test_enabled
+            and current_tsess
             and not current_tsess.is_finished
             and current_tsess.invocation_topic_slug == slug
             and current_tsess.attempt_id
             and (not from_start_button or dialogue_id is None or current_tsess.invocation_dialogue_id == dialogue_id)
         ):
-            active_test_set, active_count, active_ready = await get_test_set_readiness(
-                session,
-                current_tsess.test_set_id or 1,
-                slug,
-            )
-            if not active_ready:
-                await send_test_setup_unavailable(
-                    bot,
-                    user_id,
-                    state,
-                    active_count=active_count,
-                    expected_count=expected_test_set_question_count(active_test_set, slug) if active_test_set else None,
-                )
-                return None
             active_attempt = await session.get(TestAttempt, current_tsess.attempt_id)
             if active_attempt and active_attempt.purpose == "pre_dialogue" and active_attempt.status == "in_progress":
                 claim = await get_pre_test_claim(
                     session, user_id, slug, current_tsess.invocation_dialogue_id, test_set_id=current_tsess.test_set_id
                 )
                 if claim and claim.status == "in_progress" and (claim.lease_until is None or claim.lease_until > msk_now()):
+                    active_test_set, active_count, active_ready = await get_test_set_readiness(
+                        session,
+                        current_tsess.test_set_id or 1,
+                        slug,
+                    )
+                    if not (
+                        active_test_set
+                        and active_test_set.is_enabled
+                        and not active_test_set.is_archived
+                        and active_ready
+                    ):
+                        await send_test_setup_unavailable(
+                            bot,
+                            user_id,
+                            state,
+                            active_count=active_count,
+                            expected_count=expected_test_set_question_count(active_test_set, slug) if active_test_set else None,
+                        )
+                        return None
                     if from_start_button:
                         await _clear_event_message_reply_markup(event)
                     # User has a live progressing pre-test session. Restore FSM, resend question and return.
@@ -2476,15 +2483,28 @@ async def _activate_ai_mode_inner(
 
     await state.clear()
 
-    # 3. Readiness Validation before Welcome / Pre-test
-    if slug in {"diagnostics", "express"} and cfg and cfg.test_set_id:
+    # 3. Readiness Validation ONLY when pre-dialogue test is enabled (never mutates DB)
+    pre_test_completed = False
+    if pre_test_enabled:
+        if not (cfg and cfg.test_set_id):
+            logger.warning("Topic %s has pre_dialogue_test_enabled=True but test_set_id is None", slug)
+            await send_test_setup_unavailable(bot, user_id, state)
+            return None
         async with async_session_maker() as session:
-            configured_set, active_count, configured_ready = await get_test_set_readiness(
-                session,
-                cfg.test_set_id,
-                slug,
-            )
-        if not configured_ready:
+            claim = await get_pre_test_claim(session, user_id, slug, dialogue_id, test_set_id=cfg.test_set_id)
+            pre_test_completed = bool(claim and claim.status == "completed")
+            if not pre_test_completed:
+                configured_set, active_count, configured_ready = await get_test_set_readiness(
+                    session,
+                    cfg.test_set_id,
+                    slug,
+                )
+        if not pre_test_completed and not (
+            configured_set
+            and configured_set.is_enabled
+            and not configured_set.is_archived
+            and configured_ready
+        ):
             await send_test_setup_unavailable(
                 bot,
                 user_id,
@@ -2493,12 +2513,6 @@ async def _activate_ai_mode_inner(
                 expected_count=expected_test_set_question_count(configured_set, slug) if configured_set else None,
             )
             return None
-
-    pre_test_enabled = bool(cfg and cfg.pre_dialogue_test_enabled)
-    if pre_test_enabled and not (cfg and cfg.test_set_id):
-        logger.warning("Topic %s has pre_dialogue_test_enabled=True but test_set_id is None", slug)
-        await send_test_setup_unavailable(bot, user_id, state)
-        return None
 
     # 4. Welcome & Start Dialogue Button Gate (Runs FIRST on topic entry)
     start_btn_enabled = bool(cfg and cfg.start_dialogue_button_enabled)
@@ -2517,31 +2531,26 @@ async def _activate_ai_mode_inner(
         return None
 
     # 5. Pre-dialogue Test Gate (Guard 3 - Runs after Start button click or direct entry)
-    if pre_test_enabled:
+    if pre_test_enabled and not pre_test_completed:
         test_set_id = cfg.test_set_id
-        async with async_session_maker() as session:
-            claim = await get_pre_test_claim(session, user_id, slug, dialogue_id, test_set_id=test_set_id)
-            is_completed = bool(claim and claim.status == "completed")
-
-        if not is_completed:
-            if not from_start_button and cfg and cfg.welcome_text:
-                media_rows = []
-                if cfg.welcome_media_id:
-                    async with async_session_maker() as session:
-                        media_row = await session.get(ContentMedia, cfg.welcome_media_id)
-                    if media_row:
-                        media_rows.append(media_row)
-                await send_smart_content(event, cfg.welcome_text, media_rows or None, None, bot)
-            await start_universal_test(
-                bot,
-                user_id,
-                state,
-                test_set_id=test_set_id,
-                dialogue_id=dialogue_id,
-                topic_slug=slug,
-                purpose="pre_dialogue",
-            )
-            return None
+        if not from_start_button and cfg and cfg.welcome_text:
+            media_rows = []
+            if cfg.welcome_media_id:
+                async with async_session_maker() as session:
+                    media_row = await session.get(ContentMedia, cfg.welcome_media_id)
+                if media_row:
+                    media_rows.append(media_row)
+            await send_smart_content(event, cfg.welcome_text, media_rows or None, None, bot)
+        await start_universal_test(
+            bot,
+            user_id,
+            state,
+            test_set_id=test_set_id,
+            dialogue_id=dialogue_id,
+            topic_slug=slug,
+            purpose="pre_dialogue",
+        )
+        return None
 
     # 6. Prerecorded First Message (Guard 2) & Working Dialogue Entry
     markup = await kb.ai_response_keyboard_for_topic(slug, dialogue_id)
