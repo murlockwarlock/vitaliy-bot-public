@@ -3,10 +3,16 @@ import csv
 import html
 import io
 import json
+import os
 import re
 import secrets
+import shutil
+import struct
+import subprocess
+import tempfile
 import weakref
 from datetime import datetime, timedelta
+from pathlib import Path
 from urllib.parse import urlencode, urlparse, urlunparse, parse_qsl
 
 from aiogram import Router, F, Bot
@@ -1440,6 +1446,299 @@ async def show_meditation_card(target, meditation_id: int, page: int = 0, bot=No
     await send_content(target, text, None, await configured_meditation_card_keyboard(meditation_id, page), bot)
 
 
+def _detect_audio_container_ext(raw_bytes: bytes, ext_hint: str = "") -> str:
+    if len(raw_bytes) >= 3 and raw_bytes[:3] == b"ID3":
+        return ".mp3"
+    if len(raw_bytes) >= 2 and raw_bytes[0] == 0xFF and (raw_bytes[1] & 0xE0) == 0xE0:
+        return ".mp3"
+    if len(raw_bytes) >= 12 and raw_bytes[4:8] == b"ftyp":
+        return ".m4a"
+    if len(raw_bytes) >= 4 and raw_bytes[:4] == b"OggS":
+        return ".ogg"
+    if len(raw_bytes) >= 4 and raw_bytes[:4] == b"fLaC":
+        return ".flac"
+    norm_hint = (ext_hint or "").strip().lower()
+    if norm_hint and not norm_hint.startswith("."):
+        norm_hint = f".{norm_hint}"
+    if norm_hint in {".mp3", ".m4a", ".ogg", ".flac", ".wav"}:
+        return norm_hint
+    return ".mp3"
+
+
+def _strip_id3_tags(raw_bytes: bytes) -> bytes:
+    data = raw_bytes
+    while len(data) >= 10 and data[:3] == b"ID3":
+        flags = data[5]
+        tag_size = (
+            ((data[6] & 0x7F) << 21)
+            | ((data[7] & 0x7F) << 14)
+            | ((data[8] & 0x7F) << 7)
+            | (data[9] & 0x7F)
+        )
+        header_len = 10 + tag_size + (10 if (flags & 0x10) else 0)
+        if header_len <= 0 or header_len > len(data):
+            break
+        data = data[header_len:]
+    if len(data) >= 128 and data[-128:-125] == b"TAG":
+        data = data[:-128]
+    return data
+
+
+def _build_id3v23_header(title: str, performer: str) -> bytes:
+    frames = bytearray()
+    for frame_id, value in ((b"TIT2", title), (b"TPE1", performer)):
+        clean_val = (value or "").strip()
+        if not clean_val:
+            continue
+        payload = b"\x01" + clean_val.encode("utf-16")
+        frames.extend(frame_id)
+        frames.extend(struct.pack(">I", len(payload)))
+        frames.extend(b"\x00\x00")
+        frames.extend(payload)
+    size = len(frames)
+    synchsafe = bytes([
+        (size >> 21) & 0x7F,
+        (size >> 14) & 0x7F,
+        (size >> 7) & 0x7F,
+        size & 0x7F,
+    ])
+    return b"ID3\x03\x00\x00" + synchsafe + bytes(frames)
+
+
+def retag_audio_bytes_with_title(
+    raw_bytes: bytes,
+    title: str,
+    performer: str = "Виталий Наумов",
+    ext_hint: str = "",
+) -> tuple[bytes, str]:
+    """Strip legacy filename/ID3 metadata and write practice title + performer."""
+    ext = _detect_audio_container_ext(raw_bytes, ext_hint=ext_hint)
+    ffmpeg_bin = shutil.which("ffmpeg")
+    if ffmpeg_bin:
+        try:
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                in_path = Path(tmp_dir) / f"in{ext}"
+                out_path = Path(tmp_dir) / f"out{ext}"
+                in_path.write_bytes(raw_bytes)
+                subprocess.run(
+                    [
+                        ffmpeg_bin,
+                        "-nostdin",
+                        "-y",
+                        "-loglevel",
+                        "error",
+                        "-i",
+                        str(in_path),
+                        "-map",
+                        "0:a:0",
+                        "-map_metadata",
+                        "-1",
+                        "-metadata",
+                        f"title={title}",
+                        "-metadata",
+                        f"artist={performer}",
+                        "-c:a",
+                        "copy",
+                        str(out_path),
+                    ],
+                    check=True,
+                    capture_output=True,
+                    timeout=30,
+                )
+                if out_path.exists() and out_path.stat().st_size > 0:
+                    return out_path.read_bytes(), ext
+        except Exception:
+            pass
+
+    stripped = _strip_id3_tags(raw_bytes)
+    return _build_id3v23_header(title, performer) + stripped, ".mp3"
+
+
+def _safe_audio_filename(title: str, ext: str = ".mp3") -> str:
+    cleaned = re.sub(r'[\\/:*?"<>|\r\n\t]+', " ", (title or "").strip())
+    cleaned = re.sub(r"\s+", " ", cleaned).strip().rstrip(".")
+    if not cleaned:
+        cleaned = "practice"
+    if not ext.startswith("."):
+        ext = f".{ext}"
+    return f"{cleaned[:120]}{ext}"
+
+
+def _read_local_meditation_audio(meditation_id: int, sort_order: int | None = None) -> tuple[bytes, str] | None:
+    media_dir = Path(__file__).resolve().parent / "media" / "meditations"
+    if not media_dir.is_dir():
+        return None
+    stems = [str(meditation_id)]
+    if sort_order is not None:
+        stems.extend([f"sort_{sort_order}", f"practice_{sort_order}"])
+    for stem in stems:
+        for ext in (".mp3", ".m4a", ".ogg", ".flac"):
+            candidate = media_dir / f"{stem}{ext}"
+            if candidate.is_file() and candidate.stat().st_size > 0:
+                return candidate.read_bytes(), ext
+    return None
+
+
+async def _download_telegram_audio_bytes(bot: Bot, file_id: str) -> tuple[bytes | None, str, str | None]:
+    """Download audio bytes via Bot API if supported.
+
+    Returns (raw_bytes_or_none, ext_hint, error_code_or_none).
+    error_code is 'file_too_big' when public Bot API 20 MB getFile cap is hit.
+    """
+    try:
+        file_info = await bot.get_file(file_id)
+    except TelegramBadRequest as exc:
+        if "file is too big" in str(exc).lower():
+            return None, "", "file_too_big"
+        logger.warning("Failed to call get_file for meditation audio: %s", exc)
+        return None, "", "bad_request"
+    except Exception as exc:
+        logger.debug("Skipping audio download for file_id (non-downloadable or mock): %s", exc)
+        return None, "", "unavailable"
+
+    file_path = getattr(file_info, "file_path", None)
+    if not isinstance(file_path, str) or not file_path:
+        return None, "", "mock_or_empty"
+
+    ext_hint = os.path.splitext(file_path)[1]
+    if os.path.isabs(file_path) and os.path.isfile(file_path):
+        try:
+            raw = await asyncio.to_thread(Path(file_path).read_bytes)
+            if raw:
+                return raw, ext_hint, None
+        except Exception:
+            pass
+
+    try:
+        downloaded = await bot.download_file(file_path)
+    except Exception as exc:
+        logger.warning("Failed to download meditation audio file '%s': %s", file_path, exc)
+        return None, ext_hint, "download_failed"
+
+    if isinstance(downloaded, (bytes, bytearray)):
+        raw_bytes = bytes(downloaded)
+    elif hasattr(downloaded, "read") and callable(downloaded.read):
+        maybe_bytes = downloaded.read()
+        raw_bytes = bytes(maybe_bytes) if isinstance(maybe_bytes, (bytes, bytearray)) else b""
+    else:
+        raw_bytes = b""
+
+    if not raw_bytes:
+        return None, ext_hint, "empty_bytes"
+    return raw_bytes, ext_hint, None
+
+
+async def _prepare_meditation_audio_upload(
+    bot: Bot,
+    meditation_id: int,
+    sort_order: int | None,
+    file_id: str,
+    track_title: str,
+    synced_marker: str | None,
+    performer: str = "Виталий Наумов",
+) -> tuple[BufferedInputFile | str, str | None]:
+    """Prepare BufferedInputFile with retagged title when unsynced, or cached file_id."""
+    if not track_title or synced_marker == track_title:
+        return file_id, None
+
+    local_pair = await asyncio.to_thread(_read_local_meditation_audio, meditation_id, sort_order)
+    if local_pair is not None:
+        raw_bytes, ext_hint = local_pair
+        tagged_bytes, out_ext = await asyncio.to_thread(
+            retag_audio_bytes_with_title, raw_bytes, track_title, performer, ext_hint
+        )
+        return BufferedInputFile(tagged_bytes, filename=_safe_audio_filename(track_title, out_ext)), track_title
+
+    oversize_marker = f"__oversize__:{file_id}"
+    if synced_marker == oversize_marker:
+        return file_id, None
+
+    raw_bytes, ext_hint, err_code = await _download_telegram_audio_bytes(bot, file_id)
+    if err_code == "file_too_big":
+        return file_id, oversize_marker
+    if not raw_bytes:
+        return file_id, None
+
+    tagged_bytes, out_ext = await asyncio.to_thread(
+        retag_audio_bytes_with_title, raw_bytes, track_title, performer, ext_hint
+    )
+    return BufferedInputFile(tagged_bytes, filename=_safe_audio_filename(track_title, out_ext)), track_title
+
+
+async def _persist_synced_meditation_audio(
+    meditation_id: int,
+    expected_old_file_id: str,
+    sent_message: object,
+    marker_to_save: str | None,
+) -> None:
+    if not marker_to_save:
+        return
+    audio_obj = getattr(sent_message, "audio", None)
+    new_file_id = getattr(audio_obj, "file_id", None)
+    async with async_session_maker() as session:
+        med = await session.get(FunnelMeditation, meditation_id)
+        if not med or med.file_id != expected_old_file_id:
+            return
+        if isinstance(new_file_id, str) and new_file_id and not marker_to_save.startswith("__oversize__:"):
+            med.file_id = new_file_id
+            med.audio_title_synced_for = marker_to_save
+            await session.commit()
+        elif marker_to_save.startswith("__oversize__:"):
+            med.audio_title_synced_for = marker_to_save
+            await session.commit()
+
+
+async def sync_all_meditation_audio_titles(bot: Bot, target_chat_id: int) -> list[dict]:
+    """Batch-retag and refresh cached Telegram file_ids for all audio meditations."""
+    results: list[dict] = []
+    async with async_session_maker() as session:
+        meds = (
+            await session.scalars(
+                select(FunnelMeditation)
+                .where(FunnelMeditation.file_type == "audio", FunnelMeditation.file_id.is_not(None))
+                .order_by(FunnelMeditation.sort_order.asc(), FunnelMeditation.id.asc())
+            )
+        ).all()
+
+    for med in meds:
+        track_title = (med.title or "").strip()
+        old_file_id = med.file_id
+        if not track_title or not old_file_id:
+            continue
+        upload_obj, marker = await _prepare_meditation_audio_upload(
+            bot=bot,
+            meditation_id=med.id,
+            sort_order=med.sort_order,
+            file_id=old_file_id,
+            track_title=track_title,
+            synced_marker=med.audio_title_synced_for,
+        )
+        if isinstance(upload_obj, BufferedInputFile):
+            sent = await bot.send_audio(
+                target_chat_id,
+                upload_obj,
+                title=track_title,
+                performer="Виталий Наумов",
+            )
+            await _persist_synced_meditation_audio(med.id, old_file_id, sent, marker)
+            try:
+                msg_id = getattr(sent, "message_id", None)
+                if isinstance(msg_id, int):
+                    await bot.delete_message(target_chat_id, msg_id)
+            except Exception:
+                pass
+            results.append({"id": med.id, "title": track_title, "status": "synced"})
+        else:
+            if marker and marker.startswith("__oversize__:"):
+                await _persist_synced_meditation_audio(med.id, old_file_id, None, marker)
+                results.append({"id": med.id, "title": track_title, "status": "oversize_gt_20mb"})
+            elif med.audio_title_synced_for == track_title:
+                results.append({"id": med.id, "title": track_title, "status": "already_synced"})
+            else:
+                results.append({"id": med.id, "title": track_title, "status": "skipped"})
+    return results
+
+
 async def send_meditation(target, meditation_id: int, bot=None):
     bot = resolve_bot(target, bot)
     chat_id, message_obj = resolve_message_context(target)
@@ -1474,10 +1773,22 @@ async def send_meditation(target, meditation_id: int, bot=None):
 
     if meditation.file_type == "audio" and meditation.file_id:
         track_title = (meditation.title or "").strip() or None
+        old_file_id = meditation.file_id
+        audio_payload: BufferedInputFile | str = old_file_id
+        marker_to_save: str | None = None
+        if track_title:
+            audio_payload, marker_to_save = await _prepare_meditation_audio_upload(
+                bot=bot,
+                meditation_id=meditation.id,
+                sort_order=meditation.sort_order,
+                file_id=old_file_id,
+                track_title=track_title,
+                synced_marker=getattr(meditation, "audio_title_synced_for", None),
+            )
         if len(caption) <= 1024:
-            await bot.send_audio(
+            sent_audio = await bot.send_audio(
                 chat_id,
-                meditation.file_id,
+                audio_payload,
                 caption=caption,
                 parse_mode="HTML",
                 reply_markup=listen_markup,
@@ -1485,13 +1796,20 @@ async def send_meditation(target, meditation_id: int, bot=None):
                 performer="Виталий Наумов",
             )
         else:
-            await bot.send_audio(
+            sent_audio = await bot.send_audio(
                 chat_id,
-                meditation.file_id,
+                audio_payload,
                 title=track_title,
                 performer="Виталий Наумов",
             )
             await bot.send_message(chat_id, caption, parse_mode="HTML", reply_markup=listen_markup)
+        if marker_to_save:
+            await _persist_synced_meditation_audio(
+                meditation_id=meditation.id,
+                expected_old_file_id=old_file_id,
+                sent_message=sent_audio,
+                marker_to_save=marker_to_save,
+            )
     elif meditation.file_type == "video" and meditation.file_id:
         if len(caption) <= 1024:
             await bot.send_video(chat_id, meditation.file_id, caption=caption, parse_mode="HTML", reply_markup=listen_markup)
@@ -3462,24 +3780,81 @@ async def add_med_url(message: Message, state: FSMContext):
     )
 
 
+async def _sync_admin_uploaded_meditation_audio(
+    message: Message,
+    track_title: str,
+) -> tuple[str, str | None, str | None]:
+    """Re-upload admin audio with clean ID3 title when <=20MB; warn if >20MB with mismatched title."""
+    raw_file_id = message.audio.file_id
+    clean_title = (track_title or "").strip()
+    bot = getattr(message, "bot", None)
+    if not bot or not clean_title:
+        return raw_file_id, None, None
+
+    raw_bytes, ext_hint, err_code = await _download_telegram_audio_bytes(bot, raw_file_id)
+    if err_code == "file_too_big":
+        embedded_title = (getattr(message.audio, "title", None) or "").strip()
+        if embedded_title == clean_title:
+            return raw_file_id, clean_title, None
+        warn = (
+            "⚠️ Аудио сохранено, но его размер превышает 20 МБ (лимит скачивания Telegram Bot API), "
+            "поэтому бот не может автоматически перезаписать встроенное название трека. "
+            f"Чтобы в плеере отображалось «{html.escape(clean_title)}», пропишите Title в свойствах/ID3 файла перед отправкой "
+            "или загрузите MP3 размером до 20 МБ."
+        )
+        return raw_file_id, f"__oversize__:{raw_file_id}", warn
+
+    if not raw_bytes:
+        return raw_file_id, None, None
+
+    tagged_bytes, out_ext = await asyncio.to_thread(
+        retag_audio_bytes_with_title, raw_bytes, clean_title, "Виталий Наумов", ext_hint
+    )
+    upload = BufferedInputFile(tagged_bytes, filename=_safe_audio_filename(clean_title, out_ext))
+    try:
+        sent = await bot.send_audio(
+            message.chat.id,
+            upload,
+            title=clean_title,
+            performer="Виталий Наумов",
+        )
+        sent_audio = getattr(sent, "audio", None)
+        new_fid = getattr(sent_audio, "file_id", None)
+        if isinstance(new_fid, str) and new_fid:
+            return new_fid, clean_title, None
+    except Exception as exc:
+        logger.warning("Failed to re-upload admin meditation audio with synced title: %s", exc)
+    return raw_file_id, None, None
+
+
 @router.message(FunnelAdminStates.add_media, F.audio | F.video)
 async def add_med_media(message: Message, state: FSMContext):
     data = await state.get_data()
+    new_title = data["new_title"]
+    warn_text = None
+    if message.audio:
+        saved_file_id, synced_marker, warn_text = await _sync_admin_uploaded_meditation_audio(message, new_title)
+        saved_file_type = "audio"
+    else:
+        saved_file_id = message.video.file_id
+        saved_file_type = "video"
+        synced_marker = None
     async with async_session_maker() as session:
         current_max = await session.scalar(select(func.max(FunnelMeditation.sort_order)))
         meditation = FunnelMeditation(
-            title=data["new_title"],
+            title=new_title,
             duration_minutes=data["new_duration"],
             short_description=data["new_short"],
             full_description=data["new_full"],
-            file_id=message.audio.file_id if message.audio else message.video.file_id,
-            file_type="audio" if message.audio else "video",
+            file_id=saved_file_id,
+            file_type=saved_file_type,
+            audio_title_synced_for=synced_marker,
             sort_order=(current_max or 0) + 1,
         )
         session.add(meditation)
         await session.commit()
     await state.clear()
-    await message.answer("Медитация добавлена.")
+    await message.answer(f"Медитация добавлена.\n\n{warn_text}" if warn_text else "Медитация добавлена.", parse_mode="HTML")
     await show_admin_meditations(message)
 
 
@@ -3773,6 +4148,8 @@ async def admin_fmed_edit_text_save(message: Message, state: FSMContext):
         meditation = await session.get(FunnelMeditation, med_id)
         if meditation:
             if field_name == "title":
+                if meditation.title != value:
+                    meditation.audio_title_synced_for = None
                 meditation.title = value
             elif field_name == "duration":
                 try:
@@ -3807,14 +4184,27 @@ async def admin_fmed_edit_media_save(message: Message, state: FSMContext):
     data = await state.get_data()
     med_id = data["edit_med_id"]
     page = data.get("edit_med_page", 0)
+    warn_text = None
     async with async_session_maker() as session:
         meditation = await session.get(FunnelMeditation, med_id)
-        if meditation:
-            meditation.file_id = message.audio.file_id if message.audio else message.video.file_id
-            meditation.file_type = "audio" if message.audio else "video"
-            await session.commit()
+        med_title = meditation.title if meditation else ""
+    if meditation:
+        if message.audio:
+            saved_file_id, synced_marker, warn_text = await _sync_admin_uploaded_meditation_audio(message, med_title)
+            saved_file_type = "audio"
+        else:
+            saved_file_id = message.video.file_id
+            saved_file_type = "video"
+            synced_marker = None
+        async with async_session_maker() as session:
+            med_row = await session.get(FunnelMeditation, med_id)
+            if med_row:
+                med_row.file_id = saved_file_id
+                med_row.file_type = saved_file_type
+                med_row.audio_title_synced_for = synced_marker
+                await session.commit()
     await state.clear()
-    await message.answer("Медиа обновлено.")
+    await message.answer(f"Медиа обновлено.\n\n{warn_text}" if warn_text else "Медиа обновлено.", parse_mode="HTML")
     await show_meditation_admin_detail(message, med_id, page)
 
 
@@ -3840,6 +4230,7 @@ async def admin_fmed_edit_media_clear(message: Message, state: FSMContext):
         if meditation:
             meditation.file_id = None
             meditation.file_type = None
+            meditation.audio_title_synced_for = None
             await session.commit()
     await state.clear()
     await message.answer("Медиа удалено.")

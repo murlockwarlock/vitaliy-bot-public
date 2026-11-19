@@ -491,6 +491,7 @@ class BotConfig(Base):
         default=json.dumps(DEFAULT_CRISIS_MARKERS, ensure_ascii=False),
         nullable=False,
     )
+    content_em_dash_normalized = Column(Boolean, default=False, nullable=False)
 
 
 class FunnelConfig(Base):
@@ -518,6 +519,7 @@ class FunnelMeditation(Base):
     file_id = Column(String, nullable=True)
     file_type = Column(String, nullable=True)
     reserve_url = Column(String, nullable=True)
+    audio_title_synced_for = Column(String, nullable=True)
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=msk_now)
 
@@ -1316,6 +1318,14 @@ async def _ensure_postgresql_compat_schema(conn):
         f"TEXT NOT NULL DEFAULT '{default_markers}'"
     ))
     await conn.execute(text(
+        'ALTER TABLE "bot_config" ADD COLUMN IF NOT EXISTS '
+        '"content_em_dash_normalized" BOOLEAN NOT NULL DEFAULT FALSE'
+    ))
+    await conn.execute(text(
+        'ALTER TABLE "funnel_meditations" ADD COLUMN IF NOT EXISTS '
+        '"audio_title_synced_for" VARCHAR NULL'
+    ))
+    await conn.execute(text(
         'UPDATE "users" SET "admin_role" = \'full_admin\' '
         'WHERE "is_admin" = TRUE AND ("admin_role" IS NULL OR TRIM("admin_role") = \'\')'
     ))
@@ -1373,6 +1383,16 @@ CANONICAL_QUESTIONS = [
 
 DIAGNOSTIC_AI_SESSION_SET_SLUG = "diagnostics"
 PSYCHOLOGICAL_PROFILE_SET_SLUG = "express_psychological_profile"
+
+DEFAULT_HABIT_REMINDER_TEXT = (
+    "🔔 <b>Напоминание о привычке</b>\n\n"
+    "🎗 <b>{habit_name}</b>\n\n"
+    "Пора уделить время себе. Получилось сегодня?"
+)
+DEFAULT_JOURNAL_REMINDER_TEXT = (
+    "🔔 <b>Время вечерней рефлексии!</b>\n\n"
+    "Выдели несколько минут, чтобы подвести итоги дня в Дневнике."
+)
 
 JOURNAL_NOTE_DEFAULT_PROMPT = (
     "Ты — ИИ-ассистент дневника саморефлексии в боте Виталия Наумова (метод ТрансКоучинг). "
@@ -1809,6 +1829,8 @@ async def init_db():
                 "Напоминаю, что в боте доступны медитативные практики, персональные ИИ-сессии и библиотека книг. Возвращайся!",
                 None,
             ),
+            ("habit_reminder_text", DEFAULT_HABIT_REMINDER_TEXT, None),
+            ("journal_reminder_text", DEFAULT_JOURNAL_REMINDER_TEXT, None),
             ("journal_video", "Видеоурок по саморефлексии", None),
         ]
 
@@ -2349,12 +2371,16 @@ async def run_data_migrations(session: AsyncSession):
             "С возвращением! 👋 Ты уже пробовал(а) нашу практику...\n\n"
             "Что ты хочешь сделать дальше?"
         ), None),
+        ("habit_reminder_text", DEFAULT_HABIT_REMINDER_TEXT, None),
+        ("journal_reminder_text", DEFAULT_JOURNAL_REMINDER_TEXT, None),
     ]
 
     for key, text_content, url in new_defaults:
         item = await session.get(Content, key)
         if not item:
             session.add(Content(key=key, text_content=text_content, button_text=None, link_url=url))
+        elif key == "habit_reminder_text" and item.text_content and "Выполнил(а)?" in item.text_content:
+            item.text_content = DEFAULT_HABIT_REMINDER_TEXT
 
     # 6. TestConfig -> TestSet migration
     diag_set = (await session.execute(select(TestSet).where(TestSet.slug == 'diagnostics'))).scalar_one_or_none()
@@ -2519,4 +2545,33 @@ async def run_data_migrations(session: AsyncSession):
         )
         .values(action_type="url")
     )
+    bot_conf = await session.get(BotConfig, 1)
+    if bot_conf and not bot_conf.content_em_dash_normalized:
+        await normalize_content_em_dashes(session)
+        bot_conf.content_em_dash_normalized = True
     await session.commit()
+
+
+async def normalize_content_em_dashes(session: AsyncSession) -> None:
+    """Replace em-dash '—' with en-dash '–' in user-facing content tables (excluding system prompts)."""
+    await session.flush()
+    statements = (
+        'UPDATE "content" SET "text_content" = REPLACE("text_content", \'—\', \'–\') WHERE "text_content" LIKE \'%—%\'',
+        'UPDATE "content" SET "button_text" = REPLACE("button_text", \'—\', \'–\') WHERE "button_text" LIKE \'%—%\'',
+        'UPDATE "topic_dialogue_configs" SET "welcome_text" = REPLACE("welcome_text", \'—\', \'–\') WHERE "welcome_text" LIKE \'%—%\'',
+        'UPDATE "topic_dialogue_configs" SET "prerecorded_first_message" = REPLACE("prerecorded_first_message", \'—\', \'–\') WHERE "prerecorded_first_message" LIKE \'%—%\'',
+        'UPDATE "funnel_meditations" SET "title" = REPLACE("title", \'—\', \'–\') WHERE "title" LIKE \'%—%\'',
+        'UPDATE "funnel_meditations" SET "short_description" = REPLACE("short_description", \'—\', \'–\') WHERE "short_description" LIKE \'%—%\'',
+        'UPDATE "funnel_meditations" SET "full_description" = REPLACE("full_description", \'—\', \'–\') WHERE "full_description" LIKE \'%—%\'',
+        'UPDATE "followup_steps" SET "message_text" = REPLACE("message_text", \'—\', \'–\') WHERE "message_text" LIKE \'%—%\'',
+        'UPDATE "followup_steps" SET "button_text" = REPLACE("button_text", \'—\', \'–\') WHERE "button_text" LIKE \'%—%\'',
+        'UPDATE "books" SET "title" = REPLACE("title", \'—\', \'–\') WHERE "title" LIKE \'%—%\'',
+        'UPDATE "books" SET "description" = REPLACE("description", \'—\', \'–\') WHERE "description" LIKE \'%—%\'',
+    )
+    for stmt in statements:
+        await session.execute(text(stmt))
+    try:
+        from content_service import invalidate_content_cache
+        invalidate_content_cache()
+    except Exception:
+        pass

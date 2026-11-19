@@ -11,7 +11,7 @@ from pathlib import Path
 from urllib.parse import urlencode, urlparse
 from aiohttp import ClientSession
 import secrets
-from aiogram import Router, F, Bot
+from aiogram import Router, F, Bot, BaseMiddleware
 from aiogram.types import Message, CallbackQuery, BufferedInputFile, InputMediaPhoto, InputMediaVideo, BotCommand, BotCommandScopeChat, LabeledPrice, PreCheckoutQuery, ContentType, InlineKeyboardButton, ReplyKeyboardRemove, LinkPreviewOptions, InlineKeyboardMarkup
 from aiogram.filters import CommandStart, Command
 from aiogram.exceptions import TelegramRetryAfter, TelegramBadRequest
@@ -19,7 +19,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.base import StorageKey
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from sqlalchemy import select, update, func, delete, text, or_, and_, cast, String
+from sqlalchemy import select, update, func, delete, text, or_, and_, cast, String, case, union_all
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.dialects.sqlite import insert as sqlite_upsert
 from sqlalchemy.orm import selectinload
@@ -59,7 +59,7 @@ from database import async_session_maker, User, Topic, Content, Message as DBMes
     UserSubscription, PromoCode, ProdamusPayment, TrialUsageHistory, get_all_admin_ids, \
     PaymentIntent, ReferralPaymentLog, AiDisclaimerClaim, TopicDialogueConfig, PendingAiFlow, SessionSummary, SummaryClaim, \
     UserTopicSession, PreTestClaim, TopicPrerecordedDelivery, TestSession, TestAttempt, MenuSection, MenuButton, \
-    AdminNavigationContext, sync_book_menu_buttons
+    AdminNavigationContext, JournalEntry, QuickNote, sync_book_menu_buttons
 import keyboards as kb
 from menu_service import classify_menu_action, is_menu_section_enabled, validate_menu_url
 from ai_dialogue_service import (
@@ -2265,6 +2265,39 @@ async def touch_user_activity(user_id: int):
         else:
             user.next_main_reminder_at = None
         await session.commit()
+
+
+class UserActivityMiddleware(BaseMiddleware):
+    """Updates User.last_activity_at on non-admin user messages and button presses."""
+
+    async def __call__(self, handler, event, data):
+        from_user = getattr(event, "from_user", None)
+        user_id = getattr(from_user, "id", None)
+        is_bot = bool(getattr(from_user, "is_bot", False))
+        if isinstance(user_id, int) and not is_bot:
+            should_touch = False
+            if isinstance(event, CallbackQuery):
+                cb_data = event.data or ""
+                if permission_for_callback(cb_data) is None:
+                    should_touch = True
+            elif isinstance(event, Message):
+                msg_text = (event.text or "").strip()
+                if not msg_text.startswith(("/admin", "/help")):
+                    state = data.get("state")
+                    current_state = ""
+                    if state is not None and hasattr(state, "get_state"):
+                        try:
+                            current_state = (await state.get_state()) or ""
+                        except Exception:
+                            current_state = ""
+                    if "Admin" not in current_state:
+                        should_touch = True
+            if should_touch:
+                try:
+                    await touch_user_activity(user_id)
+                except Exception:
+                    pass
+        return await handler(event, data)
 
 
 _ai_start_locks: dict[tuple[int, str], asyncio.Lock] = {}
@@ -5695,9 +5728,11 @@ CATEGORIES = {
     "journal": {
         "journal_intro": "Вход в дневник",
         "journal_video": "Видео дневника",
+        "journal_reminder_text": "🔔 Напоминание о дневнике",
     },
     "habits": {
         "habits_text": "Экран полезных привычек",
+        "habit_reminder_text": "🔔 Напоминание о привычке",
     },
     "subscription": {
         "subscription_info": "Экран подписки",
@@ -5752,6 +5787,8 @@ HUMAN_NAMES = {
     "session_completed": "Экран завершения AI-сессии",
     "journal_intro": "Вход в дневник",
     "journal_video": "Видео дневника",
+    "journal_reminder_text": "Напоминание о дневнике",
+    "habit_reminder_text": "Напоминание о привычке",
     "extended_menu_intro": "Вступление расширенного меню",
     "thematic_sessions_intro": "Страница тематических сессий",
 }
@@ -5926,6 +5963,8 @@ async def edit_content_start(callback: CallbackQuery, state: FSMContext):
         if content_obj.media:
             media_types = ", ".join(m.file_type for m in content_obj.media)
             info_parts.append(f"<b>Текущее медиа:</b> {media_types}")
+    if key == "habit_reminder_text":
+        info_parts.append("\n💡 <i>Используйте <code>{habit_name}</code> для автоматической подстановки названия привычки.</i>")
     info_parts.append("\nОтправьте новое значение (текст, фото или видео) или нажмите «Назад»:")
     text = "\n".join(info_parts)
 
@@ -11421,7 +11460,51 @@ async def _render_admin_clients_list(
     )
 
     async with async_session_maker() as session:
-        base_query = select(User)
+        activity_union = union_all(
+            select(User.id.label("u_id"), User.last_activity_at.label("ts")),
+            select(User.id.label("u_id"), User.created_at.label("ts")),
+            select(
+                DBMessage.user_id.label("u_id"),
+                func.max(DBMessage.timestamp).label("ts"),
+            )
+            .where(DBMessage.role == "user")
+            .group_by(DBMessage.user_id),
+            select(
+                FunnelState.user_id.label("u_id"),
+                FunnelState.last_user_action_at.label("ts"),
+            ),
+            select(
+                JournalEntry.user_id.label("u_id"),
+                func.max(JournalEntry.started_at).label("ts"),
+            ).group_by(JournalEntry.user_id),
+            select(
+                JournalEntry.user_id.label("u_id"),
+                func.max(JournalEntry.completed_at).label("ts"),
+            ).group_by(JournalEntry.user_id),
+            select(
+                QuickNote.user_id.label("u_id"),
+                func.max(QuickNote.created_at).label("ts"),
+            ).group_by(QuickNote.user_id),
+            select(
+                TestAttempt.user_id.label("u_id"),
+                func.max(TestAttempt.started_at).label("ts"),
+            ).group_by(TestAttempt.user_id),
+            select(
+                TestAttempt.user_id.label("u_id"),
+                func.max(TestAttempt.completed_at).label("ts"),
+            ).group_by(TestAttempt.user_id),
+        ).subquery("user_activity_union")
+
+        activity_sq = (
+            select(
+                activity_union.c.u_id.label("u_id"),
+                func.max(activity_union.c.ts).label("last_action_at"),
+            )
+            .group_by(activity_union.c.u_id)
+            .subquery("user_last_action")
+        )
+
+        base_query = select(User).outerjoin(activity_sq, User.id == activity_sq.c.u_id)
         count_query = select(func.count(User.id))
 
         if search_query:
@@ -11441,8 +11524,17 @@ async def _render_admin_clients_list(
         page = max(0, min(page, total_pages - 1))
         offset = page * limit
 
+        crisis_first = case((User.crisis_detected_at.is_not(None), 0), else_=1).asc()
+        null_action_last = case((activity_sq.c.last_action_at.is_(None), 1), else_=0).asc()
         users_result = await session.execute(
-            base_query.order_by(User.created_at.desc()).limit(limit).offset(offset)
+            base_query.order_by(
+                crisis_first,
+                null_action_last,
+                activity_sq.c.last_action_at.desc(),
+                User.id.desc(),
+            )
+            .limit(limit)
+            .offset(offset)
         )
         users = users_result.scalars().all()
 
@@ -12599,6 +12691,14 @@ async def admin_reminders_settings(event, state: FSMContext | None = None):
     builder.button(
         text="✏️ Текст повторного напоминания",
         callback_data="edit_cont_main:main_reminder_common",
+    )
+    builder.button(
+        text="✏️ Напоминание о привычке",
+        callback_data="edit_cont_habits:habit_reminder_text",
+    )
+    builder.button(
+        text="✏️ Напоминание о дневнике",
+        callback_data="edit_cont_journal:journal_reminder_text",
     )
     builder.button(text="⬅️ Назад", callback_data="admin_section_automation")
     builder.adjust(1)
