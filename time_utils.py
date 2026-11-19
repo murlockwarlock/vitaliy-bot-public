@@ -46,6 +46,17 @@ def resolve_habit_timezone(value: str | None) -> ZoneInfo:
     return ZoneInfo(habit_timezone_name(value))
 
 
+def next_allowed_reminder_at(now_msk: datetime, timezone_name: str | None = None) -> datetime:
+    moscow = ZoneInfo(DEFAULT_HABIT_TIMEZONE)
+    local = now_msk.replace(tzinfo=moscow).astimezone(resolve_habit_timezone(timezone_name))
+    if 9 <= local.hour < 23:
+        return now_msk
+    morning = local.replace(hour=9, minute=0, second=0, microsecond=0)
+    if local.hour >= 23:
+        morning += timedelta(days=1)
+    return morning.astimezone(moscow).replace(tzinfo=None)
+
+
 def format_habit_timezone(value: str | None) -> str:
     name = habit_timezone_name(value)
     label = HABIT_TIMEZONE_LABELS.get(name, name)

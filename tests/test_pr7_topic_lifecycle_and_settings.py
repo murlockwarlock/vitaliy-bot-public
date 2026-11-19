@@ -482,6 +482,52 @@ class TopicLifecycleAndSettingsE2ETests(unittest.IsolatedAsyncioTestCase):
     # 1. EXPRESS (12 QUESTIONS): FULL E2E LIFECYCLE
     # =========================================================================
 
+    async def test_faq_text_reaches_strategy_session(self):
+        user_id = 701401
+        await self._seed_user(user_id)
+        await self._send_text(user_id, "/menu")
+        await self._click(user_id, "funnel_show_faq")
+        with patch("funnel.get_ai_response_for_topic", new=AsyncMock(return_value="Ответ о формате сессии")) as ai:
+            events = await self._send_text(user_id, "Что такое Путь Героя?")
+        self.assertEqual(ai.await_args.kwargs["topic_slug"], "strategy_session")
+        self.assertTrue(any("Ответ о формате" in event.get("text", "") for event in events))
+
+    async def test_text_after_reflection_opens_working_navigation(self):
+        user_id = 701402
+        await self._seed_user(user_id)
+        await self._send_text(user_id, "/menu")
+        await self._click(user_id, "funnel_heard")
+        with patch("funnel.get_ai_response_for_topic", new=AsyncMock(return_value="Мягкий разбор практики")):
+            await self._send_text(user_id, "Ничего не почувствовал")
+        events = await self._send_text(user_id, "А что тогда попробовать?")
+        buttons = [cb for event in events for _, cb, _ in event.get("buttons", [])]
+        self.assertIn("menu_funnel_start", buttons)
+        self.assertIn("funnel_to_main", buttons)
+        await self._click(user_id, "funnel_to_main")
+        self.assertIsNone(await self._state_of(user_id))
+
+    async def test_start_only_grants_bonus_for_enabled_subscription_access(self):
+        from database import UserSubscription
+
+        for index, (enabled, mode, expected) in enumerate((
+            (False, "subscription", False), (True, "free", False), (True, "subscription", True),
+        )):
+            user_id = 701410 + index
+            async with async_session_maker() as session:
+                config = await handlers._ensure_subscription_config(session)
+                config.subscriptions_enabled = enabled
+                config.welcome_bonus_days = 5
+                payment = await session.get(PaymentConfig, 1)
+                payment.mode = mode
+                await session.commit()
+            events = await self._send_text(user_id, "/start")
+            self.assertEqual(any("приветственный бонус" in (e.get("text") or "") for e in events), expected)
+            events = await self._send_text(user_id, "/start")
+            self.assertFalse(any("приветственный бонус" in (e.get("text") or "") for e in events))
+            async with async_session_maker() as session:
+                bonus = await session.scalar(select(UserSubscription).where(UserSubscription.user_id == user_id))
+                self.assertEqual(bonus is not None, expected)
+
     async def test_express_12_questions_full_e2e_lifecycle(self):
         user_id = 700101
         await self._seed_user(user_id)
@@ -1056,6 +1102,41 @@ class TopicLifecycleAndSettingsE2ETests(unittest.IsolatedAsyncioTestCase):
     # =========================================================================
     # 4. STRATEGY_SESSION & THEMATIC SESSIONS (INCLUDING RE-ENTRY)
     # =========================================================================
+
+    async def test_continue_dialogue_displays_current_menu_button_label(self):
+        user_id = 700146
+        await self._seed_user(user_id)
+        slug = "resume_test_topic"
+        async with async_session_maker() as session:
+            session.add(Topic(slug=slug, name="Внутреннее название"))
+            await session.flush()
+            button = await session.scalar(select(MenuButton).where(
+                MenuButton.section_key == "thematic",
+                MenuButton.legacy_callback == "thematic_relationships",
+            ))
+            button.topic_slug = slug
+            user = await session.get(User, user_id)
+            user.current_topic_slug = slug
+            user.current_dialogue_id = 3
+            for role, content in (("user", "Предыдущий вопрос"), ("assistant", "Предыдущий ответ")):
+                session.add(DBMessage(user_id=user_id, topic_slug=slug, dialogue_id=3, role=role, content=content))
+            await session.commit()
+
+        await self._send_text(user_id, "/menu")
+        await self._click(user_id, "ai_resume_current")
+        message = self._latest_chat_message(user_id)
+        self.assertEqual(message.text.splitlines()[0], "Продолжаем разговор в теме «👥 Отношения и границы» 👇")
+        self.assertIn("Предыдущий ответ", message.text)
+        await self._click(user_id, f"ai_finish_dialogue:{slug}:3", message_id=message.message_id)
+        async with async_session_maker() as session:
+            button = await session.get(MenuButton, button.id)
+            button.label = "💬 Близкие люди"
+            await session.commit()
+        await self._click(user_id, f"ai_continue_dialogue:{slug}:3")
+        message = self._latest_chat_message(user_id)
+        self.assertEqual(message.text.splitlines()[0], "Продолжаем разговор в теме «💬 Близкие люди» 👇")
+        self.assertIn("Предыдущий ответ", message.text)
+        self.assertEqual(await self._state_of(user_id), "UserStates:chatting")
 
     async def test_strategy_session_and_thematic_sessions_full_e2e_lifecycle(self):
         user_id = 700104

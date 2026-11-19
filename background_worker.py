@@ -12,7 +12,7 @@ from aiogram.exceptions import TelegramRetryAfter, TelegramForbiddenError, Teleg
 from aiogram.types import LinkPreviewOptions
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from logging_config import get_logger
-from time_utils import as_utc, calculate_next_habit_reminder, habit_local_now, msk_now, utc_naive
+from time_utils import as_utc, calculate_next_habit_reminder, habit_local_now, msk_now, next_allowed_reminder_at, resolve_habit_timezone, utc_naive
 from crisis_safety import automatic_send_allowed
 from vector_store import get_collection, get_active_path
 from mailing_service import (
@@ -260,7 +260,7 @@ async def process_mailings(bot):
 
 async def _process_habit_reminder(session, bot, habit, now_utc: datetime):
     user = await session.get(User, habit.user_id)
-    if not user:
+    if not user or user.is_blocked:
         return
 
     timezone_name = user.habit_timezone
@@ -281,6 +281,19 @@ async def _process_habit_reminder(session, bot, habit, now_utc: datetime):
         return
 
     if as_utc(habit.next_reminder_at) > now_utc:
+        return
+
+    due = habit.next_reminder_at
+    moscow = resolve_habit_timezone(None)
+    now_msk = now_utc.astimezone(moscow).replace(tzinfo=None)
+    allowed = next_allowed_reminder_at(now_msk, timezone_name)
+    pending = update(Habit).where(
+        Habit.id == habit.id, Habit.is_active == True, Habit.next_reminder_at == due,
+    )
+    if allowed > now_msk:
+        deferred = utc_naive(allowed.replace(tzinfo=moscow))
+        await session.execute(pending.values(next_reminder_at=deferred))
+        await session.commit()
         return
 
     if habit.last_reminder_at is not None:
@@ -305,55 +318,45 @@ async def _process_habit_reminder(session, bot, habit, now_utc: datetime):
     if not await automatic_send_allowed(session, habit.user_id, "habit_reminder"):
         return
 
-    next_reminder_at = calculate_next_habit_reminder(
-        habit.time_target,
-        timezone_name,
-        now=now_utc,
-        last_reminder_at=now_utc,
-    )
-    due_reminder_at = habit.next_reminder_at
-    claim = await session.execute(
-        update(Habit)
-        .where(Habit.id == habit.id, Habit.next_reminder_at == due_reminder_at)
-        .values(
-            next_reminder_at=utc_naive(next_reminder_at),
-            last_reminder_at=utc_naive(now_utc),
-        )
-    )
+    next_due = calculate_next_habit_reminder(habit.time_target, timezone_name, now=now_utc)
+    claimed_until = utc_naive(now_utc + timedelta(minutes=5))
+    claim = await session.execute(pending.values(next_reminder_at=claimed_until))
+    await session.commit()
     if not claim.rowcount:
         return
-    await session.commit()
 
+    safe_name = html.escape(habit.name or "")
+    text = (
+        f"🔔 <b>Напоминание о привычке</b>\n\n"
+        f"🎗 <b>{safe_name}</b>\n\n"
+        "Удели время себе. Когда закончишь, нажми «Сделано!»."
+    )
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Сделано!", callback_data=f"habit_done_track_{habit.id}")
+    kb.button(text="⚙️ Мои привычки", callback_data="habit_my_list")
+    kb.adjust(1)
     try:
-        safe_name = html.escape(habit.name or "")
-        text = (
-            f"🔔 <b>Напоминание привычки!</b>\n\n"
-            f"🎗 <b>{safe_name}</b>\n\n"
-            f"Пора уделить время себе. Выполнил(а)?"
-        )
-
-        kb = InlineKeyboardBuilder()
-        kb.button(text="✅ Сделано!", callback_data=f"habit_done_track_{habit.id}")
-        kb.button(text="⚙️ Мои привычки", callback_data="habit_my_list")
-        kb.adjust(1)
-
-        await bot.send_message(habit.user_id, text, reply_markup=kb.as_markup(), parse_mode='HTML')
-
-    except TelegramRetryAfter as e:
-        await asyncio.sleep(e.retry_after)
-        if not await automatic_send_allowed(session, habit.user_id, "habit_reminder"):
-            return
-        try:
-            await bot.send_message(habit.user_id, text, reply_markup=kb.as_markup(), parse_mode='HTML')
-        except Exception:
-            pass
-    except Exception as e:
-        logger.error(f"Error sending habit reminder to {habit.user_id}: {e}")
+        await bot.send_message(habit.user_id, text, reply_markup=kb.as_markup(), parse_mode="HTML")
+    except TelegramRetryAfter as exc:
+        values = {"next_reminder_at": utc_naive(now_utc + timedelta(seconds=max(60, exc.retry_after)))}
+    except TelegramForbiddenError:
+        user.is_blocked = True
+        values = {"next_reminder_at": due}
+    except Exception:
+        logger.warning("Habit reminder delivery failed habit_id=%s", habit.id)
+        values = {"next_reminder_at": utc_naive(now_utc + timedelta(minutes=1))}
+    else:
+        values = {
+            "next_reminder_at": utc_naive(next_due),
+            "last_reminder_at": utc_naive(now_utc),
+        }
+    await session.execute(update(Habit).where(
+        Habit.id == habit.id, Habit.next_reminder_at == claimed_until
+    ).values(**values))
+    await session.commit()
 
 
 async def process_habit_reminders(bot, now: datetime | None = None):
-    now_utc = as_utc(now)
-
     async with async_session_maker() as session:
         habits = await session.execute(
             select(Habit).where(
@@ -366,7 +369,7 @@ async def process_habit_reminders(bot, now: datetime | None = None):
 
         for habit in habits:
             try:
-                await _process_habit_reminder(session, bot, habit, now_utc)
+                await _process_habit_reminder(session, bot, habit, as_utc(now))
             except Exception:
                 logger.exception(
                     "Habit reminder processing failed habit_id=%s user_id=%s",
@@ -503,109 +506,70 @@ def main_reminder_keyboard():
     return builder.as_markup()
 
 
+async def process_main_reminders(bot, now=None):
+    async with async_session_maker() as session:
+        config = await session.get(BotConfig, 1)
+        if not config or not config.main_reminders_enabled:
+            return
+        users = (await session.scalars(select(User).where(
+            User.next_main_reminder_at <= (now or msk_now()), User.is_blocked == False,
+        ))).all()
+        first = await session.get(Content, "main_reminder_first")
+        common = await session.get(Content, "main_reminder_common")
+        for user in users:
+            current = now or msk_now()
+            due = user.next_main_reminder_at
+            pending = update(User).where(User.id == user.id, User.next_main_reminder_at == due)
+            funnel = await session.get(FunnelState, user.id)
+            if (funnel and funnel.is_active) or not await automatic_send_allowed(session, user.id, "main_reminder"):
+                await session.execute(pending.values(next_main_reminder_at=None))
+                await session.commit()
+                continue
+            allowed = next_allowed_reminder_at(current, user.habit_timezone)
+            if allowed > current:
+                await session.execute(pending.values(next_main_reminder_at=allowed))
+                await session.commit()
+                continue
+            lease = current + timedelta(minutes=5)
+            claim = await session.execute(pending.values(next_main_reminder_at=lease))
+            await session.commit()
+            if not claim.rowcount:
+                continue
+            text = (
+                (not user.main_reminder_count and first and first.text_content)
+                or (common and common.text_content)
+                or "Давно не виделись! Загляни в бот, там много полезного."
+            )
+            kwargs = dict(reply_markup=main_reminder_keyboard(), link_preview_options=LinkPreviewOptions(is_disabled=True))
+            try:
+                try:
+                    await bot.send_message(user.id, text, parse_mode="HTML", **kwargs)
+                except TelegramBadRequest:
+                    await bot.send_message(user.id, text, parse_mode=None, **kwargs)
+            except TelegramRetryAfter as exc:
+                values = {"next_main_reminder_at": current + timedelta(seconds=max(60, exc.retry_after))}
+            except TelegramForbiddenError:
+                values = {"is_blocked": True, "next_main_reminder_at": None}
+            except Exception:
+                logger.warning("Main reminder delivery failed user_id=%s", user.id)
+                values = {"next_main_reminder_at": current + timedelta(minutes=1)}
+            else:
+                values = {
+                    "main_reminder_count": User.main_reminder_count + 1,
+                    "next_main_reminder_at": current + timedelta(hours=config.main_next_reminder_hours),
+                }
+            await session.execute(update(User).where(
+                User.id == user.id, User.next_main_reminder_at == lease,
+            ).values(**values))
+            await session.commit()
+
+
 async def main_bot_reminder_worker(bot):
     while True:
         try:
-            async with async_session_maker() as session:
-                bot_conf = await session.get(BotConfig, 1)
-                if not bot_conf or not bot_conf.main_reminders_enabled:
-                    await asyncio.sleep(60)
-                    continue
-
-                now = msk_now()
-                users = (
-                    await session.execute(
-                        select(User).where(
-                            User.next_main_reminder_at != None,
-                            User.next_main_reminder_at <= now,
-                            User.is_blocked == False,
-                        )
-                    )
-                ).scalars().all()
-
-                first_content = await session.get(Content, "main_reminder_first")
-                common_content = await session.get(Content, "main_reminder_common")
-
-                for user in users:
-                    if not await automatic_send_allowed(session, user.id, "main_reminder"):
-                        user.next_main_reminder_at = None
-                        continue
-                    # Пропускаем, если пользователь в активной воронке (у неё свои напоминания)
-                    funnel_state = await session.get(FunnelState, user.id)
-                    if funnel_state and funnel_state.is_active:
-                        user.next_main_reminder_at = None
-                        continue
-
-                    if user.main_reminder_count == 0 and first_content and first_content.text_content:
-                        text = first_content.text_content
-                    elif common_content and common_content.text_content:
-                        text = common_content.text_content
-                    else:
-                        text = "Давно не виделись! Загляни в бот — там много полезного."
-
-                    try:
-                        await bot.send_message(
-                            user.id,
-                            text,
-                            reply_markup=main_reminder_keyboard(),
-                            parse_mode="HTML",
-                            link_preview_options=LinkPreviewOptions(is_disabled=True),
-                        )
-                        user.main_reminder_count += 1
-                        user.next_main_reminder_at = now + timedelta(
-                            hours=bot_conf.main_next_reminder_hours if user.main_reminder_count > 0 else bot_conf.main_first_reminder_hours
-                        )
-                    except TelegramBadRequest:
-                        if not await automatic_send_allowed(session, user.id, "main_reminder"):
-                            user.next_main_reminder_at = None
-                            continue
-                        await bot.send_message(
-                            user.id,
-                            text,
-                            reply_markup=main_reminder_keyboard(),
-                            link_preview_options=LinkPreviewOptions(is_disabled=True),
-                        )
-                        user.main_reminder_count += 1
-                        user.next_main_reminder_at = now + timedelta(
-                            hours=bot_conf.main_next_reminder_hours if user.main_reminder_count > 0 else bot_conf.main_first_reminder_hours
-                        )
-                    except TelegramRetryAfter as e:
-                        await asyncio.sleep(e.retry_after)
-                        if not await automatic_send_allowed(session, user.id, "main_reminder"):
-                            user.next_main_reminder_at = None
-                            continue
-                        try:
-                            await bot.send_message(
-                                user.id,
-                                text,
-                                reply_markup=main_reminder_keyboard(),
-                                parse_mode="HTML",
-                                link_preview_options=LinkPreviewOptions(is_disabled=True),
-                            )
-                            user.main_reminder_count += 1
-                            user.next_main_reminder_at = now + timedelta(hours=bot_conf.main_next_reminder_hours)
-                        except TelegramBadRequest:
-                            if not await automatic_send_allowed(session, user.id, "main_reminder"):
-                                user.next_main_reminder_at = None
-                                continue
-                            await bot.send_message(
-                                user.id,
-                                text,
-                                reply_markup=main_reminder_keyboard(),
-                                link_preview_options=LinkPreviewOptions(is_disabled=True),
-                            )
-                            user.main_reminder_count += 1
-                            user.next_main_reminder_at = now + timedelta(hours=bot_conf.main_next_reminder_hours)
-                        except Exception:
-                            user.next_main_reminder_at = now + timedelta(hours=bot_conf.main_next_reminder_hours)
-                    except Exception as exc:
-                        logger.warning("Main reminder failed for user_id=%s: %s", user.id, exc)
-                        user.next_main_reminder_at = now + timedelta(hours=bot_conf.main_next_reminder_hours)
-
-                await session.commit()
-        except Exception as e:
-            logger.error(f"Main reminder worker error: {e}")
-
+            await process_main_reminders(bot)
+        except Exception:
+            logger.exception("Main reminder worker error")
         await asyncio.sleep(60)
 
 
@@ -616,247 +580,125 @@ async def dispatch_journal_reminder_message(
     kb: Any,
     is_snooze: bool,
     today: date,
+    *,
+    claim_time: datetime | None = None,
+    now: datetime | None = None,
 ) -> bool:
-    """
-    Deliver a journal reminder with TelegramRetryAfter handling and uniform failure transitions:
-    - Initial send attempt.
-    - If TelegramRetryAfter: sleep and retry on second attempt under the SAME claim.
-    - If second attempt (or initial attempt) succeeds:
-      - Snooze: clear snooze_until and snooze_claimed_at.
-      - Regular: claim is kept.
-    - If second attempt (or initial attempt) fails:
-      - Forbidden/blocked user:
-        - mark User.is_blocked = True;
-        - Regular: consume/keep the daily claim (last_reminded_date == today);
-        - Snooze: clear snooze_until = None and snooze_claimed_at = None.
-      - Retryable/network failure:
-        - Regular: conditionally release claim:
-          UPDATE journal_settings SET last_reminded_date = NULL WHERE user_id = :uid AND last_reminded_date = :today
-        - Snooze: set snooze_claimed_at = NULL, keep snooze_until unchanged so future worker tick can retry.
-    """
-    async def _allowed() -> bool:
-        async with async_session_maker() as session:
-            return await automatic_send_allowed(session, uid, "journal_reminder")
-
-    async def _clear_snooze_claim() -> None:
-        if not is_snooze:
-            return
-        async with async_session_maker() as session:
-            await session.execute(
-                update(JournalSettings)
-                .where(JournalSettings.user_id == uid)
-                .values(snooze_until=None, snooze_claimed_at=None)
-            )
-            await session.commit()
-
-    if not await _allowed():
-        await _clear_snooze_claim()
-        return False
-
-    final_exc = None
-    try:
-        await bot.send_message(chat_id=uid, text=reminder_text, reply_markup=kb, parse_mode="HTML")
-    except TelegramRetryAfter as e:
-        await asyncio.sleep(e.retry_after)
-        if not await _allowed():
-            await _clear_snooze_claim()
-            return False
-        try:
-            await bot.send_message(chat_id=uid, text=reminder_text, reply_markup=kb, parse_mode="HTML")
-        except Exception as exc:
-            final_exc = exc
-    except Exception as exc:
-        final_exc = exc
-
-    if final_exc is None:
-        if is_snooze:
-            async with async_session_maker() as session:
-                await session.execute(
-                    update(JournalSettings)
-                    .where(JournalSettings.user_id == uid)
-                    .values(snooze_until=None, snooze_claimed_at=None)
-                )
-                await session.commit()
-        return True
-
-    exc_str = str(final_exc).lower()
-    is_forbidden = (
-        isinstance(final_exc, TelegramForbiddenError)
-        or "blocked" in exc_str
-        or "forbidden" in exc_str
-        or "deactivated" in exc_str
-        or "chat not found" in exc_str
-    )
+    pending = update(JournalSettings).where(JournalSettings.user_id == uid)
+    if claim_time is not None:
+        pending = pending.where(JournalSettings.snooze_claimed_at == claim_time)
+    elif not is_snooze:
+        pending = pending.where(JournalSettings.last_reminded_date == today)
 
     async with async_session_maker() as session:
-        if is_forbidden:
-            u = await session.get(User, uid)
-            if u:
-                u.is_blocked = True
+        user = await session.get(User, uid)
+        if not user or user.is_blocked or not await automatic_send_allowed(session, uid, "journal_reminder"):
             if is_snooze:
-                await session.execute(
-                    update(JournalSettings)
-                    .where(JournalSettings.user_id == uid)
-                    .values(snooze_until=None, snooze_claimed_at=None)
-                )
-            # Regular keeps last_reminded_date = today
-            await session.commit()
+                await session.execute(pending.values(snooze_until=None, snooze_claimed_at=None))
+                await session.commit()
+            return False
+        if claim_time is not None:
+            if await session.scalar(select(JournalSettings.snooze_claimed_at).where(JournalSettings.user_id == uid)) != claim_time:
+                return False
+            current = now or msk_now()
+            allowed = next_allowed_reminder_at(current, user.habit_timezone)
+            if allowed > current:
+                await session.execute(pending.values(snooze_until=allowed, snooze_claimed_at=None))
+                await session.commit()
+                return False
+        try:
+            await bot.send_message(chat_id=uid, text=reminder_text, reply_markup=kb, parse_mode="HTML")
+        except TelegramRetryAfter as exc:
+            if is_snooze:
+                values = {"snooze_claimed_at": None}
+                if claim_time is not None:
+                    values["snooze_until"] = (now or msk_now()) + timedelta(seconds=max(60, exc.retry_after))
+            else:
+                values = {"last_reminded_date": None}
+            await session.execute(pending.values(**values))
+        except TelegramForbiddenError:
+            user.is_blocked = True
+            if is_snooze:
+                await session.execute(pending.values(snooze_until=None, snooze_claimed_at=None))
+        except Exception as exc:
+            if any(reason in str(exc).lower() for reason in ("blocked", "forbidden", "deactivated", "chat not found")):
+                user.is_blocked = True
+                if is_snooze:
+                    await session.execute(pending.values(snooze_until=None, snooze_claimed_at=None))
+            elif is_snooze:
+                await session.execute(pending.values(snooze_claimed_at=None))
+            else:
+                await session.execute(pending.values(last_reminded_date=None))
         else:
             if is_snooze:
-                await session.execute(
-                    update(JournalSettings)
-                    .where(JournalSettings.user_id == uid)
-                    .values(snooze_claimed_at=None)
-                )
-            else:
-                await session.execute(
-                    update(JournalSettings)
-                    .where(JournalSettings.user_id == uid, JournalSettings.last_reminded_date == today)
-                    .values(last_reminded_date=None)
-                )
+                await session.execute(pending.values(snooze_until=None, snooze_claimed_at=None))
             await session.commit()
+            return True
+        await session.commit()
+        return False
 
-    return False
+
+async def process_journal_reminders(bot, now=None):
+    from journal_keyboards import journal_reminder_message_keyboard
+
+    current = now or msk_now()
+    today = current.date()
+    hhmm = current.strftime("%H:%M")
+    settings = JournalSettings
+    regular_due = (
+        (settings.reminders_enabled == True)
+        & (settings.reminder_time <= hhmm)
+        & (settings.last_reminded_date.is_(None) | (settings.last_reminded_date < today))
+    )
+    snooze_due = (settings.snooze_until <= current) & (
+        settings.snooze_claimed_at.is_(None) | (settings.snooze_claimed_at < current - timedelta(minutes=5))
+    )
+    async with async_session_maker() as session:
+        candidates = (await session.execute(
+            select(settings.user_id, User.habit_timezone).join(User, User.id == settings.user_id)
+            .where(User.is_blocked == False, regular_due | snooze_due)
+        )).all()
+    for uid, zone in candidates:
+        async with async_session_maker() as session:
+            pending = update(settings).where(settings.user_id == uid)
+            completed = select(JournalEntry.id).where(
+                JournalEntry.user_id == uid, JournalEntry.reflection_date == today,
+                JournalEntry.status == "completed",
+            ).exists()
+            # Keep a user-selected snooze when the regular reminder is due too.
+            allowed = next_allowed_reminder_at(current, zone)
+            await session.execute(pending.where(regular_due, settings.snooze_until.is_(None), ~completed)
+                                  .values(last_reminded_date=today, snooze_until=allowed))
+            await session.execute(pending.where(regular_due, settings.snooze_until.is_not(None))
+                                  .values(last_reminded_date=today))
+            await session.execute(pending.where(snooze_due, completed)
+                                  .values(snooze_until=None, snooze_claimed_at=None))
+            if allowed > current:
+                await session.execute(pending.where(snooze_due).values(snooze_until=allowed, snooze_claimed_at=None))
+                await session.commit()
+                continue
+            claim = await session.execute(pending.where(snooze_due, ~completed).values(snooze_claimed_at=current))
+            await session.commit()
+            if not claim.rowcount:
+                continue
+
+        await dispatch_journal_reminder_message(
+            bot, uid,
+            "🔔 <b>Время вечерней рефлексии!</b>\n\nВыдели несколько минут, чтобы подвести итоги дня в Дневнике.",
+            journal_reminder_message_keyboard(), is_snooze=True, today=today, claim_time=current, now=now,
+        )
 
 
 async def journal_reminder_worker(bot):
-    """Background worker for Journal evening reminders, snooze alerts, and stale AI recovery."""
+    from journal_service import recover_stale_journal_ai_operations
+
     while True:
         try:
-            from journal_service import recover_stale_journal_ai_operations
             await recover_stale_journal_ai_operations()
-        except Exception as e:
-            logger.error(f"Error in recover_stale_journal_ai_operations: {e}")
-
+        except Exception:
+            logger.exception("Error in recover_stale_journal_ai_operations")
         try:
-            now = msk_now()
-            today = now.date()
-            current_hhmm = now.strftime("%H:%M")
-
-            # 1. Regular evening reminders
-            async with async_session_maker() as session:
-                cand_stmt = (
-                    select(JournalSettings.user_id)
-                    .where(
-                        JournalSettings.reminders_enabled == True,
-                        JournalSettings.reminder_time != None,
-                        JournalSettings.reminder_time <= current_hhmm,
-                        (JournalSettings.last_reminded_date == None) | (JournalSettings.last_reminded_date < today),
-                    )
-                )
-                candidates = (await session.execute(cand_stmt)).scalars().all()
-
-            for uid in candidates:
-                async with async_session_maker() as session:
-                    not_completed_subq = (
-                        select(1)
-                        .select_from(JournalEntry)
-                        .where(
-                            JournalEntry.user_id == uid,
-                            JournalEntry.reflection_date == today,
-                            JournalEntry.status == "completed",
-                        )
-                    )
-                    claim_stmt = (
-                        update(JournalSettings)
-                        .where(
-                            JournalSettings.user_id == uid,
-                            JournalSettings.reminders_enabled == True,
-                            JournalSettings.reminder_time != None,
-                            JournalSettings.reminder_time <= current_hhmm,
-                            (JournalSettings.last_reminded_date == None) | (JournalSettings.last_reminded_date < today),
-                            ~not_completed_subq.exists(),
-                        )
-                        .values(last_reminded_date=today)
-                        .returning(JournalSettings.user_id)
-                    )
-                    claimed_uid = (await session.execute(claim_stmt)).scalar()
-                    await session.commit()
-
-                if not claimed_uid:
-                    continue
-
-                async with async_session_maker() as session:
-                    u = await session.get(User, uid)
-                    if u and u.is_blocked:
-                        continue
-
-                reminder_text = (
-                    "🔔 <b>Время вечерней рефлексии!</b>\n\n"
-                    "Выдели несколько минут, чтобы подвести итоги дня в Дневнике."
-                )
-                from journal_keyboards import journal_reminder_message_keyboard
-                kb = journal_reminder_message_keyboard()
-
-                await dispatch_journal_reminder_message(bot, uid, reminder_text, kb, is_snooze=False, today=today)
-
-            # 2. Snooze reminders
-            # Clear stale snooze claims older than 5 minutes (at-most-once semantics)
-            async with async_session_maker() as session:
-                await session.execute(
-                    update(JournalSettings)
-                    .where(
-                        JournalSettings.snooze_claimed_at != None,
-                        JournalSettings.snooze_claimed_at < now - timedelta(minutes=5),
-                    )
-                    .values(snooze_until=None, snooze_claimed_at=None)
-                )
-                await session.commit()
-
-            async with async_session_maker() as session:
-                snooze_cand_stmt = (
-                    select(JournalSettings.user_id)
-                    .where(
-                        JournalSettings.snooze_until != None,
-                        JournalSettings.snooze_until <= now,
-                        JournalSettings.snooze_claimed_at == None,
-                    )
-                )
-                snooze_candidates = (await session.execute(snooze_cand_stmt)).scalars().all()
-
-            for uid in snooze_candidates:
-                async with async_session_maker() as session:
-                    not_completed_subq = (
-                        select(1)
-                        .select_from(JournalEntry)
-                        .where(
-                            JournalEntry.user_id == uid,
-                            JournalEntry.reflection_date == today,
-                            JournalEntry.status == "completed",
-                        )
-                    )
-                    snooze_claim_stmt = (
-                        update(JournalSettings)
-                        .where(
-                            JournalSettings.user_id == uid,
-                            JournalSettings.snooze_until <= now,
-                            JournalSettings.snooze_claimed_at == None,
-                            ~not_completed_subq.exists(),
-                        )
-                        .values(snooze_claimed_at=now)
-                        .returning(JournalSettings.user_id)
-                    )
-                    claimed_uid = (await session.execute(snooze_claim_stmt)).scalar()
-                    await session.commit()
-
-                if not claimed_uid:
-                    continue
-
-                async with async_session_maker() as session:
-                    u = await session.get(User, uid)
-                    if u and u.is_blocked:
-                        continue
-
-                reminder_text = (
-                    "🔔 <b>Время вечерней рефлексии!</b>\n\n"
-                    "Выдели несколько минут, чтобы подвести итоги дня в Дневнике."
-                )
-                from journal_keyboards import journal_reminder_message_keyboard
-                kb = journal_reminder_message_keyboard()
-
-                await dispatch_journal_reminder_message(bot, uid, reminder_text, kb, is_snooze=True, today=today)
-
-        except Exception as e:
-            logger.error(f"Journal reminder worker error: {e}")
-
+            await process_journal_reminders(bot)
+        except Exception:
+            logger.exception("Journal reminder worker error")
         await asyncio.sleep(60)

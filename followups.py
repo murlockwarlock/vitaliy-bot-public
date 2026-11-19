@@ -30,7 +30,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import relationship, selectinload
 
 from database import Base, User, async_session_maker
-from time_utils import msk_now
+from time_utils import msk_now, next_allowed_reminder_at, resolve_habit_timezone
 from crisis_safety import automatic_send_allowed
 
 logger = logging.getLogger("followups")
@@ -45,8 +45,8 @@ class FollowupCampaign(Base):
     scope = Column(String, default='global', nullable=False, index=True)  # 'global', 'main', 'topic', 'funnel'
     topic_slug = Column(String, nullable=True, index=True)
     is_active = Column(Integer, default=1, nullable=False)  # 1 = active, 0 = paused
-    quiet_hours_start = Column(Integer, default=23, nullable=False)  # MSK hour
-    quiet_hours_end = Column(Integer, default=9, nullable=False)    # MSK hour
+    quiet_hours_start = Column(Integer, default=23, nullable=False)  # Local hour
+    quiet_hours_end = Column(Integer, default=9, nullable=False)    # Local hour
     created_at = Column(DateTime, default=msk_now, nullable=False)
 
     steps = relationship(
@@ -126,7 +126,7 @@ class FollowupDelivery(Base):
 
 
 def is_in_quiet_hours(now_dt: datetime, start_hour: int, end_hour: int) -> bool:
-    """Returns True if the current MSK hour falls within the quiet hours window."""
+    """Returns True if the current hour falls within the quiet hours window."""
     h = now_dt.hour
     if start_hour > end_hour:
         # e.g., 23:00 to 09:00
@@ -135,6 +135,14 @@ def is_in_quiet_hours(now_dt: datetime, start_hour: int, end_hour: int) -> bool:
         # e.g., 01:00 to 06:00
         return start_hour <= h < end_hour
     return False
+
+
+def _followup_quiet_now(campaign, user, now):
+    zone = user.habit_timezone
+    if next_allowed_reminder_at(now, zone) > now:
+        return True
+    local_time = now.replace(tzinfo=resolve_habit_timezone(None)).astimezone(resolve_habit_timezone(zone))
+    return is_in_quiet_hours(local_time, campaign.quiet_hours_start, campaign.quiet_hours_end)
 
 
 def _followup_scope_matches_user(campaign: FollowupCampaign, user: User) -> bool:
@@ -166,6 +174,8 @@ async def _validate_followup_send(
             return None, "user_missing"
         if not _followup_scope_matches_user(campaign, current_user):
             return None, "scope_mismatch_before_send"
+        if _followup_quiet_now(campaign, current_user, msk_now()):
+            return None, "quiet_hours"
     if not await automatic_send_allowed(session, user.id, "generic_followup"):
         return None, "crisis_flag"
     return current_user, None
@@ -240,7 +250,7 @@ async def get_or_create_active_followup_run(
     if existing_run is not None:
         return existing_run
 
-    return run
+    return None
 
 
 async def reset_user_followups(
@@ -365,6 +375,8 @@ async def record_followup_delivery(
                 user_id=user_id,
                 dialogue_id=dialogue_id,
             )
+            if active_run is None:
+                return False
             run_id = active_run.id
 
         existing = await session.scalar(
@@ -416,6 +428,7 @@ async def send_followup_step_to_user(
     user: User,
     dialogue_id: int,
     campaign: Optional[FollowupCampaign] = None,
+    claim_token: Optional[str] = None,
 ) -> Tuple[bool, str, Optional[str]]:
     """Sends a follow-up step to user and returns (success, status, error)."""
     if not await automatic_send_allowed(session, user.id, "generic_followup"):
@@ -467,6 +480,14 @@ async def send_followup_step_to_user(
             return blocked_reason
         if current_user is not None:
             user = current_user
+        if claim_token is not None:
+            owned = await session.execute(update(FollowupDelivery).where(
+                FollowupDelivery.claim_token == claim_token,
+                FollowupDelivery.status == "delivering",
+            ).values(delivered_at=msk_now()))
+            await session.commit()
+            if owned.rowcount != 1:
+                return "claim_expired"
         try:
             await bot.send_message(
                 user.id,
@@ -499,14 +520,14 @@ async def send_followup_step_to_user(
     try:
         blocked_reason = await _dispatch_message(clean_text)
         if blocked_reason:
-            return False, "skipped", blocked_reason
+            return False, "failed" if blocked_reason == "quiet_hours" else "skipped", blocked_reason
         return True, "delivered", None
     except TelegramRetryAfter as e:
         await asyncio.sleep(min(e.retry_after, 60))
         try:
             blocked_reason = await _dispatch_message(clean_text)
             if blocked_reason:
-                return False, "skipped", blocked_reason
+                return False, "failed" if blocked_reason == "quiet_hours" else "skipped", blocked_reason
             return True, "delivered", None
         except Exception as e2:
             return False, "failed", str(e2)
@@ -527,7 +548,7 @@ async def process_generic_followups(
     """One pass of the generic follow-up background worker.
 
     Evaluates inactive users across active campaigns with:
-    - Quiet hours (MSK)
+    - Quiet hours in the recipient's timezone
     - Sequential state-machine semantics: at most ONE step per user per pass.
     - Step 2 is NEVER sent until Step 1 is delivered according to policy.
     - Step 2 delay is measured from Step 1 delivery time.
@@ -555,10 +576,6 @@ async def process_generic_followups(
             if not campaign.steps:
                 continue
 
-            if is_in_quiet_hours(now, campaign.quiet_hours_start, campaign.quiet_hours_end):
-                logger.debug("Campaign %s is in quiet hours, skipping pass.", campaign.name)
-                continue
-
             sorted_steps = sorted(campaign.steps, key=lambda s: s.step_number)
 
             query = select(User).where(
@@ -582,6 +599,8 @@ async def process_generic_followups(
                 if fresh_user is None or not _followup_scope_matches_user(campaign, fresh_user):
                     continue
                 user = fresh_user
+                if _followup_quiet_now(campaign, user, msk_now()):
+                    continue
                 dialogue_id = user.current_dialogue_id or 1
 
                 active_run = await get_or_create_active_followup_run(
@@ -709,6 +728,8 @@ async def process_generic_followups(
                                 .where(
                                     FollowupDelivery.id == obs_id,
                                     FollowupDelivery.status == 'failed',
+                                    FollowupDelivery.delivered_at == obs_delivered_at,
+                                    FollowupDelivery.claim_token == obs_claim_token,
                                 )
                                 .values(
                                     status='delivering',
@@ -780,6 +801,7 @@ async def process_generic_followups(
                     user=user,
                     dialogue_id=dialogue_id,
                     campaign=campaign,
+                    claim_token=new_claim_token,
                 )
 
                 async with sm() as finish_session:
@@ -789,10 +811,11 @@ async def process_generic_followups(
                             FollowupDelivery.claim_token == new_claim_token,
                         )
                     )
-                    if d_row:
-                        d_row.status = status
-                        d_row.error = str(err)[:1000] if err else None
-                        d_row.delivered_at = msk_now()
+                    if d_row is None:
+                        continue
+                    d_row.status = status
+                    d_row.error = str(err)[:1000] if err else None
+                    d_row.delivered_at = msk_now()
                     if status == 'delivered':
                         delivered_count += 1
                         if step_to_send.step_number >= max((s.step_number for s in sorted_steps), default=1):

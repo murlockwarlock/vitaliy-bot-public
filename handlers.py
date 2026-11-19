@@ -16,6 +16,7 @@ from aiogram.types import Message, CallbackQuery, BufferedInputFile, InputMediaP
 from aiogram.filters import CommandStart, Command
 from aiogram.exceptions import TelegramRetryAfter, TelegramBadRequest
 from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.base import StorageKey
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from sqlalchemy import select, update, func, delete, text, or_, and_, cast, String
@@ -54,7 +55,7 @@ from admin_roles import (
 )
 from database import async_session_maker, User, Topic, Content, Message as DBMessage, ReferralConfig, AIConfig, \
     IndexingQueue, ContentMedia, KnowledgeBase, Mailing, HabitConfig, Habit, PaymentConfig, PaymentProvider, \
-    Transaction, Book, SubscriptionPlan, FunnelLanding, FunnelState, FunnelEvent, BotConfig, SubscriptionConfig, \
+    Transaction, Book, SubscriptionPlan, FunnelLanding, LandingNotificationClaim, FunnelState, FunnelEvent, BotConfig, SubscriptionConfig, \
     UserSubscription, PromoCode, ProdamusPayment, TrialUsageHistory, get_all_admin_ids, \
     PaymentIntent, ReferralPaymentLog, AiDisclaimerClaim, TopicDialogueConfig, PendingAiFlow, SessionSummary, SummaryClaim, \
     UserTopicSession, PreTestClaim, TopicPrerecordedDelivery, TestSession, TestAttempt, MenuSection, MenuButton, \
@@ -1982,7 +1983,9 @@ async def cmd_start(message: Message, state: FSMContext, command: Command = None
                 if referrer_id:
                     is_new_referral = True
                 sub_config = await _ensure_subscription_config(session)
-                if sub_config.welcome_bonus_days > 0:
+                payment_config = await session.get(PaymentConfig, 1)
+                if (sub_config.subscriptions_enabled and sub_config.welcome_bonus_days > 0
+                        and payment_config and payment_config.mode == "subscription"):
                     bonus_end = msk_now() + timedelta(days=sub_config.welcome_bonus_days)
                     session.add(UserSubscription(
                         user_id=message.from_user.id,
@@ -2000,6 +2003,8 @@ async def cmd_start(message: Message, state: FSMContext, command: Command = None
             except IntegrityError:
                 await session.rollback()
                 user = await session.get(User, message.from_user.id)
+                welcome_bonus_applied = False
+                should_show_welcome = False
                 is_new_referral = False
         else:
             if user.is_blocked:
@@ -2666,7 +2671,8 @@ async def cb_accept_disclaimer(callback: CallbackQuery, state: FSMContext, bot: 
     elif flow_type == "diagnostics":
         await activate_ai_mode(callback, "diagnostics", state, bot)
     elif flow_type == "funnel_reflection":
-        from funnel import resume_funnel_reflection_after_disclaimer
+        from funnel import FunnelStates, resume_funnel_reflection_after_disclaimer
+        await state.set_state(FunnelStates.post_analysis)
         await resume_funnel_reflection_after_disclaimer(
             bot=bot,
             user_id=user_id,
@@ -2833,6 +2839,29 @@ async def cb_ai_continue_dialogue(callback: CallbackQuery, state: FSMContext, bo
     await _resume_ai_dialogue(callback, state, bot, topic_slug, dialogue_id, explicit=True)
 
 
+async def _dialogue_menu_label(session, topic_slug: str):
+    thematic_action = f"thematic_{topic_slug}"
+    main_action = "menu_strategy_session" if topic_slug == "strategy_session" else f"mode_{topic_slug}"
+    return await session.scalar(
+        select(MenuButton.label).where(
+            MenuButton.enabled.is_(True),
+            MenuButton.action_type == "callback",
+            or_(
+                and_(
+                    MenuButton.section_key == "thematic",
+                    or_(
+                        MenuButton.topic_slug == topic_slug,
+                        and_(MenuButton.topic_slug.is_(None),
+                             func.coalesce(MenuButton.legacy_callback, MenuButton.action_value) == thematic_action),
+                    ),
+                ),
+                and_(MenuButton.section_key.in_(_ROOT_MENU_SECTION_KEYS),
+                     func.coalesce(MenuButton.action_value, MenuButton.legacy_callback) == main_action),
+            ),
+        ).order_by(MenuButton.order_num, MenuButton.id).limit(1)
+    )
+
+
 async def _resume_ai_dialogue(target, state: FSMContext, bot: Bot, topic_slug: str, dialogue_id: int, *, explicit: bool = False):
     user_id = target.from_user.id
     last_assistant = None
@@ -2876,6 +2905,7 @@ async def _resume_ai_dialogue(target, state: FSMContext, bot: Bot, topic_slug: s
             if hasattr(target, "answer"):
                 await target.answer("⚠️ Этот диалог уже закрыт или устарел.", show_alert=True)
             return False
+        menu_label = await _dialogue_menu_label(session, topic_slug)
         last_assistant = (await session.scalars(
             select(DBMessage).where(
                 DBMessage.user_id == user_id,
@@ -2902,7 +2932,7 @@ async def _resume_ai_dialogue(target, state: FSMContext, bot: Bot, topic_slug: s
         await state.update_data(ai_landing_return_callback=None, ai_landing_origin_stage=None)
     markup = await kb.ai_response_keyboard_for_topic(topic_slug, dialogue_id)
     tail = (last_assistant.content or "").strip() if last_assistant else ""
-    resume_text = "Продолжаем 👇\n\n"
+    resume_text = f"Продолжаем разговор в теме «{menu_label}» 👇\n\n" if menu_label else "Продолжаем разговор 👇\n\n"
     if tail:
         resume_text += f"Последнее сообщение ассистента:\n{tail}"
     else:
@@ -11746,10 +11776,48 @@ _USER_RESET_LABELS = {
     "balance": "баланс клиента",
     "habits": "привычки и прогресс клиента",
     "remind": "счётчик напоминаний",
-    "landing": "историю переходов и оплат на странице",
+    "landing": "неоплаченные заявки на странице",
     "name": "имя и пол клиента",
-    "full": "все данные клиента",
+    "full": "онбординг и тестовые данные клиента",
 }
+
+
+def _reset_user_id(data: str, kind: str) -> int:
+    prefix = "ureset_confirmed_" if data.startswith("ureset_confirmed_") else "ureset_"
+    return _admin_client_action_user_id(data, f"{prefix}{kind}_")
+
+
+async def _reset_funnel_state(session, user_id: int):
+    await session.execute(
+        update(FunnelState).where(FunnelState.user_id == user_id).values(
+            is_active=False, stage="idle", meditation_id=None, next_followup_at=None,
+            reminder_count=0, last_ai_reply=None, completed_at=None, started_at=None,
+            followup_sequence_anchor=None, stage_timeout_at=None, stage_timeout_sent=False,
+            strategy_origin=None,
+        )
+    )
+
+
+async def _reset_unpaid_landings(session, user_id: int):
+    unpaid = (
+        FunnelLanding.user_id == user_id,
+        FunnelLanding.paid_at.is_(None),
+        FunnelLanding.status != "paid",
+        FunnelLanding.external_payment_id.is_(None),
+    )
+    await session.execute(
+        delete(LandingNotificationClaim).where(
+            LandingNotificationClaim.landing_id.in_(select(FunnelLanding.id).where(*unpaid))
+        )
+    )
+    await session.execute(delete(FunnelLanding).where(*unpaid))
+
+
+def _expire_client_subscription(user):
+    user.subscription_end = None
+    if user.subscription:
+        user.subscription.end_date = min(user.subscription.end_date, msk_now())
+        user.subscription.auto_renewal = False
 
 
 async def _ensure_user_reset_confirmed(
@@ -11812,10 +11880,10 @@ async def admin_user_resets(callback: CallbackQuery, state: FSMContext | None = 
         f"🎗 <b>Привычки</b>\nУдаляет все привычки клиента и их прогресс.\n\n"
         f"🔔 <b>Напоминания</b>\nСбрасывает счётчик отправленных напоминаний. "
         f"Клиент снова получит первое напоминание.\n\n"
-        f"🌐 <b>Страница оплаты</b>\nУдаляет все записи о переходах и оплатах со страницы.\n\n"
+        f"🌐 <b>Страница оплаты</b>\nУдаляет неоплаченные заявки. Оплаченные заявки сохраняются.\n\n"
         f"👤 <b>Имя и пол</b>\nСбрасывает имя для общения и пол. "
         f"Бот заново спросит клиента как его зовут.\n\n"
-        f"⚡️ <b>Полный сброс</b>\nСбрасывает ВСЁ перечисленное выше одной кнопкой."
+        f"⚡️ <b>Полный сброс</b>\nНачинает знакомство с ботом заново и сбрасывает перечисленные данные. Оплаченная подписка и история платежей сохраняются."
     )
 
     builder = InlineKeyboardBuilder()
@@ -11897,10 +11965,7 @@ async def execute_confirmed_user_reset(callback: CallbackQuery, state: FSMContex
     except ValueError:
         await callback.answer("Некорректный клиент.", show_alert=True)
         return
-    confirmed_callback = callback.model_copy(update={
-        "data": f"ureset_confirmed_{kind}_{user_id}{_admin_client_action_suffix(callback.data)}",
-    })
-    await reset_handlers[kind](confirmed_callback, state=state)
+    await reset_handlers[kind](callback, state=state)
 
 
 @router.callback_query(F.data.startswith("ureset_funnel_"))
@@ -11908,20 +11973,11 @@ async def ureset_funnel(callback: CallbackQuery, state: FSMContext | None = None
     if not await is_admin_actor(callback.from_user.id):
         await callback.answer("Недостаточно прав", show_alert=True)
         return
-    user_id = _admin_client_action_user_id(callback.data, "ureset_funnel_")
+    user_id = _reset_user_id(callback.data, "funnel")
     if not await _ensure_user_reset_confirmed(callback, "funnel", user_id, state):
         return
     async with async_session_maker() as session:
-        fs = await session.get(FunnelState, user_id)
-        if fs:
-            fs.is_active = False
-            fs.stage = "idle"
-            fs.meditation_id = None
-            fs.next_followup_at = None
-            fs.reminder_count = 0
-            fs.last_ai_reply = None
-            fs.completed_at = None
-            fs.started_at = None
+        await _reset_funnel_state(session, user_id)
         await session.commit()
     await callback.answer("🌀 Воронка сброшена")
     new_cb = callback.model_copy(update={
@@ -11934,7 +11990,7 @@ async def ureset_funnel(callback: CallbackQuery, state: FSMContext | None = None
 async def ureset_dialog(callback: CallbackQuery, state: FSMContext | None = None):
     if not await require_permission(callback, AdminPermission.SYSTEM):
         return
-    user_id = _admin_client_action_user_id(callback.data, "ureset_dialog_")
+    user_id = _reset_user_id(callback.data, "dialog")
     if not await _ensure_user_reset_confirmed(callback, "dialog", user_id, state):
         return
     async with async_session_maker() as session:
@@ -11993,13 +12049,13 @@ async def ureset_sub(callback: CallbackQuery, state: FSMContext | None = None):
     if not await is_admin_actor(callback.from_user.id):
         await callback.answer("Недостаточно прав", show_alert=True)
         return
-    user_id = _admin_client_action_user_id(callback.data, "ureset_sub_")
+    user_id = _reset_user_id(callback.data, "sub")
     if not await _ensure_user_reset_confirmed(callback, "sub", user_id, state):
         return
     async with async_session_maker() as session:
         user = await session.get(User, user_id)
         if user:
-            user.subscription_end = None
+            _expire_client_subscription(user)
         await session.commit()
     await callback.answer("📅 Подписка сброшена")
     new_cb = callback.model_copy(update={
@@ -12013,7 +12069,7 @@ async def ureset_balance(callback: CallbackQuery, state: FSMContext | None = Non
     if not await is_admin_actor(callback.from_user.id):
         await callback.answer("Недостаточно прав", show_alert=True)
         return
-    user_id = _admin_client_action_user_id(callback.data, "ureset_balance_")
+    user_id = _reset_user_id(callback.data, "balance")
     if not await _ensure_user_reset_confirmed(callback, "balance", user_id, state):
         return
     async with async_session_maker() as session:
@@ -12033,7 +12089,7 @@ async def ureset_balance(callback: CallbackQuery, state: FSMContext | None = Non
 async def ureset_habits(callback: CallbackQuery, state: FSMContext | None = None):
     if not await require_permission(callback, AdminPermission.SYSTEM):
         return
-    user_id = _admin_client_action_user_id(callback.data, "ureset_habits_")
+    user_id = _reset_user_id(callback.data, "habits")
     if not await _ensure_user_reset_confirmed(callback, "habits", user_id, state):
         return
     async with async_session_maker() as session:
@@ -12051,7 +12107,7 @@ async def ureset_remind(callback: CallbackQuery, state: FSMContext | None = None
     if not await is_admin_actor(callback.from_user.id):
         await callback.answer("Недостаточно прав", show_alert=True)
         return
-    user_id = _admin_client_action_user_id(callback.data, "ureset_remind_")
+    user_id = _reset_user_id(callback.data, "remind")
     if not await _ensure_user_reset_confirmed(callback, "remind", user_id, state):
         return
     async with async_session_maker() as session:
@@ -12072,11 +12128,11 @@ async def ureset_landing(callback: CallbackQuery, state: FSMContext | None = Non
     if not await is_admin_actor(callback.from_user.id):
         await callback.answer("Недостаточно прав", show_alert=True)
         return
-    user_id = _admin_client_action_user_id(callback.data, "ureset_landing_")
+    user_id = _reset_user_id(callback.data, "landing")
     if not await _ensure_user_reset_confirmed(callback, "landing", user_id, state):
         return
     async with async_session_maker() as session:
-        await session.execute(delete(FunnelLanding).where(FunnelLanding.user_id == user_id))
+        await _reset_unpaid_landings(session, user_id)
         await session.commit()
     await callback.answer("🌐 Лендинг очищен")
     new_cb = callback.model_copy(update={
@@ -12090,7 +12146,7 @@ async def ureset_name(callback: CallbackQuery, state: FSMContext | None = None):
     if not await is_admin_actor(callback.from_user.id):
         await callback.answer("Недостаточно прав", show_alert=True)
         return
-    user_id = _admin_client_action_user_id(callback.data, "ureset_name_")
+    user_id = _reset_user_id(callback.data, "name")
     if not await _ensure_user_reset_confirmed(callback, "name", user_id, state):
         return
     async with async_session_maker() as session:
@@ -12111,21 +12167,12 @@ async def ureset_full(callback: CallbackQuery, state: FSMContext | None = None):
     if not await is_admin_actor(callback.from_user.id):
         await callback.answer("Недостаточно прав", show_alert=True)
         return
-    user_id = _admin_client_action_user_id(callback.data, "ureset_full_")
+    user_id = _reset_user_id(callback.data, "full")
     if not await _ensure_user_reset_confirmed(callback, "full", user_id, state):
         return
     async with async_session_maker() as session:
         # Воронка
-        fs = await session.get(FunnelState, user_id)
-        if fs:
-            fs.is_active = False
-            fs.stage = "idle"
-            fs.meditation_id = None
-            fs.next_followup_at = None
-            fs.reminder_count = 0
-            fs.last_ai_reply = None
-            fs.completed_at = None
-            fs.started_at = None
+        await _reset_funnel_state(session, user_id)
 
         # V6 dialogue-scoped records cleanup to prevent collisions when resetting counter to 1
         await session.execute(delete(UserTopicSession).where(UserTopicSession.user_id == user_id))
@@ -12144,14 +12191,21 @@ async def ureset_full(callback: CallbackQuery, state: FSMContext | None = None):
         await session.execute(delete(Habit).where(Habit.user_id == user_id))
 
         # Лендинг
-        await session.execute(delete(FunnelLanding).where(FunnelLanding.user_id == user_id))
+        await _reset_unpaid_landings(session, user_id)
 
         # Пользователь
         user = await session.get(User, user_id)
         if user:
             user.name = None
             user.gender = None
-            user.subscription_end = None
+            user.age = None
+            user.welcome_shown_at = None
+            user.ai_disclaimer_shown = False
+            user.ai_disclaimer_accepted_at = None
+            user.ai_disclaimer_version = 0
+            await session.execute(delete(AiDisclaimerClaim).where(AiDisclaimerClaim.user_id == user_id))
+            if user.subscription and user.subscription.payment_provider in {"Trial Welcome", "Trial Promo"}:
+                _expire_client_subscription(user)
             user.balance = 0.0
             user.low_balance_notified = False
             user.main_reminder_count = 0
@@ -12160,6 +12214,9 @@ async def ureset_full(callback: CallbackQuery, state: FSMContext | None = None):
             user.current_topic_slug = None
 
         await session.commit()
+    if state is not None:
+        client_key = StorageKey(bot_id=state.key.bot_id, chat_id=user_id, user_id=user_id)
+        await FSMContext(storage=state.storage, key=client_key).clear()
     await callback.answer("⚡️ Полный сброс выполнен!")
     new_cb = callback.model_copy(update={
         "data": f"admin_user_resets_{user_id}{_admin_client_action_suffix(callback.data)}",
