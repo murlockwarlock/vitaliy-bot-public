@@ -54,11 +54,14 @@ def ensure_test_environment_isolation(monkeypatch):
     monkeypatch.setenv("OWNER_IDS", "999999999")
     monkeypatch.setenv("ADMIN_IDS", "999999999")
 
+    from ai_dialogue_service import reset_ai_chat_runtime_state
     from error_reporting import clear_captured_test_alerts, reset_alert_cooldowns_for_tests
     clear_captured_test_alerts()
     reset_alert_cooldowns_for_tests()
+    reset_ai_chat_runtime_state()
 
     yield
 
     clear_captured_test_alerts()
     reset_alert_cooldowns_for_tests()
+    reset_ai_chat_runtime_state()

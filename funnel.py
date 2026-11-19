@@ -32,7 +32,12 @@ from sqlalchemy.orm import selectinload
 from time_utils import msk_now, format_msk, next_allowed_reminder_at
 
 import keyboards as kb
-from ai_dialogue_service import allocate_global_dialogue_id
+from ai_dialogue_service import (
+    allocate_global_dialogue_id,
+    claim_telegram_message_once,
+    get_user_chat_lock,
+    release_telegram_message_claim,
+)
 from ai_integration import get_ai_response_for_topic
 from automation_events import schedule_automation_events
 from crisis_safety import (
@@ -1803,59 +1808,62 @@ async def show_strategy_offer(target, bot=None):
     await show_strategy_sales(target, bot)
 
 
+def _extract_resumed_funnel_messages(payload: dict, text_key: str, list_key: str) -> list[str]:
+    raw_list = payload.get(list_key)
+    if isinstance(raw_list, list):
+        items = [str(item) for item in raw_list if isinstance(item, str) and item.strip()]
+        if items:
+            return items
+    single = payload.get(text_key)
+    if isinstance(single, str) and single.strip():
+        return [single]
+    return []
+
+
+def _synthesize_resumed_message(callback, bot: Bot, text: str):
+    from types import SimpleNamespace
+    chat = getattr(callback, "message", None) and getattr(callback.message, "chat", None)
+    chat_id = chat.id if chat else callback.from_user.id
+
+    async def _answer(reply_text, **kwargs):
+        return await bot.send_message(chat_id=chat_id, text=reply_text, **kwargs)
+
+    answer_func = getattr(getattr(callback, "message", None), "answer", None) or _answer
+    return SimpleNamespace(
+        from_user=callback.from_user,
+        chat=chat or SimpleNamespace(id=chat_id),
+        text=text,
+        bot=bot,
+        answer=answer_func,
+    )
+
+
 async def resume_funnel_strategy_after_disclaimer(callback, state: FSMContext, bot: Bot, payload: dict):
-    msg_text = payload.get("strategy_message")
+    pending_messages = _extract_resumed_funnel_messages(payload, "strategy_message", "strategy_messages")
     did = payload.get("strategy_dialogue_id")
     if did and state:
         await state.update_data(strategy_dialogue_id=did)
     if state:
         await state.set_state(FunnelStates.strategy_chat)
 
-    if msg_text:
-        # Re-invoke handle_strategy_message with a synthesized message
-        from types import SimpleNamespace
-        chat = getattr(callback, "message", None) and getattr(callback.message, "chat", None)
-        chat_id = chat.id if chat else callback.from_user.id
-        async def _answer(text, **kwargs):
-            return await bot.send_message(chat_id=chat_id, text=text, **kwargs)
-        answer_func = getattr(getattr(callback, "message", None), "answer", None) or _answer
-
-        msg = SimpleNamespace(
-            from_user=callback.from_user,
-            chat=chat or SimpleNamespace(id=chat_id),
-            text=msg_text,
-            bot=bot,
-            answer=answer_func,
-        )
-        await handle_strategy_message(msg, state)
+    if pending_messages:
+        msg = _synthesize_resumed_message(callback, bot, pending_messages[-1])
+        await handle_strategy_message(msg, state, pending_messages=pending_messages)
     else:
         await start_strategy_session(callback, state, bot=bot, origin="funnel")
 
 
 async def resume_funnel_objection_after_disclaimer(callback, state: FSMContext, bot: Bot, payload: dict):
-    msg_text = payload.get("objection_message")
+    pending_messages = _extract_resumed_funnel_messages(payload, "objection_message", "objection_messages")
     did = payload.get("objection_dialogue_id")
     if did and state:
         await state.update_data(objection_dialogue_id=did)
     if state:
         await state.set_state(FunnelStates.objection_chat)
 
-    if msg_text:
-        from types import SimpleNamespace
-        chat = getattr(callback, "message", None) and getattr(callback.message, "chat", None)
-        chat_id = chat.id if chat else callback.from_user.id
-        async def _answer(text, **kwargs):
-            return await bot.send_message(chat_id=chat_id, text=text, **kwargs)
-        answer_func = getattr(getattr(callback, "message", None), "answer", None) or _answer
-
-        msg = SimpleNamespace(
-            from_user=callback.from_user,
-            chat=chat or SimpleNamespace(id=chat_id),
-            text=msg_text,
-            bot=bot,
-            answer=answer_func,
-        )
-        await handle_objection_message(msg, state)
+    if pending_messages:
+        msg = _synthesize_resumed_message(callback, bot, pending_messages[-1])
+        await handle_objection_message(msg, state, pending_messages=pending_messages)
     else:
         await start_objection_dialogue(callback, state, bot=bot)
 
@@ -1944,184 +1952,206 @@ async def start_objection_dialogue(target, state: FSMContext, bot=None):
     )
 
 
-async def handle_strategy_message(message: Message, state: FSMContext):
-    data = await state.get_data() if state else {}
-    dialogue_id = data.get("strategy_dialogue_id")
-    if not dialogue_id:
-        async with async_session_maker() as session:
-            dialogue_id = await allocate_global_dialogue_id(session, message.from_user.id)
-            await session.commit()
-        if state:
-            await state.update_data(strategy_dialogue_id=dialogue_id)
+async def _handle_funnel_dialogue_message(
+    message: Message,
+    state: FSMContext,
+    *,
+    scope: str,
+    state_dialogue_key: str,
+    flow_type: str,
+    msg_payload_key: str,
+    stage: str,
+    topic_slug: str,
+    event_name: str,
+    wait_text: str,
+    wait_label: str,
+    keyboard_factory,
+    include_objection_context: bool = False,
+    send_typing: bool = False,
+    pending_messages: list[str] | None = None,
+) -> None:
+    raw_messages = pending_messages if pending_messages is not None else [message.text]
+    messages_to_persist = [m for m in raw_messages if isinstance(m, str) and m.strip()]
+    if not messages_to_persist:
+        return
 
     user_id = message.from_user.id
     chat_id = message.chat.id if hasattr(message, "chat") and message.chat else user_id
+    combined_text = "\n\n".join(messages_to_persist)
+    latest_text = messages_to_persist[-1]
 
-    from handlers import check_and_request_ai_disclaimer
-    accepted = await check_and_request_ai_disclaimer(
-        message.bot,
-        user_id,
-        chat_id,
+    claimed, claim_key = claim_telegram_message_once(
+        getattr(message, "bot", None),
+        message,
+        scope=scope,
+        content_fingerprint=latest_text,
+    )
+    if not claimed:
+        return
+
+    persisted = False
+    try:
+        async with get_user_chat_lock(user_id):
+            data = await state.get_data() if state else {}
+            dialogue_id = data.get(state_dialogue_key)
+            if not dialogue_id:
+                async with async_session_maker() as session:
+                    dialogue_id = await allocate_global_dialogue_id(session, user_id)
+                    await session.commit()
+                if state:
+                    await state.update_data(**{state_dialogue_key: dialogue_id})
+
+            from handlers import check_and_request_ai_disclaimer
+            disclaimer_payload: dict[str, object] = {
+                msg_payload_key: combined_text,
+                state_dialogue_key: dialogue_id,
+            }
+            if len(messages_to_persist) > 1:
+                disclaimer_payload[f"{msg_payload_key}s"] = list(messages_to_persist)
+            accepted = await check_and_request_ai_disclaimer(
+                message.bot,
+                user_id,
+                chat_id,
+                flow_type=flow_type,
+                payload=disclaimer_payload,
+            )
+            if not accepted:
+                return
+
+            extra_system = await build_objection_context(user_id) if include_objection_context else None
+
+            async with async_session_maker() as session:
+                funnel_state = await get_or_create_funnel_state(session, user_id)
+                await set_stage(session, funnel_state, stage, active=True, reminder_enabled=True)
+                current_msg_id = None
+                for text_item in messages_to_persist:
+                    user_msg = DBMessage(
+                        user_id=user_id,
+                        dialogue_id=dialogue_id,
+                        role="user",
+                        content=text_item,
+                        topic_slug=topic_slug,
+                    )
+                    session.add(user_msg)
+                    await session.flush()
+                    current_msg_id = user_msg.id
+                await register_event(
+                    session,
+                    user_id,
+                    stage,
+                    event_name,
+                    meditation_id=funnel_state.meditation_id,
+                    payload=combined_text[:1000],
+                )
+                await session.commit()
+                persisted = True
+
+            if send_typing:
+                try:
+                    await message.bot.send_chat_action(chat_id=chat_id, action="typing")
+                except Exception:
+                    pass
+            wait_msg = await message.answer(wait_text)
+            if send_typing:
+                try:
+                    await message.bot.send_chat_action(chat_id=chat_id, action="typing")
+                except Exception:
+                    pass
+            try:
+                ai_kwargs: dict[str, object] = {
+                    "topic_slug": topic_slug,
+                    "dialogue_id": dialogue_id,
+                    "current_message_id": current_msg_id,
+                    "bot": message.bot,
+                    "chat_id": chat_id,
+                    "alert_user_text": combined_text,
+                }
+                if extra_system:
+                    ai_kwargs["extra_system"] = extra_system
+                response = await get_ai_response_for_topic(
+                    user_id,
+                    latest_text,
+                    message.from_user.first_name or "Пользователь",
+                    **ai_kwargs,
+                )
+            finally:
+                try:
+                    await wait_msg.delete()
+                except Exception as exc:
+                    logger.warning("Failed to delete %s wait message for user_id=%s: %s", wait_label, user_id, exc)
+
+            async with async_session_maker() as session:
+                funnel_state = await get_or_create_funnel_state(session, user_id)
+                session.add(DBMessage(
+                    user_id=user_id,
+                    dialogue_id=dialogue_id,
+                    role="assistant",
+                    content=response,
+                    topic_slug=topic_slug,
+                ))
+                await set_stage(session, funnel_state, stage, active=True, reminder_enabled=True, ai_reply=response)
+                await session.commit()
+
+            await send_crisis_aware_ai_response(
+                message.bot,
+                user_id,
+                chat_id,
+                response,
+                await keyboard_factory(user_id=user_id),
+            )
+    except Exception:
+        if not persisted:
+            release_telegram_message_claim(claim_key)
+        raise
+
+
+async def handle_strategy_message(
+    message: Message,
+    state: FSMContext,
+    *,
+    pending_messages: list[str] | None = None,
+):
+    await _handle_funnel_dialogue_message(
+        message,
+        state,
+        scope="funnel_strategy",
+        state_dialogue_key="strategy_dialogue_id",
         flow_type="funnel_strategy",
-        payload={"strategy_message": message.text, "strategy_dialogue_id": dialogue_id},
-    )
-    if not accepted:
-        return
-
-    async with async_session_maker() as session:
-        funnel_state = await get_or_create_funnel_state(session, message.from_user.id)
-        await set_stage(session, funnel_state, "strategy_chat", active=True, reminder_enabled=True)
-        user_msg = DBMessage(
-            user_id=message.from_user.id,
-            dialogue_id=dialogue_id,
-            role="user",
-            content=message.text,
-            topic_slug="strategy_session",
-        )
-        session.add(user_msg)
-        await session.flush()
-        current_msg_id = user_msg.id
-        await register_event(
-            session,
-            message.from_user.id,
-            "strategy_chat",
-            "strategy_user_message",
-            meditation_id=funnel_state.meditation_id,
-            payload=message.text[:1000],
-        )
-        await session.commit()
-
-    wait_msg = await message.answer("Подбираю следующий шаг...")
-    response = await get_ai_response_for_topic(
-        message.from_user.id,
-        message.text,
-        message.from_user.first_name or "Пользователь",
+        msg_payload_key="strategy_message",
+        stage="strategy_chat",
         topic_slug="strategy_session",
-        dialogue_id=dialogue_id,
-        current_message_id=current_msg_id,
-        bot=message.bot,
-        chat_id=message.chat.id,
-        alert_user_text=message.text,
-    )
-    try:
-        await wait_msg.delete()
-    except Exception as exc:
-        logger.warning("Failed to delete strategy wait message for user_id=%s: %s", message.from_user.id, exc)
-
-    async with async_session_maker() as session:
-        funnel_state = await get_or_create_funnel_state(session, message.from_user.id)
-        session.add(DBMessage(
-            user_id=message.from_user.id,
-            dialogue_id=dialogue_id,
-            role="assistant",
-            content=response,
-            topic_slug="strategy_session",
-        ))
-        await set_stage(session, funnel_state, "strategy_chat", active=True, reminder_enabled=True, ai_reply=response)
-        await session.commit()
-
-    await send_crisis_aware_ai_response(
-        message.bot,
-        message.from_user.id,
-        message.chat.id,
-        response,
-        await configured_strategy_offer_keyboard(user_id=message.from_user.id),
+        event_name="strategy_user_message",
+        wait_text="Подбираю следующий шаг...",
+        wait_label="strategy",
+        keyboard_factory=configured_strategy_offer_keyboard,
+        include_objection_context=False,
+        send_typing=False,
+        pending_messages=pending_messages,
     )
 
 
-async def handle_objection_message(message: Message, state: FSMContext):
-    data = await state.get_data() if state else {}
-    dialogue_id = data.get("objection_dialogue_id")
-    if not dialogue_id:
-        async with async_session_maker() as session:
-            dialogue_id = await allocate_global_dialogue_id(session, message.from_user.id)
-            await session.commit()
-        if state:
-            await state.update_data(objection_dialogue_id=dialogue_id)
-
-    user_id = message.from_user.id
-    chat_id = message.chat.id if hasattr(message, "chat") and message.chat else user_id
-
-    from handlers import check_and_request_ai_disclaimer
-    accepted = await check_and_request_ai_disclaimer(
-        message.bot,
-        user_id,
-        chat_id,
+async def handle_objection_message(
+    message: Message,
+    state: FSMContext,
+    *,
+    pending_messages: list[str] | None = None,
+):
+    await _handle_funnel_dialogue_message(
+        message,
+        state,
+        scope="funnel_objection",
+        state_dialogue_key="objection_dialogue_id",
         flow_type="funnel_objection",
-        payload={"objection_message": message.text, "objection_dialogue_id": dialogue_id},
-    )
-    if not accepted:
-        return
-
-    context_text = await build_objection_context(message.from_user.id)
-
-    async with async_session_maker() as session:
-        funnel_state = await get_or_create_funnel_state(session, message.from_user.id)
-        await set_stage(session, funnel_state, "objection_chat", active=True, reminder_enabled=True)
-        user_msg = DBMessage(
-            user_id=message.from_user.id,
-            dialogue_id=dialogue_id,
-            role="user",
-            content=message.text,
-            topic_slug="strategy_objections",
-        )
-        session.add(user_msg)
-        await session.flush()
-        current_msg_id = user_msg.id
-        await register_event(
-            session,
-            message.from_user.id,
-            "objection_chat",
-            "objection_user_message",
-            meditation_id=funnel_state.meditation_id,
-            payload=message.text[:1000],
-        )
-        await session.commit()
-
-    try:
-        await message.bot.send_chat_action(chat_id=message.chat.id, action="typing")
-    except Exception:
-        pass
-    wait_msg = await message.answer("💬 Готовлю лучший ответ для тебя...")
-    try:
-        await message.bot.send_chat_action(chat_id=message.chat.id, action="typing")
-    except Exception:
-        pass
-    response = await get_ai_response_for_topic(
-        message.from_user.id,
-        message.text,
-        message.from_user.first_name or "Пользователь",
+        msg_payload_key="objection_message",
+        stage="objection_chat",
         topic_slug="strategy_objections",
-        dialogue_id=dialogue_id,
-        extra_system=context_text or None,
-        current_message_id=current_msg_id,
-        bot=message.bot,
-        chat_id=message.chat.id,
-        alert_user_text=message.text,
-    )
-    try:
-        await wait_msg.delete()
-    except Exception as exc:
-        logger.warning("Failed to delete objection wait message for user_id=%s: %s", message.from_user.id, exc)
-
-    async with async_session_maker() as session:
-        funnel_state = await get_or_create_funnel_state(session, message.from_user.id)
-        session.add(DBMessage(
-            user_id=message.from_user.id,
-            dialogue_id=dialogue_id,
-            role="assistant",
-            content=response,
-            topic_slug="strategy_objections",
-        ))
-        await set_stage(session, funnel_state, "objection_chat", active=True, reminder_enabled=True, ai_reply=response)
-        await session.commit()
-
-    await send_crisis_aware_ai_response(
-        message.bot,
-        message.from_user.id,
-        message.chat.id,
-        response,
-        await configured_objection_response_keyboard(user_id=message.from_user.id),
+        event_name="objection_user_message",
+        wait_text="💬 Готовлю лучший ответ для тебя...",
+        wait_label="objection",
+        keyboard_factory=configured_objection_response_keyboard,
+        include_objection_context=True,
+        send_typing=True,
+        pending_messages=pending_messages,
     )
 
 
@@ -2254,25 +2284,53 @@ async def funnel_heard(callback: CallbackQuery, state: FSMContext):
 
 @router.message(FunnelStates.waiting_reflection, ~F.text.startswith("/"))
 async def funnel_reflection_message(message: Message, state: FSMContext):
+    if not message.text or not message.text.strip():
+        return
     user_id = message.from_user.id
-    from handlers import check_and_request_ai_disclaimer
+    claimed, claim_key = claim_telegram_message_once(
+        getattr(message, "bot", None),
+        message,
+        scope="funnel_reflection",
+        content_fingerprint=message.text,
+    )
+    if not claimed:
+        return
 
-    async with async_session_maker() as session:
-        user = await session.get(User, user_id)
-        funnel_state = await get_or_create_funnel_state(session, user_id)
-        med_id = funnel_state.meditation_id if funnel_state else None
-        if not user or not user.ai_disclaimer_accepted_at or (user.ai_disclaimer_version or 0) < 1:
-            chat_id = message.chat.id if hasattr(message, "chat") and message.chat else user_id
-            await check_and_request_ai_disclaimer(
-                message.bot,
-                user_id,
-                chat_id,
-                flow_type="funnel_reflection",
-                payload={"reflection_text": message.text, "meditation_id": med_id},
-            )
-            return
+    persisted = False
+    try:
+        async with get_user_chat_lock(user_id):
+            if state is not None and hasattr(state, "get_state"):
+                try:
+                    cur_state = await state.get_state()
+                except Exception:
+                    cur_state = None
+                if cur_state == FunnelStates.post_analysis.state:
+                    await post_analysis_message(message, state)
+                    return
 
-    await deliver_analysis(message, state, message.text)
+            from handlers import check_and_request_ai_disclaimer
+
+            async with async_session_maker() as session:
+                user = await session.get(User, user_id)
+                funnel_state = await get_or_create_funnel_state(session, user_id)
+                med_id = funnel_state.meditation_id if funnel_state else None
+                if not user or not user.ai_disclaimer_accepted_at or (user.ai_disclaimer_version or 0) < 1:
+                    chat_id = message.chat.id if hasattr(message, "chat") and message.chat else user_id
+                    await check_and_request_ai_disclaimer(
+                        message.bot,
+                        user_id,
+                        chat_id,
+                        flow_type="funnel_reflection",
+                        payload={"reflection_text": message.text, "meditation_id": med_id},
+                    )
+                    return
+
+            await deliver_analysis(message, state, message.text)
+            persisted = True
+    except Exception:
+        if not persisted:
+            release_telegram_message_claim(claim_key)
+        raise
 
 
 @router.callback_query(F.data.in_(["funnel_resume_choice", "funnel_restart"]))

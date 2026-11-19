@@ -66,6 +66,7 @@ from ai_dialogue_service import (
     TopicContextSnapshot,
     acquire_pre_test_claim,
     allocate_next_dialogue_id,
+    claim_telegram_message_once,
     clear_pending_ai_flow,
     consume_pending_ai_flow,
     deliver_prerecorded_first_message,
@@ -73,6 +74,9 @@ from ai_dialogue_service import (
     get_active_topic_dialogue_id,
     get_pending_ai_flow,
     get_pre_test_claim,
+    get_user_chat_lock,
+    merge_pending_ai_flow_payload,
+    release_telegram_message_claim,
     set_active_topic_dialogue_id,
     store_pending_ai_flow,
 )
@@ -963,8 +967,15 @@ async def check_and_request_ai_disclaimer(
             if content_row and content_row.text_content
             else "<i>Бот не заменяет консультацию специалиста. Если ты в кризисной ситуации, обратись к профессионалу.</i>"
         )
+        existing_pending = await session.get(PendingAiFlow, user_id)
+        merged_payload = merge_pending_ai_flow_payload(
+            existing_pending.flow_type if existing_pending else None,
+            existing_pending.payload if existing_pending else None,
+            flow_type,
+            payload,
+        )
+        await store_pending_ai_flow(session, user_id, flow_type, merged_payload)
 
-    await store_pending_ai_flow(user_id, flow_type, payload or {})
     await bot.send_message(
         chat_id=chat_id,
         text=disclaimer_text,
@@ -2668,6 +2679,36 @@ async def cb_accept_disclaimer(callback: CallbackQuery, state: FSMContext, bot: 
     if flow_type in ("topic", "thematic"):
         slug = payload.get("topic_slug", "free_session")
         await activate_ai_mode(callback, slug, state, bot)
+        raw_chat_msgs = payload.get("chat_messages")
+        if isinstance(raw_chat_msgs, list):
+            pending_chat_msgs = [str(item) for item in raw_chat_msgs if isinstance(item, str) and item.strip()]
+        else:
+            single_chat_msg = payload.get("chat_message")
+            pending_chat_msgs = (
+                [single_chat_msg]
+                if isinstance(single_chat_msg, str) and single_chat_msg.strip()
+                else []
+            )
+        if pending_chat_msgs and state is not None and hasattr(state, "get_state"):
+            try:
+                current_state = await state.get_state()
+            except Exception:
+                current_state = None
+            if current_state == UserStates.chatting.state:
+                from types import SimpleNamespace
+                chat = getattr(getattr(callback, "message", None), "chat", None)
+                chat_id = chat.id if chat else user_id
+                async def _answer(text, **kwargs):
+                    return await bot.send_message(chat_id=chat_id, text=text, **kwargs)
+                answer_func = getattr(getattr(callback, "message", None), "answer", None) or _answer
+                msg = SimpleNamespace(
+                    from_user=callback.from_user,
+                    chat=chat or SimpleNamespace(id=chat_id),
+                    text=pending_chat_msgs[-1],
+                    bot=bot,
+                    answer=answer_func,
+                )
+                await _process_chat_messages(msg, state, bot, pending_messages=pending_chat_msgs)
     elif flow_type == "diagnostics":
         await activate_ai_mode(callback, "diagnostics", state, bot)
     elif flow_type == "funnel_reflection":
@@ -3929,233 +3970,313 @@ async def process_image_edit(message: Message, bot: Bot):
             pass
 
 
+async def _debit_user_tokens_atomic(
+    session,
+    bot: Bot,
+    user_id: int,
+    user: User,
+    cost: float,
+    low_balance_threshold: float,
+    message: Message,
+    *,
+    notify_low_balance: bool = False,
+) -> bool:
+    """Atomically deduct `cost` tokens using SQL CAS without overwriting concurrent updates."""
+    debit_stmt = (
+        update(User)
+        .where(User.id == user_id, User.balance >= cost)
+        .values(balance=User.balance - cost)
+        .returning(User.balance)
+    )
+    new_balance = (await session.execute(debit_stmt)).scalar_one_or_none()
+    if new_balance is None:
+        await message.answer(
+            f"❌ Недостаточно токенов. Стоимость сообщения: {cost}, твой баланс: {user.balance}",
+            reply_markup=kb.token_alert_keyboard(),
+        )
+        return False
+
+    if notify_low_balance:
+        if new_balance <= low_balance_threshold and not user.low_balance_notified:
+            asyncio.create_task(bot.send_message(user_id, "⚠️ Баланс подходит к концу!"))
+            await session.execute(
+                update(User).where(User.id == user_id).values(low_balance_notified=True)
+            )
+        elif new_balance > low_balance_threshold and user.low_balance_notified:
+            await session.execute(
+                update(User).where(User.id == user_id).values(low_balance_notified=False)
+            )
+
+    await session.commit()
+    return True
+
+
 @router.message(UserStates.chatting, F.photo)
 async def process_chat_photo(message: Message, bot: Bot, state: FSMContext | None = None):
     user_id = message.from_user.id
-    async with async_session_maker() as session:
-        user = await session.get(User, user_id)
-        if not user or not user.ai_disclaimer_accepted_at or (user.ai_disclaimer_version or 0) < 1:
-            await check_and_request_ai_disclaimer(
-                bot,
-                user_id,
-                message.chat.id,
-                flow_type="topic",
-                payload={"topic_slug": user.current_topic_slug if user else "free_session"},
-            )
-            return
+    photo_id = message.photo[-1].file_id if getattr(message, "photo", None) else ""
+    photo_fp = f"{photo_id}:{message.caption or ''}"
+    claimed, claim_key = claim_telegram_message_once(
+        bot,
+        message,
+        scope="chat_photo",
+        content_fingerprint=photo_fp,
+    )
+    if not claimed:
+        return
 
-        if user.is_blocked:
-            await message.answer("⛔️ Ты заблокирован(а) администратором.")
-            return
-
-        pay_conf = await session.get(PaymentConfig, 1)
-        if not user.is_admin and pay_conf.mode != 'free':
-            if pay_conf.mode == 'subscription':
-                if not user.subscription_end or user.subscription_end < msk_now():
-                    await message.answer(
-                        "❌ Твой доступ к образовательной программе истёк. Оформи доступ к программе, чтобы продолжить.",
-                        reply_markup=kb.payment_alert_keyboard(),
+    persisted = False
+    try:
+        async with get_user_chat_lock(user_id):
+            async with async_session_maker() as session:
+                user = await session.get(User, user_id)
+                if not user or not user.ai_disclaimer_accepted_at or (user.ai_disclaimer_version or 0) < 1:
+                    await check_and_request_ai_disclaimer(
+                        bot,
+                        user_id,
+                        message.chat.id,
+                        flow_type="topic",
+                        payload={"topic_slug": user.current_topic_slug if user else "free_session"},
                     )
                     return
-            elif pay_conf.mode == 'token':
-                cost = pay_conf.cost_per_message
-                if user.balance < cost:
-                    await message.answer(
-                        f"❌ Недостаточно токенов. Стоимость сообщения: {cost}, твой баланс: {user.balance}",
-                        reply_markup=kb.token_alert_keyboard(),
-                    )
+
+                if user.is_blocked:
+                    await message.answer("⛔️ Ты заблокирован(а) администратором.")
                     return
-                user.balance -= cost
-                await session.commit()
 
-        # Resolve immutable snapshot ONCE before any network awaits
-        current_slug = user.current_topic_slug or "free_session"
-        current_did = await get_active_topic_dialogue_id(
-            session, user_id, current_slug, default=user.current_dialogue_id or 1
-        )
-        snapshot = TopicContextSnapshot(
-            user_id=user_id,
-            topic_slug=current_slug,
-            dialogue_id=current_did,
-        )
-        user_name = (user.name or user.first_name or "пользователь").strip()
+                pay_conf = await session.get(PaymentConfig, 1)
+                if not user.is_admin and pay_conf.mode != 'free':
+                    if pay_conf.mode == 'subscription':
+                        if not user.subscription_end or user.subscription_end < msk_now():
+                            await message.answer(
+                                "❌ Твой доступ к образовательной программе истёк. Оформи доступ к программе, чтобы продолжить.",
+                                reply_markup=kb.payment_alert_keyboard(),
+                            )
+                            return
+                    elif pay_conf.mode == 'token':
+                        if not await _debit_user_tokens_atomic(
+                            session,
+                            bot,
+                            user_id,
+                            user,
+                            pay_conf.cost_per_message,
+                            pay_conf.low_balance_threshold,
+                            message,
+                        ):
+                            return
 
-    async with ai_typing_action(bot, message.chat.id):
-        waiting = await message.answer("Анализирую фотографию…")
-        try:
-            file = await bot.get_file(message.photo[-1].file_id)
-            image = await bot.download_file(file.file_path)
-            caption = (message.caption or "").strip()
-
-            # Stage 1: Vision extraction -> textual factual image description
-            prompt = caption or "Опиши подробно, что изображено на фото."
-            image_description = await analyze_image(image.read(), prompt)
-
-            photo_text = f"[Фото: {image_description}]" if not caption else f"[Фото: {image_description}]\nПодпись: {caption}"
-
-            # Persist user photo representation before main dialogue generation using snapshot
-            async with async_session_maker() as session:
-                user_msg = DBMessage(
-                    user_id=snapshot.user_id,
-                    dialogue_id=snapshot.dialogue_id,
-                    role='user',
-                    content=photo_text,
-                    topic_slug=snapshot.topic_slug,
+                # Resolve immutable snapshot ONCE before any network awaits
+                current_slug = user.current_topic_slug or "free_session"
+                current_did = await get_active_topic_dialogue_id(
+                    session, user_id, current_slug, default=user.current_dialogue_id or 1
                 )
-                session.add(user_msg)
-                await session.flush()
-                current_msg_id = user_msg.id
-                await session.commit()
-
-            # Stage 2: Standard Topic Dialogue LLM pipeline using the immutable snapshot
-            response_text = await get_ai_response_for_topic(
-                snapshot.user_id,
-                photo_text,
-                user_name,
-                current_message_id=current_msg_id,
-                topic_slug=snapshot.topic_slug,
-                dialogue_id=snapshot.dialogue_id,
-                bot=bot,
-                chat_id=message.chat.id,
-            )
-
-            async with async_session_maker() as session:
-                ai_msg = DBMessage(
-                    user_id=snapshot.user_id,
-                    dialogue_id=snapshot.dialogue_id,
-                    role='assistant',
-                    content=response_text,
-                    topic_slug=snapshot.topic_slug,
+                snapshot = TopicContextSnapshot(
+                    user_id=user_id,
+                    topic_slug=current_slug,
+                    dialogue_id=current_did,
                 )
-                session.add(ai_msg)
-                await session.commit()
+                user_name = (user.name or user.first_name or "пользователь").strip()
 
-            await send_ai_response(
-                message.chat.id,
-                response_text,
-                bot,
-                state,
-                await kb.ai_response_keyboard_for_topic(snapshot.topic_slug, snapshot.dialogue_id),
-            )
-        except Exception:
-            logger.exception("Photo processing failed")
-            await message.answer("Не удалось обработать изображение. Попробуйте позже.")
-        finally:
-            try:
-                await waiting.delete()
-            except Exception:
-                pass
+            async with ai_typing_action(bot, message.chat.id):
+                waiting = await message.answer("Анализирую фотографию…")
+                try:
+                    file = await bot.get_file(message.photo[-1].file_id)
+                    image = await bot.download_file(file.file_path)
+                    caption = (message.caption or "").strip()
+
+                    # Stage 1: Vision extraction -> textual factual image description
+                    prompt = caption or "Опиши подробно, что изображено на фото."
+                    image_description = await analyze_image(image.read(), prompt)
+
+                    photo_text = f"[Фото: {image_description}]" if not caption else f"[Фото: {image_description}]\nПодпись: {caption}"
+
+                    # Persist user photo representation before main dialogue generation using snapshot
+                    async with async_session_maker() as session:
+                        user_msg = DBMessage(
+                            user_id=snapshot.user_id,
+                            dialogue_id=snapshot.dialogue_id,
+                            role='user',
+                            content=photo_text,
+                            topic_slug=snapshot.topic_slug,
+                        )
+                        session.add(user_msg)
+                        await session.flush()
+                        current_msg_id = user_msg.id
+                        await session.commit()
+                        persisted = True
+
+                    # Stage 2: Standard Topic Dialogue LLM pipeline using the immutable snapshot
+                    response_text = await get_ai_response_for_topic(
+                        snapshot.user_id,
+                        photo_text,
+                        user_name,
+                        current_message_id=current_msg_id,
+                        topic_slug=snapshot.topic_slug,
+                        dialogue_id=snapshot.dialogue_id,
+                        bot=bot,
+                        chat_id=message.chat.id,
+                    )
+
+                    async with async_session_maker() as session:
+                        ai_msg = DBMessage(
+                            user_id=snapshot.user_id,
+                            dialogue_id=snapshot.dialogue_id,
+                            role='assistant',
+                            content=response_text,
+                            topic_slug=snapshot.topic_slug,
+                        )
+                        session.add(ai_msg)
+                        await session.commit()
+
+                    await send_ai_response(
+                        message.chat.id,
+                        response_text,
+                        bot,
+                        state,
+                        await kb.ai_response_keyboard_for_topic(snapshot.topic_slug, snapshot.dialogue_id),
+                    )
+                except Exception:
+                    logger.exception("Photo processing failed")
+                    await message.answer("Не удалось обработать изображение. Попробуйте позже.")
+                finally:
+                    try:
+                        await waiting.delete()
+                    except Exception:
+                        pass
+    except Exception:
+        if not persisted:
+            release_telegram_message_claim(claim_key)
+        raise
 
 
 @router.message(UserStates.chatting, F.voice | F.audio)
 async def process_chat_audio(message: Message, bot: Bot, state: FSMContext | None = None):
     user_id = message.from_user.id
-    async with async_session_maker() as session:
-        user = await session.get(User, user_id)
-        if not user or not user.ai_disclaimer_accepted_at or (user.ai_disclaimer_version or 0) < 1:
-            await check_and_request_ai_disclaimer(
-                bot,
-                user_id,
-                message.chat.id,
-                flow_type="topic",
-                payload={"topic_slug": user.current_topic_slug if user else "free_session"},
-            )
-            return
-
-        if user.is_blocked:
-            await message.answer("⛔️ Ты заблокирован(а) администратором.")
-            return
-
-        pay_conf = await session.get(PaymentConfig, 1)
-        if not user.is_admin and pay_conf.mode != 'free':
-            if pay_conf.mode == 'subscription':
-                if not user.subscription_end or user.subscription_end < msk_now():
-                    await message.answer(
-                        "❌ Твой доступ к образовательной программе истёк. Оформи доступ к программе, чтобы продолжить.",
-                        reply_markup=kb.payment_alert_keyboard(),
-                    )
-                    return
-            elif pay_conf.mode == 'token':
-                cost = pay_conf.cost_per_message
-                if user.balance < cost:
-                    await message.answer(
-                        f"❌ Недостаточно токенов. Стоимость сообщения: {cost}, твой баланс: {user.balance}",
-                        reply_markup=kb.token_alert_keyboard(),
-                    )
-                    return
-                user.balance -= cost
-                await session.commit()
-
-        current_slug = user.current_topic_slug or "free_session"
-        current_did = await get_active_topic_dialogue_id(
-            session, user_id, current_slug, default=user.current_dialogue_id or 1
-        )
-        snapshot = TopicContextSnapshot(
-            user_id=user_id,
-            topic_slug=current_slug,
-            dialogue_id=current_did,
-        )
-        user_name = (user.name or user.first_name or "пользователь").strip()
-
     source = message.voice or message.audio
-    async with ai_typing_action(bot, message.chat.id):
-        waiting = await message.answer("Распознаю аудио…")
-        try:
-            file = await bot.get_file(source.file_id)
-            audio = await bot.download_file(file.file_path)
-            transcript = await transcribe_audio(audio.read(), getattr(source, 'file_name', None) or 'voice.ogg')
+    audio_fp = getattr(source, "file_id", "") if source else ""
+    claimed, claim_key = claim_telegram_message_once(
+        bot,
+        message,
+        scope="chat_audio",
+        content_fingerprint=audio_fp,
+    )
+    if not claimed:
+        return
 
-            audio_text = f"[Аудио] {transcript}"
+    persisted = False
+    try:
+        async with get_user_chat_lock(user_id):
             async with async_session_maker() as session:
-                user_msg = DBMessage(
-                    user_id=snapshot.user_id,
-                    dialogue_id=snapshot.dialogue_id,
-                    role='user',
-                    content=audio_text,
-                    topic_slug=snapshot.topic_slug,
+                user = await session.get(User, user_id)
+                if not user or not user.ai_disclaimer_accepted_at or (user.ai_disclaimer_version or 0) < 1:
+                    await check_and_request_ai_disclaimer(
+                        bot,
+                        user_id,
+                        message.chat.id,
+                        flow_type="topic",
+                        payload={"topic_slug": user.current_topic_slug if user else "free_session"},
+                    )
+                    return
+
+                if user.is_blocked:
+                    await message.answer("⛔️ Ты заблокирован(а) администратором.")
+                    return
+
+                pay_conf = await session.get(PaymentConfig, 1)
+                if not user.is_admin and pay_conf.mode != 'free':
+                    if pay_conf.mode == 'subscription':
+                        if not user.subscription_end or user.subscription_end < msk_now():
+                            await message.answer(
+                                "❌ Твой доступ к образовательной программе истёк. Оформи доступ к программе, чтобы продолжить.",
+                                reply_markup=kb.payment_alert_keyboard(),
+                            )
+                            return
+                    elif pay_conf.mode == 'token':
+                        if not await _debit_user_tokens_atomic(
+                            session,
+                            bot,
+                            user_id,
+                            user,
+                            pay_conf.cost_per_message,
+                            pay_conf.low_balance_threshold,
+                            message,
+                        ):
+                            return
+
+                current_slug = user.current_topic_slug or "free_session"
+                current_did = await get_active_topic_dialogue_id(
+                    session, user_id, current_slug, default=user.current_dialogue_id or 1
                 )
-                session.add(user_msg)
-                await session.flush()
-                current_msg_id = user_msg.id
-                await session.commit()
-
-            response_text = await get_ai_response_for_topic(
-                snapshot.user_id,
-                f"Пользователь прислал аудио. Расшифровка:\n{transcript}",
-                user_name,
-                current_message_id=current_msg_id,
-                topic_slug=snapshot.topic_slug,
-                dialogue_id=snapshot.dialogue_id,
-                bot=bot,
-                chat_id=message.chat.id,
-            )
-
-            async with async_session_maker() as session:
-                ai_msg = DBMessage(
-                    user_id=snapshot.user_id,
-                    dialogue_id=snapshot.dialogue_id,
-                    role='assistant',
-                    content=response_text,
-                    topic_slug=snapshot.topic_slug,
+                snapshot = TopicContextSnapshot(
+                    user_id=user_id,
+                    topic_slug=current_slug,
+                    dialogue_id=current_did,
                 )
-                session.add(ai_msg)
-                await session.commit()
+                user_name = (user.name or user.first_name or "пользователь").strip()
 
-            await send_ai_response(
-                message.chat.id,
-                response_text,
-                bot,
-                state,
-                await kb.ai_response_keyboard_for_topic(snapshot.topic_slug, snapshot.dialogue_id),
-            )
-        except Exception:
-            logger.exception("Audio transcription failed")
-            await message.answer("Не удалось распознать аудио. Попробуйте позже.")
-        finally:
-            try:
-                await waiting.delete()
-            except Exception:
-                pass
+            async with ai_typing_action(bot, message.chat.id):
+                waiting = await message.answer("Распознаю аудио…")
+                try:
+                    file = await bot.get_file(source.file_id)
+                    audio = await bot.download_file(file.file_path)
+                    transcript = await transcribe_audio(audio.read(), getattr(source, 'file_name', None) or 'voice.ogg')
+
+                    audio_text = f"[Аудио] {transcript}"
+                    async with async_session_maker() as session:
+                        user_msg = DBMessage(
+                            user_id=snapshot.user_id,
+                            dialogue_id=snapshot.dialogue_id,
+                            role='user',
+                            content=audio_text,
+                            topic_slug=snapshot.topic_slug,
+                        )
+                        session.add(user_msg)
+                        await session.flush()
+                        current_msg_id = user_msg.id
+                        await session.commit()
+                        persisted = True
+
+                    response_text = await get_ai_response_for_topic(
+                        snapshot.user_id,
+                        f"Пользователь прислал аудио. Расшифровка:\n{transcript}",
+                        user_name,
+                        current_message_id=current_msg_id,
+                        topic_slug=snapshot.topic_slug,
+                        dialogue_id=snapshot.dialogue_id,
+                        bot=bot,
+                        chat_id=message.chat.id,
+                    )
+
+                    async with async_session_maker() as session:
+                        ai_msg = DBMessage(
+                            user_id=snapshot.user_id,
+                            dialogue_id=snapshot.dialogue_id,
+                            role='assistant',
+                            content=response_text,
+                            topic_slug=snapshot.topic_slug,
+                        )
+                        session.add(ai_msg)
+                        await session.commit()
+
+                    await send_ai_response(
+                        message.chat.id,
+                        response_text,
+                        bot,
+                        state,
+                        await kb.ai_response_keyboard_for_topic(snapshot.topic_slug, snapshot.dialogue_id),
+                    )
+                except Exception:
+                    logger.exception("Audio transcription failed")
+                    await message.answer("Не удалось распознать аудио. Попробуйте позже.")
+                finally:
+                    try:
+                        await waiting.delete()
+                    except Exception:
+                        pass
+    except Exception:
+        if not persisted:
+            release_telegram_message_claim(claim_key)
+        raise
 
 
 @router.message(Command("image"))
@@ -4179,129 +4300,184 @@ async def process_image_generation(message: Message, bot: Bot):
                 pass
 
 
-@router.message(UserStates.chatting, ~F.text.startswith('/'))
-async def process_chat(message: Message, state: FSMContext, bot: Bot):
-    await touch_user_activity(message.from_user.id)
-    if message.text == "❌ Выход":
-        await state.clear()
-        await send_main_menu(message, bot=bot)
+async def _process_chat_messages(
+    message: Message,
+    state: FSMContext,
+    bot: Bot,
+    *,
+    pending_messages: list[str],
+    claim_key: tuple[int, str, int, int, str] | None = None,
+) -> None:
+    messages_to_persist = [m for m in pending_messages if isinstance(m, str) and m.strip()]
+    if not messages_to_persist:
         return
 
     user_id = message.from_user.id
-    user_prompt = message.text
-
-    async with async_session_maker() as session:
-        user = await session.get(User, user_id)
-        if not user or not user.ai_disclaimer_accepted_at or (user.ai_disclaimer_version or 0) < 1:
-            await check_and_request_ai_disclaimer(
-                bot,
-                user_id,
-                message.chat.id,
-                flow_type="topic",
-                payload={"topic_slug": user.current_topic_slug if user else "free_session"},
-            )
-            return
-
-        if user.is_blocked:
-            await message.answer("⛔️ Ты заблокирован(а) администратором.")
-            await state.clear()
-            return
-
-        pay_conf = await session.get(PaymentConfig, 1)
-
-        if not user.is_admin and pay_conf.mode != 'free':
-            if pay_conf.mode == 'subscription':
-                if not user.subscription_end or user.subscription_end < msk_now():
-                    await message.answer("❌ Твой доступ к образовательной программе истёк. Оформи доступ к программе, чтобы продолжить.",
-                                         reply_markup=kb.payment_alert_keyboard())
-                    return
-
-            elif pay_conf.mode == 'token':
-                cost = pay_conf.cost_per_message
-                if user.balance < cost:
-                    await message.answer(
-                        f"❌ Недостаточно токенов. Стоимость сообщения: {cost}, твой баланс: {user.balance}",
-                        reply_markup=kb.token_alert_keyboard(),
-                    )
-                    return
-                user.balance -= cost
-                if user.balance <= pay_conf.low_balance_threshold and not user.low_balance_notified:
-                    asyncio.create_task(bot.send_message(user_id, "⚠️ Баланс подходит к концу!"))
-                    user.low_balance_notified = True
-                elif user.balance > pay_conf.low_balance_threshold:
-                    user.low_balance_notified = False
-                await session.commit()
-
-        # Resolve immutable snapshot ONCE before any network awaits
-        current_slug = user.current_topic_slug or "free_session"
-        current_did = await get_active_topic_dialogue_id(
-            session, user_id, current_slug, default=user.current_dialogue_id or 1
-        )
-        snapshot = TopicContextSnapshot(
-            user_id=user_id,
-            topic_slug=current_slug,
-            dialogue_id=current_did,
-        )
-        user_name = (user.name or user.first_name or "пользователь").strip()
-
-        user_msg_db = DBMessage(
-            user_id=snapshot.user_id,
-            dialogue_id=snapshot.dialogue_id,
-            role='user',
-            content=user_prompt,
-            topic_slug=snapshot.topic_slug,
-        )
-        session.add(user_msg_db)
-        await session.flush()
-        current_msg_id = user_msg_db.id
-        await session.commit()
-
-    waiting_msg = await message.answer("⏳ ...")
-    response_text = await get_ai_response_for_topic(
-        snapshot.user_id,
-        user_prompt,
-        user_name,
-        current_message_id=current_msg_id,
-        topic_slug=snapshot.topic_slug,
-        dialogue_id=snapshot.dialogue_id,
-        bot=bot,
-        chat_id=message.chat.id,
-    )
-    should_start_test, response_text = extract_test_start_directive(response_text)
+    user_prompt = messages_to_persist[-1]
+    combined_user_text = "\n\n".join(messages_to_persist)
+    persisted = False
 
     try:
-        await waiting_msg.delete()
+        async with get_user_chat_lock(user_id):
+            await touch_user_activity(user_id)
+            async with async_session_maker() as session:
+                user = await session.get(User, user_id)
+                if not user or not user.ai_disclaimer_accepted_at or (user.ai_disclaimer_version or 0) < 1:
+                    disclaimer_payload: dict[str, object] = {
+                        "topic_slug": user.current_topic_slug if user else "free_session",
+                        "chat_message": combined_user_text,
+                    }
+                    if len(messages_to_persist) > 1:
+                        disclaimer_payload["chat_messages"] = list(messages_to_persist)
+                    await check_and_request_ai_disclaimer(
+                        bot,
+                        user_id,
+                        message.chat.id,
+                        flow_type="topic",
+                        payload=disclaimer_payload,
+                    )
+                    return
+
+                if user.is_blocked:
+                    await message.answer("⛔️ Ты заблокирован(а) администратором.")
+                    await state.clear()
+                    return
+
+                pay_conf = await session.get(PaymentConfig, 1)
+
+                if not user.is_admin and pay_conf.mode != 'free':
+                    if pay_conf.mode == 'subscription':
+                        if not user.subscription_end or user.subscription_end < msk_now():
+                            await message.answer(
+                                "❌ Твой доступ к образовательной программе истёк. Оформи доступ к программе, чтобы продолжить.",
+                                reply_markup=kb.payment_alert_keyboard(),
+                            )
+                            return
+
+                    elif pay_conf.mode == 'token':
+                        if not await _debit_user_tokens_atomic(
+                            session,
+                            bot,
+                            user_id,
+                            user,
+                            pay_conf.cost_per_message,
+                            pay_conf.low_balance_threshold,
+                            message,
+                            notify_low_balance=True,
+                        ):
+                            return
+
+                # Resolve immutable snapshot ONCE before any network awaits
+                current_slug = user.current_topic_slug or "free_session"
+                current_did = await get_active_topic_dialogue_id(
+                    session, user_id, current_slug, default=user.current_dialogue_id or 1
+                )
+                snapshot = TopicContextSnapshot(
+                    user_id=user_id,
+                    topic_slug=current_slug,
+                    dialogue_id=current_did,
+                )
+                user_name = (user.name or user.first_name or "пользователь").strip()
+
+                current_msg_id = None
+                for text_item in messages_to_persist:
+                    user_msg_db = DBMessage(
+                        user_id=snapshot.user_id,
+                        dialogue_id=snapshot.dialogue_id,
+                        role='user',
+                        content=text_item,
+                        topic_slug=snapshot.topic_slug,
+                    )
+                    session.add(user_msg_db)
+                    await session.flush()
+                    current_msg_id = user_msg_db.id
+                await session.commit()
+                persisted = True
+
+            waiting_msg = await message.answer("⏳ ...")
+            try:
+                ai_kwargs: dict[str, object] = {
+                    "current_message_id": current_msg_id,
+                    "topic_slug": snapshot.topic_slug,
+                    "dialogue_id": snapshot.dialogue_id,
+                    "bot": bot,
+                    "chat_id": message.chat.id,
+                }
+                if len(messages_to_persist) > 1:
+                    ai_kwargs["alert_user_text"] = combined_user_text
+                response_text = await get_ai_response_for_topic(
+                    snapshot.user_id,
+                    user_prompt,
+                    user_name,
+                    **ai_kwargs,
+                )
+                should_start_test, response_text = extract_test_start_directive(response_text)
+            finally:
+                try:
+                    await waiting_msg.delete()
+                except Exception:
+                    pass
+
+            async with async_session_maker() as session:
+                if response_text:
+                    ai_msg_db = DBMessage(
+                        user_id=snapshot.user_id,
+                        dialogue_id=snapshot.dialogue_id,
+                        role='assistant',
+                        content=response_text,
+                        topic_slug=snapshot.topic_slug,
+                    )
+                    session.add(ai_msg_db)
+                    await session.commit()
+
+            if response_text:
+                await send_ai_response(
+                    message.chat.id,
+                    response_text,
+                    bot,
+                    state,
+                    await kb.ai_response_keyboard_for_topic(snapshot.topic_slug, snapshot.dialogue_id),
+                )
+            if should_start_test:
+                await start_universal_test(
+                    bot,
+                    user_id,
+                    state,
+                    topic_slug=snapshot.topic_slug,
+                    dialogue_id=snapshot.dialogue_id,
+                )
     except Exception:
-        pass
+        if not persisted:
+            release_telegram_message_claim(claim_key)
+        raise
 
-    async with async_session_maker() as session:
-        if response_text:
-            ai_msg_db = DBMessage(
-                user_id=snapshot.user_id,
-                dialogue_id=snapshot.dialogue_id,
-                role='assistant',
-                content=response_text,
-                topic_slug=snapshot.topic_slug,
-            )
-            session.add(ai_msg_db)
-            await session.commit()
 
-    if response_text:
-        await send_ai_response(
-            message.chat.id,
-            response_text,
-            bot,
-            state,
-            await kb.ai_response_keyboard_for_topic(snapshot.topic_slug, snapshot.dialogue_id),
-        )
-    if should_start_test:
-        await start_universal_test(
-            bot,
-            user_id,
-            state,
-            topic_slug=snapshot.topic_slug,
-            dialogue_id=snapshot.dialogue_id,
-        )
+@router.message(UserStates.chatting, ~F.text.startswith('/'))
+async def process_chat(message: Message, state: FSMContext, bot: Bot):
+    if message.text == "❌ Выход":
+        await touch_user_activity(message.from_user.id)
+        await state.clear()
+        await send_main_menu(message, bot=bot)
+        return
+    if not message.text or not message.text.strip():
+        return
+
+    claimed, claim_key = claim_telegram_message_once(
+        bot,
+        message,
+        scope="chat_text",
+        content_fingerprint=message.text,
+    )
+    if not claimed:
+        return
+
+    await _process_chat_messages(
+        message,
+        state,
+        bot,
+        pending_messages=[message.text],
+        claim_key=claim_key,
+    )
 
 
 @router.callback_query(F.data == "ref_create_link")

@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
 import json
 import logging
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any
+from weakref import WeakKeyDictionary
 
 from aiogram import Bot
 from aiogram.fsm.context import FSMContext
@@ -31,6 +34,82 @@ from database import (
 from time_utils import msk_now
 
 logger = logging.getLogger(__name__)
+
+_USER_CHAT_LOCKS: WeakKeyDictionary[asyncio.AbstractEventLoop, dict[int, asyncio.Lock]] = WeakKeyDictionary()
+_SEEN_TELEGRAM_MESSAGES: OrderedDict[tuple[int, str, int, int, str], float] = OrderedDict()
+_TELEGRAM_DEDUP_TTL_SECONDS = 300.0
+_TELEGRAM_DEDUP_MAX_SIZE = 4096
+
+
+def get_user_chat_lock(user_id: int) -> asyncio.Lock:
+    """Return a per-event-loop FIFO asyncio.Lock serializing chat turns for one user."""
+    loop = asyncio.get_running_loop()
+    loop_locks = _USER_CHAT_LOCKS.get(loop)
+    if loop_locks is None:
+        loop_locks = {}
+        _USER_CHAT_LOCKS[loop] = loop_locks
+    uid = int(user_id)
+    lock = loop_locks.get(uid)
+    if lock is None:
+        lock = asyncio.Lock()
+        loop_locks[uid] = lock
+    return lock
+
+
+def claim_telegram_message_once(
+    bot: Any,
+    message: Any,
+    *,
+    scope: str,
+    content_fingerprint: str = "",
+) -> tuple[bool, tuple[int, str, int, int, str] | None]:
+    """Deduplicate identical Telegram redeliveries while allowing synthetic test messages without message_id."""
+    message_id = getattr(message, "message_id", None)
+    if isinstance(message_id, bool) or not isinstance(message_id, int) or message_id <= 0:
+        return True, None
+
+    chat_obj = getattr(message, "chat", None)
+    from_user = getattr(message, "from_user", None)
+    chat_id = getattr(chat_obj, "id", None)
+    if chat_id is None:
+        chat_id = getattr(from_user, "id", 0)
+
+    key = (
+        id(bot) if bot is not None else 0,
+        str(scope),
+        int(chat_id or 0),
+        int(message_id),
+        str(content_fingerprint or ""),
+    )
+    now = time.monotonic()
+
+    while _SEEN_TELEGRAM_MESSAGES:
+        _, seen_at = next(iter(_SEEN_TELEGRAM_MESSAGES.items()))
+        if now - seen_at >= _TELEGRAM_DEDUP_TTL_SECONDS:
+            _SEEN_TELEGRAM_MESSAGES.popitem(last=False)
+        else:
+            break
+
+    if key in _SEEN_TELEGRAM_MESSAGES:
+        return False, None
+
+    _SEEN_TELEGRAM_MESSAGES[key] = now
+    _SEEN_TELEGRAM_MESSAGES.move_to_end(key)
+    while len(_SEEN_TELEGRAM_MESSAGES) > _TELEGRAM_DEDUP_MAX_SIZE:
+        _SEEN_TELEGRAM_MESSAGES.popitem(last=False)
+    return True, key
+
+
+def release_telegram_message_claim(key: tuple[int, str, int, int, str] | None) -> None:
+    """Release a message claim if processing failed before DB persistence."""
+    if key is not None:
+        _SEEN_TELEGRAM_MESSAGES.pop(key, None)
+
+
+def reset_ai_chat_runtime_state() -> None:
+    """Clear in-memory chat locks and redelivery dedup cache between tests."""
+    _SEEN_TELEGRAM_MESSAGES.clear()
+    _USER_CHAT_LOCKS.clear()
 
 
 @dataclass(frozen=True)
@@ -255,7 +334,7 @@ async def get_turn_aware_history(
         )
     )
     if exclude_message_id is not None:
-        stmt = stmt.where(DBMessage.id != exclude_message_id)
+        stmt = stmt.where(DBMessage.id < exclude_message_id)
 
     stmt = stmt.order_by(DBMessage.id.asc())
     all_msgs = (await session.execute(stmt)).scalars().all()
@@ -266,8 +345,10 @@ async def get_turn_aware_history(
     if not turns:
         return []
 
-    first_turns = turns[:limit_first] if limit_first > 0 else []
-    recent_turns = turns[-limit_recent:] if limit_recent > 0 else []
+    safe_limit_first = int(limit_first or 0)
+    safe_limit_recent = int(limit_recent or 0)
+    first_turns = turns[:safe_limit_first] if safe_limit_first > 0 else []
+    recent_turns = turns[-safe_limit_recent:] if safe_limit_recent > 0 else []
 
     turn_map = {}
     for t in first_turns:
@@ -1074,6 +1155,54 @@ async def generate_session_summary(
 # ==============================================================================
 # Guard 1: Allowlisted Flow Resumption for Disclaimer
 # ==============================================================================
+
+_PENDING_FLOW_MERGE_SPECS: dict[str, tuple[str, str, tuple[str, ...]]] = {
+    "funnel_strategy": ("strategy_message", "strategy_messages", ("strategy_dialogue_id",)),
+    "funnel_objection": ("objection_message", "objection_messages", ("objection_dialogue_id",)),
+    "funnel_reflection": ("reflection_text", "reflection_messages", ("meditation_id",)),
+    "topic": ("chat_message", "chat_messages", ("topic_slug",)),
+}
+
+
+def _extract_pending_flow_messages(payload: dict[str, Any], text_key: str, list_key: str) -> list[str]:
+    raw_list = payload.get(list_key)
+    if isinstance(raw_list, list):
+        items = [str(item) for item in raw_list if isinstance(item, str) and item.strip()]
+        if items:
+            return items
+    single = payload.get(text_key)
+    if isinstance(single, str) and single.strip():
+        return [single]
+    return []
+
+
+def merge_pending_ai_flow_payload(
+    existing_flow_type: str | None,
+    existing_payload: dict[str, Any] | None,
+    new_flow_type: str,
+    new_payload: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Preserve and merge consecutive pre-disclaimer messages within the same flow & identity."""
+    merged = dict(new_payload or {})
+    spec = _PENDING_FLOW_MERGE_SPECS.get(new_flow_type)
+    if spec is None or existing_flow_type != new_flow_type or not isinstance(existing_payload, dict):
+        return merged
+
+    text_key, list_key, identity_keys = spec
+    if not all(existing_payload.get(k) == merged.get(k) for k in identity_keys):
+        return merged
+
+    prev_msgs = _extract_pending_flow_messages(existing_payload, text_key, list_key)
+    new_msgs = _extract_pending_flow_messages(merged, text_key, list_key)
+    if prev_msgs and new_msgs:
+        combined = prev_msgs + new_msgs
+        merged[list_key] = combined
+        merged[text_key] = "\n\n".join(combined)
+    elif prev_msgs and not new_msgs:
+        merged[list_key] = list(prev_msgs)
+        merged[text_key] = "\n\n".join(prev_msgs)
+    return merged
+
 
 async def store_pending_ai_flow(
     *args,

@@ -571,6 +571,30 @@ async def get_standalone_ai_response(
                 raise
 
 
+def normalize_llm_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop empty entries and merge adjacent non-system messages sharing the same role."""
+    normalized: list[dict[str, Any]] = []
+    for item in messages:
+        role = item.get("role")
+        content = item.get("content")
+        if content is None or (isinstance(content, str) and not content.strip()):
+            continue
+        if (
+            normalized
+            and role != "system"
+            and normalized[-1].get("role") == role
+            and isinstance(normalized[-1].get("content"), str)
+            and isinstance(content, str)
+        ):
+            normalized[-1] = {
+                **normalized[-1],
+                "content": f"{normalized[-1]['content']}\n\n{content}",
+            }
+        else:
+            normalized.append(dict(item))
+    return normalized
+
+
 async def get_ai_response_for_topic(
         user_id: int,
         user_prompt: str,
@@ -680,12 +704,13 @@ async def get_ai_response_for_topic(
             messages.append({"role": "system", "content": full_system})
 
             for m in history_msgs:
-                if current_message_id is not None and m.id == current_message_id:
+                if current_message_id is not None and m.id is not None and m.id >= current_message_id:
                     continue
                 if m.content:
                     messages.append({"role": m.role, "content": m.content})
 
             messages.append({"role": "user", "content": user_prompt})
+            messages = normalize_llm_messages(messages)
 
             request_group_id = uuid.uuid4().hex[:12]
             start_ts = time.monotonic()
