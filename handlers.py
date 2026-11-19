@@ -2677,7 +2677,7 @@ async def cb_accept_disclaimer(callback: CallbackQuery, state: FSMContext, bot: 
     payload = pending.payload or {}
 
     if flow_type in ("topic", "thematic"):
-        slug = payload.get("topic_slug", "free_session")
+        slug = payload.get("topic_slug") or "free_session"
         await activate_ai_mode(callback, slug, state, bot)
         raw_chat_msgs = payload.get("chat_messages")
         if isinstance(raw_chat_msgs, list):
@@ -4036,7 +4036,7 @@ async def process_chat_photo(message: Message, bot: Bot, state: FSMContext | Non
                         user_id,
                         message.chat.id,
                         flow_type="topic",
-                        payload={"topic_slug": user.current_topic_slug if user else "free_session"},
+                        payload={"topic_slug": (user.current_topic_slug or "free_session") if user else "free_session"},
                     )
                     return
 
@@ -4174,7 +4174,7 @@ async def process_chat_audio(message: Message, bot: Bot, state: FSMContext | Non
                         user_id,
                         message.chat.id,
                         flow_type="topic",
-                        payload={"topic_slug": user.current_topic_slug if user else "free_session"},
+                        payload={"topic_slug": (user.current_topic_slug or "free_session") if user else "free_session"},
                     )
                     return
 
@@ -4324,7 +4324,7 @@ async def _process_chat_messages(
                 user = await session.get(User, user_id)
                 if not user or not user.ai_disclaimer_accepted_at or (user.ai_disclaimer_version or 0) < 1:
                     disclaimer_payload: dict[str, object] = {
-                        "topic_slug": user.current_topic_slug if user else "free_session",
+                        "topic_slug": (user.current_topic_slug or "free_session") if user else "free_session",
                         "chat_message": combined_user_text,
                     }
                     if len(messages_to_persist) > 1:
