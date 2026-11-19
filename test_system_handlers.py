@@ -500,19 +500,24 @@ async def _send_long(
     text: str,
     parse_mode: Optional[str] = None,
     include_finish_markup: bool = True,
-) -> None:
+    reply_markup_override=None,
+):
     remaining = (text or "").strip()
     if not remaining:
         remaining = "Интерпретация результата сейчас недоступна."
-    finish_markup = await kb.ai_exit_keyboard_for_topic() if include_finish_markup else None
+    if reply_markup_override is not None:
+        finish_markup = reply_markup_override if include_finish_markup else None
+    else:
+        finish_markup = await kb.ai_exit_keyboard_for_topic() if include_finish_markup else None
 
+    last_sent = None
     if parse_mode == "HTML":
         from md_utils import split_html_message, strip_telegram_html
         chunks = split_html_message(remaining, 4000)
         for i, chunk in enumerate(chunks):
             is_last = (i == len(chunks) - 1)
             try:
-                await bot.send_message(
+                last_sent = await bot.send_message(
                     chat_id,
                     chunk,
                     reply_markup=finish_markup if is_last else None,
@@ -520,13 +525,13 @@ async def _send_long(
                 )
             except TelegramBadRequest:
                 plain_chunk = strip_telegram_html(chunk)
-                await bot.send_message(
+                last_sent = await bot.send_message(
                     chat_id,
                     plain_chunk,
                     reply_markup=finish_markup if is_last else None,
                     parse_mode=None,
                 )
-        return
+        return last_sent
 
     while remaining:
         if len(remaining) <= 4000:
@@ -536,12 +541,13 @@ async def _send_long(
             if split_at < 1000:
                 split_at = 4000
             chunk, remaining = remaining[:split_at], remaining[split_at:].lstrip()
-        await bot.send_message(
+        last_sent = await bot.send_message(
             chat_id,
             chunk,
             reply_markup=finish_markup if not remaining else None,
             parse_mode=parse_mode,
         )
+    return last_sent
 
 
 async def _finish_test(bot: Bot, user_id: int, state: FSMContext, answers: list[dict]) -> None:
@@ -753,50 +759,94 @@ async def _finish_test(bot: Bot, user_id: int, state: FSMContext, answers: list[
 
     from md_utils import markdown_to_html
 
+    if crisis_active:
+        await _send_long(
+            bot,
+            user_id,
+            markdown_to_html(result_text),
+            parse_mode="HTML",
+            include_finish_markup=False,
+        )
+        if crisis_detected_now:
+            await send_crisis_contacts_if_active(bot, user_id, user_id)
+        await state.clear()
+        return
+
+    # Enter working dialogue directly after pre_dialogue test (no repeated welcome/start button)
+    if attempt_purpose == "pre_dialogue" and topic_slug:
+        from database import TopicDialogueConfig
+        from ai_dialogue_service import deliver_prerecorded_first_message
+        effective_did = dialogue_id or 1
+        async with async_session_maker() as session:
+            cfg = (await session.execute(
+                select(TopicDialogueConfig).where(TopicDialogueConfig.topic_slug == topic_slug)
+            )).scalar_one_or_none()
+            prerecorded_text = cfg.prerecorded_first_message if (cfg and cfg.prerecorded_first_message) else None
+
+        markup = await kb.ai_response_keyboard_for_topic(topic_slug, effective_did)
+        last_sent_message = None
+        if prerecorded_text:
+            result_msg = await _send_long(
+                bot,
+                user_id,
+                markdown_to_html(result_text),
+                parse_mode="HTML",
+                include_finish_markup=False,
+            )
+            sent_prerec = []
+            async with async_session_maker() as session:
+                await deliver_prerecorded_first_message(
+                    bot,
+                    session,
+                    user_id,
+                    topic_slug,
+                    effective_did,
+                    prerecorded_text,
+                    reply_markup=markup,
+                    sent_messages=sent_prerec,
+                )
+            if sent_prerec:
+                last_sent_message = sent_prerec[-1]
+            else:
+                last_sent_message = result_msg
+                if isinstance(getattr(result_msg, "message_id", None), int):
+                    try:
+                        await bot.edit_message_reply_markup(
+                            chat_id=user_id,
+                            message_id=result_msg.message_id,
+                            reply_markup=markup,
+                        )
+                    except Exception:
+                        pass
+        else:
+            last_sent_message = await _send_long(
+                bot,
+                user_id,
+                markdown_to_html(result_text),
+                parse_mode="HTML",
+                include_finish_markup=True,
+                reply_markup_override=markup,
+            )
+
+        if crisis_detected_now:
+            await send_crisis_contacts_if_active(bot, user_id, user_id)
+
+        await state.set_state("UserStates:chatting")
+        update_payload = {"current_topic_slug": topic_slug, "dialogue_id": effective_did}
+        if isinstance(getattr(last_sent_message, "message_id", None), int):
+            update_payload["ai_last_response_message_id"] = last_sent_message.message_id
+        await state.update_data(**update_payload)
+        return
+
     await _send_long(
         bot,
         user_id,
         markdown_to_html(result_text),
         parse_mode="HTML",
-        include_finish_markup=not crisis_active,
+        include_finish_markup=True,
     )
     if crisis_detected_now:
         await send_crisis_contacts_if_active(bot, user_id, user_id)
-    if crisis_active:
-        await state.clear()
-        return
-
-    # Resume topic lifecycle if pre_dialogue
-    if attempt_purpose == "pre_dialogue" and topic_slug:
-        from database import TopicDialogueConfig
-        from ai_dialogue_service import deliver_prerecorded_first_message
-        async with async_session_maker() as session:
-            cfg = (await session.execute(
-                select(TopicDialogueConfig).where(TopicDialogueConfig.topic_slug == topic_slug)
-            )).scalar_one_or_none()
-            start_btn_enabled = cfg.start_dialogue_button_enabled if cfg else False
-            prerecorded_text = cfg.prerecorded_first_message if cfg else None
-
-        if start_btn_enabled:
-            btn_text = (cfg.start_dialogue_button_text if cfg and cfg.start_dialogue_button_text else None) or "Начать диалог"
-            keyboard = kb.topic_start_dialogue_keyboard(topic_slug, dialogue_id, btn_text)
-            await _send_topic_welcome(bot, user_id, cfg, reply_markup=keyboard)
-            await state.clear()
-            return
-
-        if prerecorded_text:
-            async with async_session_maker() as session:
-                await deliver_prerecorded_first_message(
-                    bot, session, user_id, topic_slug, dialogue_id, prerecorded_text
-                )
-
-        await state.set_state("UserStates:chatting")
-        await state.update_data(current_topic_slug=topic_slug, dialogue_id=dialogue_id)
-        markup = await kb.ai_response_keyboard_for_topic(topic_slug, dialogue_id)
-        sent_message = await _send_topic_welcome(bot, user_id, cfg, reply_markup=markup)
-        if isinstance(getattr(sent_message, "message_id", None), int):
-            await state.update_data(ai_last_response_message_id=sent_message.message_id)
-        return
 
     await state.set_state("UserStates:chatting")
 

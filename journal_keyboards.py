@@ -165,10 +165,37 @@ def quick_note_input_keyboard(page: int = 0) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
-def quick_note_detail_keyboard(page: int = 0) -> InlineKeyboardMarkup:
+def quick_note_saved_keyboard(note_id: int, page: int = 0) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
+    builder.button(text="💬 Разобрать с ИИ", callback_data=f"quick_note_ai:{note_id}:{page}")
+    builder.button(text="➕ Ещё запись", callback_data=f"quick_note_new:{page}")
+    builder.button(text="⬅️ В дневник", callback_data="mode_journal")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def quick_note_ai_result_keyboard(note_id: int, asst_msg_id: int) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="💬 Продолжить с ИИ-Виталием", callback_data=f"quick_note_cont:{note_id}:{asst_msg_id}")
+    builder.button(text="⬅️ В дневник", callback_data="mode_journal")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def quick_note_ai_error_keyboard(note_id: int, page: int = 0) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🔄 Попробовать снова", callback_data=f"quick_note_ai:{note_id}:{page}")
+    builder.button(text="⬅️ В дневник", callback_data="mode_journal")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def quick_note_detail_keyboard(page: int = 0, note_id: int | None = None) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    if note_id is not None:
+        builder.button(text="💬 Разобрать с ИИ", callback_data=f"quick_note_ai:{note_id}:{page}")
     builder.button(text="⬅️ К списку записей", callback_data=f"quick_notes_page:{page}")
-    builder.button(text="⬅️ В Дневник", callback_data="mode_journal")
+    builder.button(text="⬅️ В дневник", callback_data="mode_journal")
     builder.adjust(1)
     return builder.as_markup()
 

@@ -232,7 +232,7 @@ async def _show_campaign_card(event: Message | CallbackQuery, campaign_id: int):
             f"📌 <b>Цепочка: {html.escape(campaign.name)}</b>\n\n"
             f"<b>Статус:</b> {status_text}\n"
             f"<b>Область действия:</b> {scope_desc}\n"
-            f"<b>Тихие часы по московскому времени:</b> с {campaign.quiet_hours_start}:00 до {campaign.quiet_hours_end}:00\n"
+            f"<b>Тихие часы по времени пользователя:</b> с {campaign.quiet_hours_start}:00 до {campaign.quiet_hours_end}:00. Период с 23:00 до 09:00 действует всегда.\n"
             f"<b>Всего доставок:</b> {total_deliveries} (успешно: {success_deliveries})\n\n"
             f"<b>Шаги цепочки ({len(steps_sorted)}):</b>\n"
             + "\n".join(step_lines)
@@ -526,7 +526,7 @@ async def callback_admin_fu_quiet(callback: CallbackQuery, state: FSMContext | N
     if callback.message:
         await callback.message.edit_text(
             f"🌙 <b>Тихие часы цепочки «{html.escape(campaign.name)}»</b>\n\n"
-            f"Текущие тихие часы: <b>с {campaign.quiet_hours_start}:00 до {campaign.quiet_hours_end}:00 по московскому времени</b>.\n"
+            f"Текущие тихие часы: <b>с {campaign.quiet_hours_start}:00 до {campaign.quiet_hours_end}:00 по времени пользователя</b>. Период с 23:00 до 09:00 действует всегда.\n"
             "В это время бот не отправляет напоминания, чтобы не тревожить пользователей ночью.\n\n"
             "Выберите режим:",
             reply_markup=kb.as_markup(),

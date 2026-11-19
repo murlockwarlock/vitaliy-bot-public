@@ -2125,15 +2125,20 @@ class TestJournalUserAcceptanceMatrix(JournalFeatureBaseTest):
             self.assertIn("&amp;", sent_summary)
             self.assertNotIn("<b>тест</b>", sent_summary)
 
-        # 3. cb_journal_run_dynamics
+        # 3. cb_journal_run_dynamics (Markdown -> HTML converter + safe escaping of raw <, &, and unsupported tags)
         cb_dyn = make_callback_query("j_d7:token123", user.id, bot=self.bot)
-        with patch("ai_integration.generate_journal_dynamics_analysis", new_callable=AsyncMock, return_value=(True, "Динамика <3 & A < B <b>тест</b>")):
+        with patch(
+            "ai_integration.generate_journal_dynamics_analysis",
+            new_callable=AsyncMock,
+            return_value=(True, "Динамика <3 & A < B **важно** <script>тест</script>"),
+        ):
             await cb_journal_run_dynamics(cb_dyn, self.bot)
             cb_dyn.message.edit_text.assert_called()
             sent_dyn = cb_dyn.message.edit_text.call_args[0][0]
             self.assertIn("&lt;3", sent_dyn)
-            self.assertIn("&lt;b&gt;тест&lt;/b&gt;", sent_dyn)
             self.assertIn("&amp;", sent_dyn)
+            self.assertIn("<b>важно</b>", sent_dyn)
+            self.assertIn("&lt;script&gt;тест&lt;/script&gt;", sent_dyn)
 
         # 4. admin_journal_q_edit_handler
         cb_admin = make_callback_query("j_adm_q_ed:1", user.id, bot=self.bot)

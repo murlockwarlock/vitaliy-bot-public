@@ -933,8 +933,8 @@ async def test_pobudu_s_etim_allows_enabled_nurture_without_immediate_offer():
     user_id = 94000204
     await _prepare_user(user_id)
     await _set_funnel_switches()
-    due_time = funnel.msk_now() + timedelta(hours=1)
-    anchor_time = funnel.msk_now()
+    anchor_time = funnel.msk_now().replace(hour=12, minute=0)
+    due_time = anchor_time + timedelta(hours=1)
     try:
         async with async_session_maker() as session:
             state = await session.get(FunnelState, user_id)
@@ -1056,7 +1056,9 @@ async def test_legacy_funnel_config_migration_enables_new_switches(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_nurture_disable_waits_for_selected_worker_send():
+async def test_nurture_disable_waits_for_selected_worker_send(monkeypatch):
+    noon = funnel.msk_now().replace(hour=12, minute=0)
+    monkeypatch.setattr(funnel, "msk_now", lambda: noon)
     user_id = 94000208
     await _prepare_user(user_id)
     await _set_funnel_switches()

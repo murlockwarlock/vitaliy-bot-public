@@ -668,7 +668,8 @@ async def books_keyboard(page=0):
     for book, menu_button in book_rows:
         builder.row(InlineKeyboardButton(text=menu_button.label, url=book.url))
 
-    builder.row(*standard_pagination_row(page, total_pages, lambda target: f"menu_books_pg_{target}"))
+    if total_pages > 1:
+        builder.row(*standard_pagination_row(page, total_pages, lambda target: f"menu_books_pg_{target}"))
     builder.row(InlineKeyboardButton(text="⬅️ Назад", callback_data="open_extended_menu"))
 
     return builder.as_markup()

@@ -108,24 +108,45 @@ async def render_dialogue_cfg_text(session, cfg: TopicDialogueConfig) -> str:
     topic_title = topic.name if topic else cfg.topic_slug
 
     test_set_title = "Не выбран"
+    pre_test_state = "Включен" if cfg.pre_dialogue_test_enabled else "Выключен"
     if cfg.test_set_id:
         tset = await session.get(TestSet, cfg.test_set_id)
         if tset:
-            test_set_title = f"{tset.title} (ID: {tset.id})"
+            active_questions = list((await session.scalars(
+                select(TestQuestion).where(
+                    TestQuestion.test_set_id == tset.id,
+                    TestQuestion.is_active == True,
+                )
+            )).all())
+            if cfg.topic_slug in {"diagnostics", "express"}:
+                active_count = sum(not is_esoteric_question(q) for q in active_questions)
+            else:
+                active_count = len(active_questions)
+            ready = (
+                bool(tset.is_enabled)
+                and not bool(tset.is_archived)
+                and is_test_set_ready(tset, active_count, cfg.topic_slug)
+            )
+            expected = expected_test_set_question_count(tset, cfg.topic_slug)
+            count_label = f"{active_count}/{expected} вопр." if expected else f"{active_count} вопр."
+            ready_label = "готов" if ready else "не готов"
+            test_set_title = f"{tset.title} (ID: {tset.id}, {count_label}, {ready_label})"
+            if not cfg.pre_dialogue_test_enabled:
+                pre_test_state = "Выключен (набор выбран, но тест выключен)"
 
     welcome_preview = (cfg.welcome_text[:120] + "...") if cfg.welcome_text and len(cfg.welcome_text) > 120 else (cfg.welcome_text or "Стандартный")
     prerecorded_preview = (cfg.prerecorded_first_message[:120] + "...") if cfg.prerecorded_first_message and len(cfg.prerecorded_first_message) > 120 else (cfg.prerecorded_first_message or "Не задано")
     sumprompt_preview = (cfg.summary_prompt[:120] + "...") if cfg.summary_prompt and len(cfg.summary_prompt) > 120 else (cfg.summary_prompt or "По умолчанию")
 
     return (
-        f"⚙️ <b>Параметры диалога темы: {html.escape(topic_title)}</b> (<code>{cfg.topic_slug}</code>)\n\n"
+        f"⚙️ <b>Параметры диалога темы: {html.escape(topic_title)}</b>\n\n"
         f"1. <b>Приветственный текст:</b>\n<i>{html.escape(welcome_preview)}</i>\n\n"
         f"2. <b>Медиа приветствия:</b> {'Прикреплено (ID: ' + str(cfg.welcome_media_id) + ')' if cfg.welcome_media_id else 'Нет'}\n"
         f"3. <b>Сброс диалога при каждом входе:</b> {'Да' if cfg.reset_dialogue_on_entry else 'Нет'}\n"
         f"4. <b>Кнопка «Начать диалог»:</b> {'Включена' if cfg.start_dialogue_button_enabled else 'Выключена'}\n"
         f"5. <b>Текст кнопки:</b> {html.escape(cfg.start_dialogue_button_text or 'Начать диалог')}\n"
         f"6. <b>Первое сообщение ассистента:</b>\n<i>{html.escape(prerecorded_preview)}</i>\n\n"
-        f"7. <b>Пре-диалоговый тест:</b> {'Включен' if cfg.pre_dialogue_test_enabled else 'Выключен'}\n"
+        f"7. <b>Пре-диалоговый тест:</b> {html.escape(pre_test_state)}\n"
         f"8. <b>Набор тестов (TestSet):</b> {html.escape(test_set_title)}\n"
         f"9. <b>Генерация итогов сессии:</b> {'Включена' if cfg.summary_generation_enabled else 'Выключена'}\n"
         f"10. <b>Промпт итогов:</b> <i>{html.escape(sumprompt_preview)}</i>\n"
@@ -288,25 +309,35 @@ async def set_test_set_selection(callback: CallbackQuery):
     if not await _is_admin(_extract_user_id(callback)):
         await callback.answer("Доступ запрещен.", show_alert=True)
         return
-    parts = callback.data.split("cfg_set_testset_")[1].split("_")
-    slug = parts[0]
-    test_set_id = int(parts[1])
+    raw_payload = (callback.data or "").removeprefix("cfg_set_testset_")
+    slug, sep, raw_id = raw_payload.rpartition("_")
+    if not sep or not slug:
+        await callback.answer("Некорректные данные выбора набора.", show_alert=True)
+        return
+    try:
+        test_set_id = int(raw_id)
+    except ValueError:
+        await callback.answer("Некорректный ID набора тестов.", show_alert=True)
+        return
 
+    auto_enabled_pretest = False
     async with async_session_maker() as session:
         cfg = await _get_or_create_config(session, slug)
-        if cfg.pre_dialogue_test_enabled:
-            if test_set_id <= 0:
-                await callback.answer("Сначала выключите предварительную анкету, затем сбросьте TestSet.", show_alert=True)
-                return
+        if test_set_id <= 0:
+            if cfg.pre_dialogue_test_enabled:
+                cfg.pre_dialogue_test_enabled = False
+            cfg.test_set_id = None
+            toast_text = "Набор сброшен, пре-диалоговый тест выключен"
+        else:
             selected_set = await session.get(TestSet, test_set_id)
             if not selected_set:
                 await callback.answer("Выбранный TestSet не найден.", show_alert=True)
                 return
             if selected_set.is_archived:
-                await callback.answer("Нельзя подключить архивный TestSet к активной предварительной анкете.", show_alert=True)
+                await callback.answer("Нельзя подключить архивный TestSet.", show_alert=True)
                 return
             if not selected_set.is_enabled:
-                await callback.answer("Нельзя подключить выключенный TestSet к активной предварительной анкете.", show_alert=True)
+                await callback.answer("Нельзя подключить выключенный TestSet. Включите его в управлении наборами.", show_alert=True)
                 return
             active_questions = list((await session.scalars(
                 select(TestQuestion).where(
@@ -320,10 +351,21 @@ async def set_test_set_selection(callback: CallbackQuery):
                 active_count = len(active_questions)
             if not is_test_set_ready(selected_set, active_count, slug):
                 expected = expected_test_set_question_count(selected_set, slug)
-                detail = f" Нужно активных вопросов: {expected}." if expected else " Нужен хотя бы один активный вопрос."
+                detail = (
+                    f" Сейчас готово вопросов: {active_count} из {expected}."
+                    if expected
+                    else " Нужен хотя бы один активный вопрос."
+                )
                 await callback.answer(f"Нельзя подключить: анкета ещё не готова.{detail}", show_alert=True)
                 return
-        cfg.test_set_id = test_set_id if test_set_id > 0 else None
+            cfg.test_set_id = selected_set.id
+            if slug in {"diagnostics", "express"} and not cfg.pre_dialogue_test_enabled:
+                cfg.pre_dialogue_test_enabled = True
+                auto_enabled_pretest = True
+            if auto_enabled_pretest or cfg.pre_dialogue_test_enabled:
+                toast_text = "Набор подключен, пре-диалоговый тест включен"
+            else:
+                toast_text = "Набор обновлен (пре-диалоговый тест выключен)"
         await session.commit()
         text = await render_dialogue_cfg_text(session, cfg)
         markup = _cfg_menu_keyboard(cfg)
@@ -332,7 +374,7 @@ async def set_test_set_selection(callback: CallbackQuery):
         await callback.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
     except TelegramBadRequest:
         pass
-    await callback.answer("Набор обновлен")
+    await callback.answer(toast_text)
 
 
 @router.callback_query(F.data.startswith("cfg_clear_welcome_"))

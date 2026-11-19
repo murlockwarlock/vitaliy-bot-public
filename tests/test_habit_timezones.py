@@ -272,13 +272,17 @@ class HabitTimezoneTests(IsolatedAsyncioTestCase):
         bot = MockBot()
         await process_habit_reminders(bot, now=first_fold)
         await process_habit_reminders(bot, now=second_fold)
+        self.assertFalse(any(message[0] == self.user_id for message in bot.messages))
+        morning = utc(2026, 10, 25, 8)
+        await process_habit_reminders(bot, now=morning)
+        await process_habit_reminders(bot, now=morning)
 
         self.assertEqual(sum(message[0] == self.user_id for message in bot.messages), 1)
         async with async_session_maker() as session:
             habit = (await session.execute(
                 select(Habit).where(Habit.user_id == self.user_id)
             )).scalar_one()
-        self.assertEqual(habit.last_reminder_at, utc_naive(first_fold))
+        self.assertEqual(habit.last_reminder_at, utc_naive(morning))
         self.assertEqual(habit.next_reminder_at, utc_naive(utc(2026, 10, 26, 1, 30)))
 
     async def test_time_change_reschedules_next_reminder(self):

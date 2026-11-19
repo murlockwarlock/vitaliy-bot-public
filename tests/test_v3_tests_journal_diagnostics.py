@@ -561,7 +561,7 @@ async def test_migration_disables_existing_incomplete_express_binding_and_preser
 
             cfg = await session.scalar(select(TopicDialogueConfig).where(TopicDialogueConfig.topic_slug == "express"))
             assert cfg.test_set_id == 2
-            assert cfg.pre_dialogue_test_enabled is False
+            assert cfg.pre_dialogue_test_enabled is True
             assert (await session.get(TestSet, 2)).is_enabled is True
 
             legacy_question = await session.scalar(select(TestQuestion).where(TestQuestion.text == "Дата рождения в старом формате?"))
@@ -617,8 +617,8 @@ async def test_migration_keeps_shared_theme_set_enabled_and_blocks_diagnostic_to
             stress_cfg = await session.scalar(
                 select(TopicDialogueConfig).where(TopicDialogueConfig.topic_slug == "stress")
             )
-            assert diagnostic_cfg.pre_dialogue_test_enabled is False
-            assert express_cfg.pre_dialogue_test_enabled is False
+            assert diagnostic_cfg.pre_dialogue_test_enabled is True
+            assert express_cfg.pre_dialogue_test_enabled is True
             assert stress_cfg.test_set_id == 101
             assert stress_cfg.pre_dialogue_test_enabled is True
 

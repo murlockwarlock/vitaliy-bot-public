@@ -16,6 +16,7 @@ from aiogram.types import Message, CallbackQuery, BufferedInputFile, InputMediaP
 from aiogram.filters import CommandStart, Command
 from aiogram.exceptions import TelegramRetryAfter, TelegramBadRequest
 from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.base import StorageKey
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from sqlalchemy import select, update, func, delete, text, or_, and_, cast, String
@@ -54,7 +55,7 @@ from admin_roles import (
 )
 from database import async_session_maker, User, Topic, Content, Message as DBMessage, ReferralConfig, AIConfig, \
     IndexingQueue, ContentMedia, KnowledgeBase, Mailing, HabitConfig, Habit, PaymentConfig, PaymentProvider, \
-    Transaction, Book, SubscriptionPlan, FunnelLanding, FunnelState, FunnelEvent, BotConfig, SubscriptionConfig, \
+    Transaction, Book, SubscriptionPlan, FunnelLanding, LandingNotificationClaim, FunnelState, FunnelEvent, BotConfig, SubscriptionConfig, \
     UserSubscription, PromoCode, ProdamusPayment, TrialUsageHistory, get_all_admin_ids, \
     PaymentIntent, ReferralPaymentLog, AiDisclaimerClaim, TopicDialogueConfig, PendingAiFlow, SessionSummary, SummaryClaim, \
     UserTopicSession, PreTestClaim, TopicPrerecordedDelivery, TestSession, TestAttempt, MenuSection, MenuButton, \
@@ -65,6 +66,7 @@ from ai_dialogue_service import (
     TopicContextSnapshot,
     acquire_pre_test_claim,
     allocate_next_dialogue_id,
+    claim_telegram_message_once,
     clear_pending_ai_flow,
     consume_pending_ai_flow,
     deliver_prerecorded_first_message,
@@ -72,6 +74,9 @@ from ai_dialogue_service import (
     get_active_topic_dialogue_id,
     get_pending_ai_flow,
     get_pre_test_claim,
+    get_user_chat_lock,
+    merge_pending_ai_flow_payload,
+    release_telegram_message_claim,
     set_active_topic_dialogue_id,
     store_pending_ai_flow,
 )
@@ -498,6 +503,7 @@ class AdminStates(StatesGroup):
     edit_content = State()
     edit_url = State()
     edit_topic_prompt = State()
+    edit_topic_name = State()
     set_referral_points = State()
     edit_ref_reg_points = State()
     edit_ref_first_percent = State()
@@ -961,8 +967,15 @@ async def check_and_request_ai_disclaimer(
             if content_row and content_row.text_content
             else "<i>Бот не заменяет консультацию специалиста. Если ты в кризисной ситуации, обратись к профессионалу.</i>"
         )
+        existing_pending = await session.get(PendingAiFlow, user_id)
+        merged_payload = merge_pending_ai_flow_payload(
+            existing_pending.flow_type if existing_pending else None,
+            existing_pending.payload if existing_pending else None,
+            flow_type,
+            payload,
+        )
+        await store_pending_ai_flow(session, user_id, flow_type, merged_payload)
 
-    await store_pending_ai_flow(user_id, flow_type, payload or {})
     await bot.send_message(
         chat_id=chat_id,
         text=disclaimer_text,
@@ -1981,7 +1994,9 @@ async def cmd_start(message: Message, state: FSMContext, command: Command = None
                 if referrer_id:
                     is_new_referral = True
                 sub_config = await _ensure_subscription_config(session)
-                if sub_config.welcome_bonus_days > 0:
+                payment_config = await session.get(PaymentConfig, 1)
+                if (sub_config.subscriptions_enabled and sub_config.welcome_bonus_days > 0
+                        and payment_config and payment_config.mode == "subscription"):
                     bonus_end = msk_now() + timedelta(days=sub_config.welcome_bonus_days)
                     session.add(UserSubscription(
                         user_id=message.from_user.id,
@@ -1999,6 +2014,8 @@ async def cmd_start(message: Message, state: FSMContext, command: Command = None
             except IntegrityError:
                 await session.rollback()
                 user = await session.get(User, message.from_user.id)
+                welcome_bonus_applied = False
+                should_show_welcome = False
                 is_new_referral = False
         else:
             if user.is_blocked:
@@ -2190,6 +2207,14 @@ async def check_paid_access(event, bot: Bot, topic_slug: str | None = None, sect
     user_id = event.from_user.id
     async with async_session_maker() as session:
         user = await session.get(User, user_id)
+        if not user:
+            return False
+        if user.is_blocked:
+            if hasattr(event, "data") and hasattr(event, "message"):
+                await event.answer("⛔️ Ты заблокирован(а) администратором.", show_alert=True)
+            elif hasattr(event, "answer") and callable(event.answer):
+                await event.answer("⛔️ Ты заблокирован(а) администратором.")
+            return False
         if user.is_admin:
             return True
 
@@ -2242,7 +2267,63 @@ async def touch_user_activity(user_id: int):
         await session.commit()
 
 
-async def activate_ai_mode(event, slug: str, state: FSMContext, bot: Bot, *, from_start_button: bool = False, dialogue_id: int | None = None):
+_ai_start_locks: dict[tuple[int, str], asyncio.Lock] = {}
+
+
+async def _clear_event_message_reply_markup(event) -> None:
+    msg = getattr(event, "message", None)
+    edit_rm = getattr(msg, "edit_reply_markup", None) if msg is not None else None
+    if callable(edit_rm):
+        try:
+            await edit_rm(reply_markup=None)
+        except Exception:
+            pass
+
+
+async def activate_ai_mode(
+    event,
+    slug: str,
+    state: FSMContext,
+    bot: Bot,
+    *,
+    from_start_button: bool = False,
+    from_new_dialogue: bool = False,
+    dialogue_id: int | None = None,
+):
+    user_id = event.from_user.id
+    lock = _ai_start_locks.setdefault((user_id, slug), asyncio.Lock()) if from_start_button else None
+    if lock is not None:
+        async with lock:
+            return await _activate_ai_mode_inner(
+                event,
+                slug,
+                state,
+                bot,
+                from_start_button=from_start_button,
+                from_new_dialogue=from_new_dialogue,
+                dialogue_id=dialogue_id,
+            )
+    return await _activate_ai_mode_inner(
+        event,
+        slug,
+        state,
+        bot,
+        from_start_button=from_start_button,
+        from_new_dialogue=from_new_dialogue,
+        dialogue_id=dialogue_id,
+    )
+
+
+async def _activate_ai_mode_inner(
+    event,
+    slug: str,
+    state: FSMContext,
+    bot: Bot,
+    *,
+    from_start_button: bool = False,
+    from_new_dialogue: bool = False,
+    dialogue_id: int | None = None,
+):
     user_id = event.from_user.id
     chat_id = (
         event.message.chat.id
@@ -2251,7 +2332,7 @@ async def activate_ai_mode(event, slug: str, state: FSMContext, bot: Bot, *, fro
     )
 
     if not await check_paid_access(event, bot, topic_slug=slug):
-        return
+        return "callback_answered"
 
     # 1. Guard 1: AI Disclaimer gate
     async with async_session_maker() as session:
@@ -2269,9 +2350,26 @@ async def activate_ai_mode(event, slug: str, state: FSMContext, bot: Bot, *, fro
             flow_type=flow_type,
             payload={"topic_slug": slug},
         )
-        return
+        return None
 
     await touch_user_activity(user_id)
+
+    prior_state = None
+    prior_data = {}
+    if state is not None and hasattr(state, "get_state"):
+        try:
+            raw_state = await state.get_state()
+            if isinstance(raw_state, str):
+                prior_state = raw_state
+        except Exception:
+            prior_state = None
+    if state is not None and hasattr(state, "get_data"):
+        try:
+            raw_data = await state.get_data()
+            if isinstance(raw_data, dict):
+                prior_data = raw_data
+        except Exception:
+            prior_data = {}
 
     # 2. Topic Dialogue Config & Dialogue ID allocation
     async with async_session_maker() as session:
@@ -2302,38 +2400,76 @@ async def activate_ai_mode(event, slug: str, state: FSMContext, bot: Bot, *, fro
                     await session.rollback()
                     if hasattr(event, "answer"):
                         await event.answer("⚠️ Эта кнопка устарела. Начни диалог заново из меню темы.", show_alert=True)
+                        return "callback_answered"
                     elif hasattr(event, "message") and hasattr(event.message, "answer"):
                         await event.message.answer("⚠️ Эта кнопка устарела. Начни диалог заново из меню темы.")
-                    return
+                    return None
 
         # P0-1: Check if user is currently in a live pre-test for THIS topic:
         current_tsess = await session.get(TestSession, user_id)
+
+        # Idempotent double-click guard on start button
+        if from_start_button and not from_new_dialogue and dialogue_id is not None and prior_state is not None:
+            if (
+                prior_state == UniversalTestStates.answering.state
+                and current_tsess
+                and not current_tsess.is_finished
+                and current_tsess.invocation_topic_slug == slug
+                and current_tsess.invocation_dialogue_id == dialogue_id
+            ):
+                await _clear_event_message_reply_markup(event)
+                if hasattr(event, "answer"):
+                    await event.answer("Тест уже запущен.")
+                    return "callback_answered"
+                return None
+            if (
+                prior_state == UserStates.chatting.state
+                and prior_data.get("current_topic_slug") == slug
+                and prior_data.get("dialogue_id") == dialogue_id
+                and prior_data.get("started_via_button_dialogue_id") == dialogue_id
+            ):
+                await _clear_event_message_reply_markup(event)
+                if hasattr(event, "answer"):
+                    await event.answer("Диалог уже начат.")
+                    return "callback_answered"
+                return None
+
+        pre_test_enabled = bool(cfg and cfg.pre_dialogue_test_enabled)
         if (
-            current_tsess
+            pre_test_enabled
+            and current_tsess
             and not current_tsess.is_finished
             and current_tsess.invocation_topic_slug == slug
             and current_tsess.attempt_id
+            and (not from_start_button or dialogue_id is None or current_tsess.invocation_dialogue_id == dialogue_id)
         ):
-            active_test_set, active_count, active_ready = await get_test_set_readiness(
-                session,
-                current_tsess.test_set_id or 1,
-                slug,
-            )
-            if not active_ready:
-                await send_test_setup_unavailable(
-                    bot,
-                    user_id,
-                    state,
-                    active_count=active_count,
-                    expected_count=expected_test_set_question_count(active_test_set, slug) if active_test_set else None,
-                )
-                return
             active_attempt = await session.get(TestAttempt, current_tsess.attempt_id)
             if active_attempt and active_attempt.purpose == "pre_dialogue" and active_attempt.status == "in_progress":
                 claim = await get_pre_test_claim(
                     session, user_id, slug, current_tsess.invocation_dialogue_id, test_set_id=current_tsess.test_set_id
                 )
                 if claim and claim.status == "in_progress" and (claim.lease_until is None or claim.lease_until > msk_now()):
+                    active_test_set, active_count, active_ready = await get_test_set_readiness(
+                        session,
+                        current_tsess.test_set_id or 1,
+                        slug,
+                    )
+                    if not (
+                        active_test_set
+                        and active_test_set.is_enabled
+                        and not active_test_set.is_archived
+                        and active_ready
+                    ):
+                        await send_test_setup_unavailable(
+                            bot,
+                            user_id,
+                            state,
+                            active_count=active_count,
+                            expected_count=expected_test_set_question_count(active_test_set, slug) if active_test_set else None,
+                        )
+                        return None
+                    if from_start_button:
+                        await _clear_event_message_reply_markup(event)
                     # User has a live progressing pre-test session. Restore FSM, resend question and return.
                     await state.set_state(UniversalTestStates.answering)
                     await _send_question(
@@ -2343,7 +2479,7 @@ async def activate_ai_mode(event, slug: str, state: FSMContext, bot: Bot, *, fro
                         current_tsess.test_set_id,
                         state,
                     )
-                    return
+                    return None
 
         if from_start_button:
             # Active dialogue was atomically validated and touched; do not alter or lower it
@@ -2366,17 +2502,33 @@ async def activate_ai_mode(event, slug: str, state: FSMContext, bot: Bot, *, fro
                 user.current_dialogue_id = dialogue_id
         await session.commit()
 
+    if from_start_button:
+        await _clear_event_message_reply_markup(event)
+
     await state.clear()
 
-    # 3. Pre-dialogue Test Gate (Guard 3) - MUST run before Start button
-    if slug in {"diagnostics", "express"} and cfg and cfg.test_set_id:
+    # 3. Readiness Validation ONLY when pre-dialogue test is enabled (never mutates DB)
+    pre_test_completed = False
+    if pre_test_enabled:
+        if not (cfg and cfg.test_set_id):
+            logger.warning("Topic %s has pre_dialogue_test_enabled=True but test_set_id is None", slug)
+            await send_test_setup_unavailable(bot, user_id, state)
+            return None
         async with async_session_maker() as session:
-            configured_set, active_count, configured_ready = await get_test_set_readiness(
-                session,
-                cfg.test_set_id,
-                slug,
-            )
-        if not configured_ready:
+            claim = await get_pre_test_claim(session, user_id, slug, dialogue_id, test_set_id=cfg.test_set_id)
+            pre_test_completed = bool(claim and claim.status == "completed")
+            if not pre_test_completed:
+                configured_set, active_count, configured_ready = await get_test_set_readiness(
+                    session,
+                    cfg.test_set_id,
+                    slug,
+                )
+        if not pre_test_completed and not (
+            configured_set
+            and configured_set.is_enabled
+            and not configured_set.is_archived
+            and configured_ready
+        ):
             await send_test_setup_unavailable(
                 bot,
                 user_id,
@@ -2384,34 +2536,10 @@ async def activate_ai_mode(event, slug: str, state: FSMContext, bot: Bot, *, fro
                 active_count=active_count,
                 expected_count=expected_test_set_question_count(configured_set, slug) if configured_set else None,
             )
-            return
+            return None
 
-    pre_test_enabled = bool(cfg and cfg.pre_dialogue_test_enabled)
-    if pre_test_enabled:
-        if not cfg.test_set_id:
-            logger.warning("Topic %s has pre_dialogue_test_enabled=True but test_set_id is None", slug)
-            await send_test_setup_unavailable(bot, user_id, state)
-            return
-
-        test_set_id = cfg.test_set_id
-        async with async_session_maker() as session:
-            claim = await get_pre_test_claim(session, user_id, slug, dialogue_id, test_set_id=test_set_id)
-            is_completed = bool(claim and claim.status == "completed")
-
-        if not is_completed:
-            await start_universal_test(
-                bot,
-                user_id,
-                state,
-                test_set_id=test_set_id,
-                dialogue_id=dialogue_id,
-                topic_slug=slug,
-                purpose="pre_dialogue",
-            )
-            return
-
-    # 4. Start Dialogue Button Gate (Runs after pre-test is completed or not required)
-    start_btn_enabled = cfg.start_dialogue_button_enabled if cfg else False
+    # 4. Welcome & Start Dialogue Button Gate (Runs FIRST on topic entry)
+    start_btn_enabled = bool(cfg and cfg.start_dialogue_button_enabled)
     if start_btn_enabled and not from_start_button:
         welcome_text = (cfg.welcome_text if cfg and cfg.welcome_text else None) or "Добро пожаловать в сессию."
         btn_text = (cfg.start_dialogue_button_text if cfg and cfg.start_dialogue_button_text else None) or "Начать диалог"
@@ -2422,14 +2550,46 @@ async def activate_ai_mode(event, slug: str, state: FSMContext, bot: Bot, *, fro
                 media_row = await session.get(ContentMedia, media_id)
             if media_row:
                 await send_smart_content(event, welcome_text, [media_row], keyboard, bot)
-                return
+                return None
         await send_smart_content(event, welcome_text, None, keyboard, bot)
-        return
+        return None
 
-    # 5. Prerecorded First Message (Guard 2)
+    # 5. Pre-dialogue Test Gate (Guard 3 - Runs after Start button click or direct entry)
+    if pre_test_enabled and not pre_test_completed:
+        test_set_id = cfg.test_set_id
+        if not from_start_button and cfg and cfg.welcome_text:
+            media_rows = []
+            if cfg.welcome_media_id:
+                async with async_session_maker() as session:
+                    media_row = await session.get(ContentMedia, cfg.welcome_media_id)
+                if media_row:
+                    media_rows.append(media_row)
+            await send_smart_content(event, cfg.welcome_text, media_rows or None, None, bot)
+        await start_universal_test(
+            bot,
+            user_id,
+            state,
+            test_set_id=test_set_id,
+            dialogue_id=dialogue_id,
+            topic_slug=slug,
+            purpose="pre_dialogue",
+        )
+        return None
+
+    # 6. Prerecorded First Message (Guard 2) & Working Dialogue Entry
+    markup = await kb.ai_response_keyboard_for_topic(slug, dialogue_id)
     prerecorded_text = cfg.prerecorded_first_message if (cfg and cfg.prerecorded_first_message) else None
     delivered_prerecorded = False
+    sent_prerec = []
     if prerecorded_text:
+        if not from_start_button and not start_btn_enabled and cfg and cfg.welcome_text:
+            media_rows = []
+            if cfg.welcome_media_id:
+                async with async_session_maker() as session:
+                    media_row = await session.get(ContentMedia, cfg.welcome_media_id)
+                if media_row:
+                    media_rows.append(media_row)
+            await send_smart_content(event, cfg.welcome_text, media_rows or None, None, bot)
         async with async_session_maker() as session:
             delivered_prerecorded = await deliver_prerecorded_first_message(
                 bot,
@@ -2438,23 +2598,42 @@ async def activate_ai_mode(event, slug: str, state: FSMContext, bot: Bot, *, fro
                 slug,
                 dialogue_id,
                 prerecorded_text,
+                reply_markup=markup,
+                sent_messages=sent_prerec,
             )
 
-    # 6. Enter Chatting State
+    # 7. Enter Chatting State (no silent branches)
     await state.set_state(UserStates.chatting)
-    await state.update_data(current_topic_slug=slug, dialogue_id=dialogue_id)
+    state_payload = {"current_topic_slug": slug, "dialogue_id": dialogue_id}
+    if from_start_button and not from_new_dialogue:
+        state_payload["started_via_button_dialogue_id"] = dialogue_id
 
-    if not delivered_prerecorded and not (start_btn_enabled and from_start_button):
-        welcome_prompt = (cfg.welcome_text if cfg and cfg.welcome_text else None) or "Добро пожаловать в сессию. Напиши, что хочешь обсудить."
-        markup = await kb.ai_response_keyboard_for_topic(slug, dialogue_id)
-        media_rows = []
-        if cfg and cfg.welcome_media_id:
-            async with async_session_maker() as session:
-                media_row = await session.get(ContentMedia, cfg.welcome_media_id)
-            if media_row:
-                media_rows.append(media_row)
-        sent_message = await send_smart_content(event, welcome_prompt, media_rows or None, markup, bot)
-        await _remember_ai_response_message(state, sent_message)
+    sent_message = sent_prerec[-1] if sent_prerec else None
+    if not delivered_prerecorded:
+        if from_new_dialogue:
+            prompt_text = "Начинаем новый разговор. Напиши, с чем сегодня хочешь поработать."
+            sent_message = await bot.send_message(chat_id, prompt_text, reply_markup=markup)
+        elif from_start_button:
+            prompt_text = (
+                "Продолжаем разговор. Напиши свой вопрос или мысль."
+                if prerecorded_text
+                else "Я на связи. Напиши, с чем сегодня хочешь поработать или какой вопрос разобрать."
+            )
+            sent_message = await bot.send_message(chat_id, prompt_text, reply_markup=markup)
+        else:
+            welcome_prompt = (cfg.welcome_text if cfg and cfg.welcome_text else None) or "Добро пожаловать в сессию. Напиши, что хочешь обсудить."
+            media_rows = []
+            if cfg and cfg.welcome_media_id:
+                async with async_session_maker() as session:
+                    media_row = await session.get(ContentMedia, cfg.welcome_media_id)
+                if media_row:
+                    media_rows.append(media_row)
+            sent_message = await send_smart_content(event, welcome_prompt, media_rows or None, markup, bot)
+
+    if isinstance(getattr(sent_message, "message_id", None), int):
+        state_payload["ai_last_response_message_id"] = sent_message.message_id
+    await state.update_data(**state_payload)
+    return None
 
 
 @router.callback_query(F.data == "cb_accept_disclaimer")
@@ -2498,12 +2677,43 @@ async def cb_accept_disclaimer(callback: CallbackQuery, state: FSMContext, bot: 
     payload = pending.payload or {}
 
     if flow_type in ("topic", "thematic"):
-        slug = payload.get("topic_slug", "free_session")
+        slug = payload.get("topic_slug") or "free_session"
         await activate_ai_mode(callback, slug, state, bot)
+        raw_chat_msgs = payload.get("chat_messages")
+        if isinstance(raw_chat_msgs, list):
+            pending_chat_msgs = [str(item) for item in raw_chat_msgs if isinstance(item, str) and item.strip()]
+        else:
+            single_chat_msg = payload.get("chat_message")
+            pending_chat_msgs = (
+                [single_chat_msg]
+                if isinstance(single_chat_msg, str) and single_chat_msg.strip()
+                else []
+            )
+        if pending_chat_msgs and state is not None and hasattr(state, "get_state"):
+            try:
+                current_state = await state.get_state()
+            except Exception:
+                current_state = None
+            if current_state == UserStates.chatting.state:
+                from types import SimpleNamespace
+                chat = getattr(getattr(callback, "message", None), "chat", None)
+                chat_id = chat.id if chat else user_id
+                async def _answer(text, **kwargs):
+                    return await bot.send_message(chat_id=chat_id, text=text, **kwargs)
+                answer_func = getattr(getattr(callback, "message", None), "answer", None) or _answer
+                msg = SimpleNamespace(
+                    from_user=callback.from_user,
+                    chat=chat or SimpleNamespace(id=chat_id),
+                    text=pending_chat_msgs[-1],
+                    bot=bot,
+                    answer=answer_func,
+                )
+                await _process_chat_messages(msg, state, bot, pending_messages=pending_chat_msgs)
     elif flow_type == "diagnostics":
         await activate_ai_mode(callback, "diagnostics", state, bot)
     elif flow_type == "funnel_reflection":
-        from funnel import resume_funnel_reflection_after_disclaimer
+        from funnel import FunnelStates, resume_funnel_reflection_after_disclaimer
+        await state.set_state(FunnelStates.post_analysis)
         await resume_funnel_reflection_after_disclaimer(
             bot=bot,
             user_id=user_id,
@@ -2523,6 +2733,23 @@ async def cb_accept_disclaimer(callback: CallbackQuery, state: FSMContext, bot: 
     elif flow_type == "journal_start":
         from journal_handlers import handle_journal_start
         await handle_journal_start(event=callback, bot=bot, state=state)
+    elif flow_type == "quick_note_ai":
+        from journal_handlers import run_quick_note_ai_analysis
+        await run_quick_note_ai_analysis(
+            callback,
+            bot,
+            note_id=int(payload.get("note_id", 0)),
+            page=int(payload.get("page", 0)),
+        )
+    elif flow_type == "quick_note_cont":
+        from journal_handlers import run_quick_note_continue_in_free_session
+        await run_quick_note_continue_in_free_session(
+            callback,
+            state,
+            bot,
+            note_id=int(payload.get("note_id", 0)),
+            asst_msg_id=int(payload.get("asst_msg_id", 0)),
+        )
     else:
         await send_main_menu(callback, bot=bot)
 
@@ -2555,11 +2782,12 @@ async def cb_ai_start_dialogue(callback: CallbackQuery, state: FSMContext, bot: 
     parts = callback.data.split(":")
     topic_slug = parts[1] if len(parts) > 1 else "free_session"
     btn_dialogue_id = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else None
-    await activate_ai_mode(callback, topic_slug, state, bot, from_start_button=True, dialogue_id=btn_dialogue_id)
-    try:
-        await callback.answer()
-    except Exception:
-        pass
+    res = await activate_ai_mode(callback, topic_slug, state, bot, from_start_button=True, dialogue_id=btn_dialogue_id)
+    if res != "callback_answered":
+        try:
+            await callback.answer()
+        except Exception:
+            pass
 
 
 @router.callback_query(F.data.startswith("ai_finish_dialogue:"))
@@ -2652,6 +2880,29 @@ async def cb_ai_continue_dialogue(callback: CallbackQuery, state: FSMContext, bo
     await _resume_ai_dialogue(callback, state, bot, topic_slug, dialogue_id, explicit=True)
 
 
+async def _dialogue_menu_label(session, topic_slug: str):
+    thematic_action = f"thematic_{topic_slug}"
+    main_action = "menu_strategy_session" if topic_slug == "strategy_session" else f"mode_{topic_slug}"
+    return await session.scalar(
+        select(MenuButton.label).where(
+            MenuButton.enabled.is_(True),
+            MenuButton.action_type == "callback",
+            or_(
+                and_(
+                    MenuButton.section_key == "thematic",
+                    or_(
+                        MenuButton.topic_slug == topic_slug,
+                        and_(MenuButton.topic_slug.is_(None),
+                             func.coalesce(MenuButton.legacy_callback, MenuButton.action_value) == thematic_action),
+                    ),
+                ),
+                and_(MenuButton.section_key.in_(_ROOT_MENU_SECTION_KEYS),
+                     func.coalesce(MenuButton.action_value, MenuButton.legacy_callback) == main_action),
+            ),
+        ).order_by(MenuButton.order_num, MenuButton.id).limit(1)
+    )
+
+
 async def _resume_ai_dialogue(target, state: FSMContext, bot: Bot, topic_slug: str, dialogue_id: int, *, explicit: bool = False):
     user_id = target.from_user.id
     last_assistant = None
@@ -2695,6 +2946,7 @@ async def _resume_ai_dialogue(target, state: FSMContext, bot: Bot, topic_slug: s
             if hasattr(target, "answer"):
                 await target.answer("⚠️ Этот диалог уже закрыт или устарел.", show_alert=True)
             return False
+        menu_label = await _dialogue_menu_label(session, topic_slug)
         last_assistant = (await session.scalars(
             select(DBMessage).where(
                 DBMessage.user_id == user_id,
@@ -2721,7 +2973,7 @@ async def _resume_ai_dialogue(target, state: FSMContext, bot: Bot, topic_slug: s
         await state.update_data(ai_landing_return_callback=None, ai_landing_origin_stage=None)
     markup = await kb.ai_response_keyboard_for_topic(topic_slug, dialogue_id)
     tail = (last_assistant.content or "").strip() if last_assistant else ""
-    resume_text = "Продолжаем 👇\n\n"
+    resume_text = f"Продолжаем разговор в теме «{menu_label}» 👇\n\n" if menu_label else "Продолжаем разговор 👇\n\n"
     if tail:
         resume_text += f"Последнее сообщение ассистента:\n{tail}"
     else:
@@ -2768,6 +3020,8 @@ async def cb_ai_resume_current(callback: CallbackQuery, state: FSMContext, bot: 
 async def cb_ai_new_dialogue(callback: CallbackQuery, state: FSMContext, bot: Bot):
     parts = callback.data.split(":")
     topic_slug = parts[1] if len(parts) > 1 else "free_session"
+    if not await check_paid_access(callback, bot, topic_slug=topic_slug):
+        return
     user_id = callback.from_user.id
     async with async_session_maker() as session:
         new_dialogue_id = await allocate_next_dialogue_id(session, user_id, topic_slug)
@@ -2786,6 +3040,7 @@ async def cb_ai_new_dialogue(callback: CallbackQuery, state: FSMContext, bot: Bo
         state,
         bot,
         from_start_button=True,
+        from_new_dialogue=True,
         dialogue_id=new_dialogue_id,
     )
 
@@ -3345,13 +3600,20 @@ async def habit_edit_time_manual_input(message: Message, state: FSMContext):
     data = await state.get_data()
     name = await _set_habit_time(message.from_user.id, data.get("habit_id"), time_target)
     if name is None:
-        await message.answer("❌ Привычка не найдена.")
+        err_kb = InlineKeyboardBuilder()
+        err_kb.button(text="⬅️ В раздел привычек", callback_data="mode_habits")
+        await message.answer("❌ Привычка не найдена.", reply_markup=err_kb.as_markup())
         await state.clear()
         return
     await state.clear()
+    nav_kb = InlineKeyboardBuilder()
+    nav_kb.button(text="📋 Мои привычки", callback_data="habit_my_list")
+    nav_kb.button(text="⬅️ В раздел привычек", callback_data="mode_habits")
+    nav_kb.adjust(1)
     await message.answer(
         f"✅ Для привычки <b>«{html.escape(name)}»</b> установлено время <b>{time_target}</b>.",
         parse_mode="HTML",
+        reply_markup=nav_kb.as_markup(),
     )
 
 
@@ -3365,9 +3627,26 @@ async def habit_my_list(callback: CallbackQuery, bot: Bot):
             select(Habit).where(Habit.user_id == callback.from_user.id).order_by(Habit.time_target)
         )
         habits = habits.scalars().all()
+        conf = await session.get(HabitConfig, 1)
+        habit_mode = conf.mode if conf and conf.mode else "hybrid"
 
     if not habits:
-        await mode_habits(callback, bot)
+        empty_builder = InlineKeyboardBuilder()
+        if habit_mode in {"catalog", "hybrid"}:
+            empty_builder.button(text="📂 Выбрать из каталога", callback_data="habit_open_catalog")
+        if habit_mode in {"custom", "hybrid"}:
+            empty_builder.button(text="➕ Создать свою", callback_data="habit_create_new")
+        empty_builder.button(text="⬅️ В раздел привычек", callback_data="mode_habits")
+        empty_builder.adjust(1)
+        if habit_mode == "catalog":
+            empty_text = "📋 <b>Мои привычки</b>\n\nПока нет привычек. Выбери из каталога."
+        elif habit_mode == "custom":
+            empty_text = "📋 <b>Мои привычки</b>\n\nПока нет привычек. Создай свою."
+        else:
+            empty_text = "📋 <b>Мои привычки</b>\n\nПока нет привычек. Выбери из каталога или создай свою."
+        await send_smart_content(callback, empty_text, None, empty_builder.as_markup(), bot)
+        if callback.data == "habit_my_list":
+            await callback.answer()
         return
 
     timezone_text = format_habit_timezone(user.habit_timezone if user else None)
@@ -3387,6 +3666,8 @@ async def habit_my_list(callback: CallbackQuery, bot: Bot):
     builder.adjust(1)
 
     await send_smart_content(callback, text, None, builder.as_markup(), bot)
+    if callback.data == "habit_my_list":
+        await callback.answer()
 
 
 def habit_delete_confirmation_text(name: str) -> str:
@@ -3689,233 +3970,313 @@ async def process_image_edit(message: Message, bot: Bot):
             pass
 
 
+async def _debit_user_tokens_atomic(
+    session,
+    bot: Bot,
+    user_id: int,
+    user: User,
+    cost: float,
+    low_balance_threshold: float,
+    message: Message,
+    *,
+    notify_low_balance: bool = False,
+) -> bool:
+    """Atomically deduct `cost` tokens using SQL CAS without overwriting concurrent updates."""
+    debit_stmt = (
+        update(User)
+        .where(User.id == user_id, User.balance >= cost)
+        .values(balance=User.balance - cost)
+        .returning(User.balance)
+    )
+    new_balance = (await session.execute(debit_stmt)).scalar_one_or_none()
+    if new_balance is None:
+        await message.answer(
+            f"❌ Недостаточно токенов. Стоимость сообщения: {cost}, твой баланс: {user.balance}",
+            reply_markup=kb.token_alert_keyboard(),
+        )
+        return False
+
+    if notify_low_balance:
+        if new_balance <= low_balance_threshold and not user.low_balance_notified:
+            asyncio.create_task(bot.send_message(user_id, "⚠️ Баланс подходит к концу!"))
+            await session.execute(
+                update(User).where(User.id == user_id).values(low_balance_notified=True)
+            )
+        elif new_balance > low_balance_threshold and user.low_balance_notified:
+            await session.execute(
+                update(User).where(User.id == user_id).values(low_balance_notified=False)
+            )
+
+    await session.commit()
+    return True
+
+
 @router.message(UserStates.chatting, F.photo)
 async def process_chat_photo(message: Message, bot: Bot, state: FSMContext | None = None):
     user_id = message.from_user.id
-    async with async_session_maker() as session:
-        user = await session.get(User, user_id)
-        if not user or not user.ai_disclaimer_accepted_at or (user.ai_disclaimer_version or 0) < 1:
-            await check_and_request_ai_disclaimer(
-                bot,
-                user_id,
-                message.chat.id,
-                flow_type="topic",
-                payload={"topic_slug": user.current_topic_slug if user else "free_session"},
-            )
-            return
+    photo_id = message.photo[-1].file_id if getattr(message, "photo", None) else ""
+    photo_fp = f"{photo_id}:{message.caption or ''}"
+    claimed, claim_key = claim_telegram_message_once(
+        bot,
+        message,
+        scope="chat_photo",
+        content_fingerprint=photo_fp,
+    )
+    if not claimed:
+        return
 
-        if user.is_blocked:
-            await message.answer("⛔️ Ты заблокирован(а) администратором.")
-            return
-
-        pay_conf = await session.get(PaymentConfig, 1)
-        if not user.is_admin and pay_conf.mode != 'free':
-            if pay_conf.mode == 'subscription':
-                if not user.subscription_end or user.subscription_end < msk_now():
-                    await message.answer(
-                        "❌ Твой доступ к образовательной программе истёк. Оформи доступ к программе, чтобы продолжить.",
-                        reply_markup=kb.payment_alert_keyboard(),
+    persisted = False
+    try:
+        async with get_user_chat_lock(user_id):
+            async with async_session_maker() as session:
+                user = await session.get(User, user_id)
+                if not user or not user.ai_disclaimer_accepted_at or (user.ai_disclaimer_version or 0) < 1:
+                    await check_and_request_ai_disclaimer(
+                        bot,
+                        user_id,
+                        message.chat.id,
+                        flow_type="topic",
+                        payload={"topic_slug": (user.current_topic_slug or "free_session") if user else "free_session"},
                     )
                     return
-            elif pay_conf.mode == 'token':
-                cost = pay_conf.cost_per_message
-                if user.balance < cost:
-                    await message.answer(
-                        f"❌ Недостаточно токенов. Стоимость сообщения: {cost}, твой баланс: {user.balance}",
-                        reply_markup=kb.token_alert_keyboard(),
-                    )
+
+                if user.is_blocked:
+                    await message.answer("⛔️ Ты заблокирован(а) администратором.")
                     return
-                user.balance -= cost
-                await session.commit()
 
-        # Resolve immutable snapshot ONCE before any network awaits
-        current_slug = user.current_topic_slug or "free_session"
-        current_did = await get_active_topic_dialogue_id(
-            session, user_id, current_slug, default=user.current_dialogue_id or 1
-        )
-        snapshot = TopicContextSnapshot(
-            user_id=user_id,
-            topic_slug=current_slug,
-            dialogue_id=current_did,
-        )
-        user_name = (user.name or user.first_name or "пользователь").strip()
+                pay_conf = await session.get(PaymentConfig, 1)
+                if not user.is_admin and pay_conf.mode != 'free':
+                    if pay_conf.mode == 'subscription':
+                        if not user.subscription_end or user.subscription_end < msk_now():
+                            await message.answer(
+                                "❌ Твой доступ к образовательной программе истёк. Оформи доступ к программе, чтобы продолжить.",
+                                reply_markup=kb.payment_alert_keyboard(),
+                            )
+                            return
+                    elif pay_conf.mode == 'token':
+                        if not await _debit_user_tokens_atomic(
+                            session,
+                            bot,
+                            user_id,
+                            user,
+                            pay_conf.cost_per_message,
+                            pay_conf.low_balance_threshold,
+                            message,
+                        ):
+                            return
 
-    async with ai_typing_action(bot, message.chat.id):
-        waiting = await message.answer("Анализирую фотографию…")
-        try:
-            file = await bot.get_file(message.photo[-1].file_id)
-            image = await bot.download_file(file.file_path)
-            caption = (message.caption or "").strip()
-
-            # Stage 1: Vision extraction -> textual factual image description
-            prompt = caption or "Опиши подробно, что изображено на фото."
-            image_description = await analyze_image(image.read(), prompt)
-
-            photo_text = f"[Фото: {image_description}]" if not caption else f"[Фото: {image_description}]\nПодпись: {caption}"
-
-            # Persist user photo representation before main dialogue generation using snapshot
-            async with async_session_maker() as session:
-                user_msg = DBMessage(
-                    user_id=snapshot.user_id,
-                    dialogue_id=snapshot.dialogue_id,
-                    role='user',
-                    content=photo_text,
-                    topic_slug=snapshot.topic_slug,
+                # Resolve immutable snapshot ONCE before any network awaits
+                current_slug = user.current_topic_slug or "free_session"
+                current_did = await get_active_topic_dialogue_id(
+                    session, user_id, current_slug, default=user.current_dialogue_id or 1
                 )
-                session.add(user_msg)
-                await session.flush()
-                current_msg_id = user_msg.id
-                await session.commit()
-
-            # Stage 2: Standard Topic Dialogue LLM pipeline using the immutable snapshot
-            response_text = await get_ai_response_for_topic(
-                snapshot.user_id,
-                photo_text,
-                user_name,
-                current_message_id=current_msg_id,
-                topic_slug=snapshot.topic_slug,
-                dialogue_id=snapshot.dialogue_id,
-                bot=bot,
-                chat_id=message.chat.id,
-            )
-
-            async with async_session_maker() as session:
-                ai_msg = DBMessage(
-                    user_id=snapshot.user_id,
-                    dialogue_id=snapshot.dialogue_id,
-                    role='assistant',
-                    content=response_text,
-                    topic_slug=snapshot.topic_slug,
+                snapshot = TopicContextSnapshot(
+                    user_id=user_id,
+                    topic_slug=current_slug,
+                    dialogue_id=current_did,
                 )
-                session.add(ai_msg)
-                await session.commit()
+                user_name = (user.name or user.first_name or "пользователь").strip()
 
-            await send_ai_response(
-                message.chat.id,
-                response_text,
-                bot,
-                state,
-                await kb.ai_response_keyboard_for_topic(snapshot.topic_slug, snapshot.dialogue_id),
-            )
-        except Exception:
-            logger.exception("Photo processing failed")
-            await message.answer("Не удалось обработать изображение. Попробуйте позже.")
-        finally:
-            try:
-                await waiting.delete()
-            except Exception:
-                pass
+            async with ai_typing_action(bot, message.chat.id):
+                waiting = await message.answer("Анализирую фотографию…")
+                try:
+                    file = await bot.get_file(message.photo[-1].file_id)
+                    image = await bot.download_file(file.file_path)
+                    caption = (message.caption or "").strip()
+
+                    # Stage 1: Vision extraction -> textual factual image description
+                    prompt = caption or "Опиши подробно, что изображено на фото."
+                    image_description = await analyze_image(image.read(), prompt)
+
+                    photo_text = f"[Фото: {image_description}]" if not caption else f"[Фото: {image_description}]\nПодпись: {caption}"
+
+                    # Persist user photo representation before main dialogue generation using snapshot
+                    async with async_session_maker() as session:
+                        user_msg = DBMessage(
+                            user_id=snapshot.user_id,
+                            dialogue_id=snapshot.dialogue_id,
+                            role='user',
+                            content=photo_text,
+                            topic_slug=snapshot.topic_slug,
+                        )
+                        session.add(user_msg)
+                        await session.flush()
+                        current_msg_id = user_msg.id
+                        await session.commit()
+                        persisted = True
+
+                    # Stage 2: Standard Topic Dialogue LLM pipeline using the immutable snapshot
+                    response_text = await get_ai_response_for_topic(
+                        snapshot.user_id,
+                        photo_text,
+                        user_name,
+                        current_message_id=current_msg_id,
+                        topic_slug=snapshot.topic_slug,
+                        dialogue_id=snapshot.dialogue_id,
+                        bot=bot,
+                        chat_id=message.chat.id,
+                    )
+
+                    async with async_session_maker() as session:
+                        ai_msg = DBMessage(
+                            user_id=snapshot.user_id,
+                            dialogue_id=snapshot.dialogue_id,
+                            role='assistant',
+                            content=response_text,
+                            topic_slug=snapshot.topic_slug,
+                        )
+                        session.add(ai_msg)
+                        await session.commit()
+
+                    await send_ai_response(
+                        message.chat.id,
+                        response_text,
+                        bot,
+                        state,
+                        await kb.ai_response_keyboard_for_topic(snapshot.topic_slug, snapshot.dialogue_id),
+                    )
+                except Exception:
+                    logger.exception("Photo processing failed")
+                    await message.answer("Не удалось обработать изображение. Попробуйте позже.")
+                finally:
+                    try:
+                        await waiting.delete()
+                    except Exception:
+                        pass
+    except Exception:
+        if not persisted:
+            release_telegram_message_claim(claim_key)
+        raise
 
 
 @router.message(UserStates.chatting, F.voice | F.audio)
 async def process_chat_audio(message: Message, bot: Bot, state: FSMContext | None = None):
     user_id = message.from_user.id
-    async with async_session_maker() as session:
-        user = await session.get(User, user_id)
-        if not user or not user.ai_disclaimer_accepted_at or (user.ai_disclaimer_version or 0) < 1:
-            await check_and_request_ai_disclaimer(
-                bot,
-                user_id,
-                message.chat.id,
-                flow_type="topic",
-                payload={"topic_slug": user.current_topic_slug if user else "free_session"},
-            )
-            return
-
-        if user.is_blocked:
-            await message.answer("⛔️ Ты заблокирован(а) администратором.")
-            return
-
-        pay_conf = await session.get(PaymentConfig, 1)
-        if not user.is_admin and pay_conf.mode != 'free':
-            if pay_conf.mode == 'subscription':
-                if not user.subscription_end or user.subscription_end < msk_now():
-                    await message.answer(
-                        "❌ Твой доступ к образовательной программе истёк. Оформи доступ к программе, чтобы продолжить.",
-                        reply_markup=kb.payment_alert_keyboard(),
-                    )
-                    return
-            elif pay_conf.mode == 'token':
-                cost = pay_conf.cost_per_message
-                if user.balance < cost:
-                    await message.answer(
-                        f"❌ Недостаточно токенов. Стоимость сообщения: {cost}, твой баланс: {user.balance}",
-                        reply_markup=kb.token_alert_keyboard(),
-                    )
-                    return
-                user.balance -= cost
-                await session.commit()
-
-        current_slug = user.current_topic_slug or "free_session"
-        current_did = await get_active_topic_dialogue_id(
-            session, user_id, current_slug, default=user.current_dialogue_id or 1
-        )
-        snapshot = TopicContextSnapshot(
-            user_id=user_id,
-            topic_slug=current_slug,
-            dialogue_id=current_did,
-        )
-        user_name = (user.name or user.first_name or "пользователь").strip()
-
     source = message.voice or message.audio
-    async with ai_typing_action(bot, message.chat.id):
-        waiting = await message.answer("Распознаю аудио…")
-        try:
-            file = await bot.get_file(source.file_id)
-            audio = await bot.download_file(file.file_path)
-            transcript = await transcribe_audio(audio.read(), getattr(source, 'file_name', None) or 'voice.ogg')
+    audio_fp = getattr(source, "file_id", "") if source else ""
+    claimed, claim_key = claim_telegram_message_once(
+        bot,
+        message,
+        scope="chat_audio",
+        content_fingerprint=audio_fp,
+    )
+    if not claimed:
+        return
 
-            audio_text = f"[Аудио] {transcript}"
+    persisted = False
+    try:
+        async with get_user_chat_lock(user_id):
             async with async_session_maker() as session:
-                user_msg = DBMessage(
-                    user_id=snapshot.user_id,
-                    dialogue_id=snapshot.dialogue_id,
-                    role='user',
-                    content=audio_text,
-                    topic_slug=snapshot.topic_slug,
+                user = await session.get(User, user_id)
+                if not user or not user.ai_disclaimer_accepted_at or (user.ai_disclaimer_version or 0) < 1:
+                    await check_and_request_ai_disclaimer(
+                        bot,
+                        user_id,
+                        message.chat.id,
+                        flow_type="topic",
+                        payload={"topic_slug": (user.current_topic_slug or "free_session") if user else "free_session"},
+                    )
+                    return
+
+                if user.is_blocked:
+                    await message.answer("⛔️ Ты заблокирован(а) администратором.")
+                    return
+
+                pay_conf = await session.get(PaymentConfig, 1)
+                if not user.is_admin and pay_conf.mode != 'free':
+                    if pay_conf.mode == 'subscription':
+                        if not user.subscription_end or user.subscription_end < msk_now():
+                            await message.answer(
+                                "❌ Твой доступ к образовательной программе истёк. Оформи доступ к программе, чтобы продолжить.",
+                                reply_markup=kb.payment_alert_keyboard(),
+                            )
+                            return
+                    elif pay_conf.mode == 'token':
+                        if not await _debit_user_tokens_atomic(
+                            session,
+                            bot,
+                            user_id,
+                            user,
+                            pay_conf.cost_per_message,
+                            pay_conf.low_balance_threshold,
+                            message,
+                        ):
+                            return
+
+                current_slug = user.current_topic_slug or "free_session"
+                current_did = await get_active_topic_dialogue_id(
+                    session, user_id, current_slug, default=user.current_dialogue_id or 1
                 )
-                session.add(user_msg)
-                await session.flush()
-                current_msg_id = user_msg.id
-                await session.commit()
-
-            response_text = await get_ai_response_for_topic(
-                snapshot.user_id,
-                f"Пользователь прислал аудио. Расшифровка:\n{transcript}",
-                user_name,
-                current_message_id=current_msg_id,
-                topic_slug=snapshot.topic_slug,
-                dialogue_id=snapshot.dialogue_id,
-                bot=bot,
-                chat_id=message.chat.id,
-            )
-
-            async with async_session_maker() as session:
-                ai_msg = DBMessage(
-                    user_id=snapshot.user_id,
-                    dialogue_id=snapshot.dialogue_id,
-                    role='assistant',
-                    content=response_text,
-                    topic_slug=snapshot.topic_slug,
+                snapshot = TopicContextSnapshot(
+                    user_id=user_id,
+                    topic_slug=current_slug,
+                    dialogue_id=current_did,
                 )
-                session.add(ai_msg)
-                await session.commit()
+                user_name = (user.name or user.first_name or "пользователь").strip()
 
-            await send_ai_response(
-                message.chat.id,
-                response_text,
-                bot,
-                state,
-                await kb.ai_response_keyboard_for_topic(snapshot.topic_slug, snapshot.dialogue_id),
-            )
-        except Exception:
-            logger.exception("Audio transcription failed")
-            await message.answer("Не удалось распознать аудио. Попробуйте позже.")
-        finally:
-            try:
-                await waiting.delete()
-            except Exception:
-                pass
+            async with ai_typing_action(bot, message.chat.id):
+                waiting = await message.answer("Распознаю аудио…")
+                try:
+                    file = await bot.get_file(source.file_id)
+                    audio = await bot.download_file(file.file_path)
+                    transcript = await transcribe_audio(audio.read(), getattr(source, 'file_name', None) or 'voice.ogg')
+
+                    audio_text = f"[Аудио] {transcript}"
+                    async with async_session_maker() as session:
+                        user_msg = DBMessage(
+                            user_id=snapshot.user_id,
+                            dialogue_id=snapshot.dialogue_id,
+                            role='user',
+                            content=audio_text,
+                            topic_slug=snapshot.topic_slug,
+                        )
+                        session.add(user_msg)
+                        await session.flush()
+                        current_msg_id = user_msg.id
+                        await session.commit()
+                        persisted = True
+
+                    response_text = await get_ai_response_for_topic(
+                        snapshot.user_id,
+                        f"Пользователь прислал аудио. Расшифровка:\n{transcript}",
+                        user_name,
+                        current_message_id=current_msg_id,
+                        topic_slug=snapshot.topic_slug,
+                        dialogue_id=snapshot.dialogue_id,
+                        bot=bot,
+                        chat_id=message.chat.id,
+                    )
+
+                    async with async_session_maker() as session:
+                        ai_msg = DBMessage(
+                            user_id=snapshot.user_id,
+                            dialogue_id=snapshot.dialogue_id,
+                            role='assistant',
+                            content=response_text,
+                            topic_slug=snapshot.topic_slug,
+                        )
+                        session.add(ai_msg)
+                        await session.commit()
+
+                    await send_ai_response(
+                        message.chat.id,
+                        response_text,
+                        bot,
+                        state,
+                        await kb.ai_response_keyboard_for_topic(snapshot.topic_slug, snapshot.dialogue_id),
+                    )
+                except Exception:
+                    logger.exception("Audio transcription failed")
+                    await message.answer("Не удалось распознать аудио. Попробуйте позже.")
+                finally:
+                    try:
+                        await waiting.delete()
+                    except Exception:
+                        pass
+    except Exception:
+        if not persisted:
+            release_telegram_message_claim(claim_key)
+        raise
 
 
 @router.message(Command("image"))
@@ -3939,129 +4300,184 @@ async def process_image_generation(message: Message, bot: Bot):
                 pass
 
 
-@router.message(UserStates.chatting, ~F.text.startswith('/'))
-async def process_chat(message: Message, state: FSMContext, bot: Bot):
-    await touch_user_activity(message.from_user.id)
-    if message.text == "❌ Выход":
-        await state.clear()
-        await send_main_menu(message, bot=bot)
+async def _process_chat_messages(
+    message: Message,
+    state: FSMContext,
+    bot: Bot,
+    *,
+    pending_messages: list[str],
+    claim_key: tuple[int, str, int, int, str] | None = None,
+) -> None:
+    messages_to_persist = [m for m in pending_messages if isinstance(m, str) and m.strip()]
+    if not messages_to_persist:
         return
 
     user_id = message.from_user.id
-    user_prompt = message.text
-
-    async with async_session_maker() as session:
-        user = await session.get(User, user_id)
-        if not user or not user.ai_disclaimer_accepted_at or (user.ai_disclaimer_version or 0) < 1:
-            await check_and_request_ai_disclaimer(
-                bot,
-                user_id,
-                message.chat.id,
-                flow_type="topic",
-                payload={"topic_slug": user.current_topic_slug if user else "free_session"},
-            )
-            return
-
-        if user.is_blocked:
-            await message.answer("⛔️ Ты заблокирован(а) администратором.")
-            await state.clear()
-            return
-
-        pay_conf = await session.get(PaymentConfig, 1)
-
-        if not user.is_admin and pay_conf.mode != 'free':
-            if pay_conf.mode == 'subscription':
-                if not user.subscription_end or user.subscription_end < msk_now():
-                    await message.answer("❌ Твой доступ к образовательной программе истёк. Оформи доступ к программе, чтобы продолжить.",
-                                         reply_markup=kb.payment_alert_keyboard())
-                    return
-
-            elif pay_conf.mode == 'token':
-                cost = pay_conf.cost_per_message
-                if user.balance < cost:
-                    await message.answer(
-                        f"❌ Недостаточно токенов. Стоимость сообщения: {cost}, твой баланс: {user.balance}",
-                        reply_markup=kb.token_alert_keyboard(),
-                    )
-                    return
-                user.balance -= cost
-                if user.balance <= pay_conf.low_balance_threshold and not user.low_balance_notified:
-                    asyncio.create_task(bot.send_message(user_id, "⚠️ Баланс подходит к концу!"))
-                    user.low_balance_notified = True
-                elif user.balance > pay_conf.low_balance_threshold:
-                    user.low_balance_notified = False
-                await session.commit()
-
-        # Resolve immutable snapshot ONCE before any network awaits
-        current_slug = user.current_topic_slug or "free_session"
-        current_did = await get_active_topic_dialogue_id(
-            session, user_id, current_slug, default=user.current_dialogue_id or 1
-        )
-        snapshot = TopicContextSnapshot(
-            user_id=user_id,
-            topic_slug=current_slug,
-            dialogue_id=current_did,
-        )
-        user_name = (user.name or user.first_name or "пользователь").strip()
-
-        user_msg_db = DBMessage(
-            user_id=snapshot.user_id,
-            dialogue_id=snapshot.dialogue_id,
-            role='user',
-            content=user_prompt,
-            topic_slug=snapshot.topic_slug,
-        )
-        session.add(user_msg_db)
-        await session.flush()
-        current_msg_id = user_msg_db.id
-        await session.commit()
-
-    waiting_msg = await message.answer("⏳ ...")
-    response_text = await get_ai_response_for_topic(
-        snapshot.user_id,
-        user_prompt,
-        user_name,
-        current_message_id=current_msg_id,
-        topic_slug=snapshot.topic_slug,
-        dialogue_id=snapshot.dialogue_id,
-        bot=bot,
-        chat_id=message.chat.id,
-    )
-    should_start_test, response_text = extract_test_start_directive(response_text)
+    user_prompt = messages_to_persist[-1]
+    combined_user_text = "\n\n".join(messages_to_persist)
+    persisted = False
 
     try:
-        await waiting_msg.delete()
+        async with get_user_chat_lock(user_id):
+            await touch_user_activity(user_id)
+            async with async_session_maker() as session:
+                user = await session.get(User, user_id)
+                if not user or not user.ai_disclaimer_accepted_at or (user.ai_disclaimer_version or 0) < 1:
+                    disclaimer_payload: dict[str, object] = {
+                        "topic_slug": (user.current_topic_slug or "free_session") if user else "free_session",
+                        "chat_message": combined_user_text,
+                    }
+                    if len(messages_to_persist) > 1:
+                        disclaimer_payload["chat_messages"] = list(messages_to_persist)
+                    await check_and_request_ai_disclaimer(
+                        bot,
+                        user_id,
+                        message.chat.id,
+                        flow_type="topic",
+                        payload=disclaimer_payload,
+                    )
+                    return
+
+                if user.is_blocked:
+                    await message.answer("⛔️ Ты заблокирован(а) администратором.")
+                    await state.clear()
+                    return
+
+                pay_conf = await session.get(PaymentConfig, 1)
+
+                if not user.is_admin and pay_conf.mode != 'free':
+                    if pay_conf.mode == 'subscription':
+                        if not user.subscription_end or user.subscription_end < msk_now():
+                            await message.answer(
+                                "❌ Твой доступ к образовательной программе истёк. Оформи доступ к программе, чтобы продолжить.",
+                                reply_markup=kb.payment_alert_keyboard(),
+                            )
+                            return
+
+                    elif pay_conf.mode == 'token':
+                        if not await _debit_user_tokens_atomic(
+                            session,
+                            bot,
+                            user_id,
+                            user,
+                            pay_conf.cost_per_message,
+                            pay_conf.low_balance_threshold,
+                            message,
+                            notify_low_balance=True,
+                        ):
+                            return
+
+                # Resolve immutable snapshot ONCE before any network awaits
+                current_slug = user.current_topic_slug or "free_session"
+                current_did = await get_active_topic_dialogue_id(
+                    session, user_id, current_slug, default=user.current_dialogue_id or 1
+                )
+                snapshot = TopicContextSnapshot(
+                    user_id=user_id,
+                    topic_slug=current_slug,
+                    dialogue_id=current_did,
+                )
+                user_name = (user.name or user.first_name or "пользователь").strip()
+
+                current_msg_id = None
+                for text_item in messages_to_persist:
+                    user_msg_db = DBMessage(
+                        user_id=snapshot.user_id,
+                        dialogue_id=snapshot.dialogue_id,
+                        role='user',
+                        content=text_item,
+                        topic_slug=snapshot.topic_slug,
+                    )
+                    session.add(user_msg_db)
+                    await session.flush()
+                    current_msg_id = user_msg_db.id
+                await session.commit()
+                persisted = True
+
+            waiting_msg = await message.answer("⏳ ...")
+            try:
+                ai_kwargs: dict[str, object] = {
+                    "current_message_id": current_msg_id,
+                    "topic_slug": snapshot.topic_slug,
+                    "dialogue_id": snapshot.dialogue_id,
+                    "bot": bot,
+                    "chat_id": message.chat.id,
+                }
+                if len(messages_to_persist) > 1:
+                    ai_kwargs["alert_user_text"] = combined_user_text
+                response_text = await get_ai_response_for_topic(
+                    snapshot.user_id,
+                    user_prompt,
+                    user_name,
+                    **ai_kwargs,
+                )
+                should_start_test, response_text = extract_test_start_directive(response_text)
+            finally:
+                try:
+                    await waiting_msg.delete()
+                except Exception:
+                    pass
+
+            async with async_session_maker() as session:
+                if response_text:
+                    ai_msg_db = DBMessage(
+                        user_id=snapshot.user_id,
+                        dialogue_id=snapshot.dialogue_id,
+                        role='assistant',
+                        content=response_text,
+                        topic_slug=snapshot.topic_slug,
+                    )
+                    session.add(ai_msg_db)
+                    await session.commit()
+
+            if response_text:
+                await send_ai_response(
+                    message.chat.id,
+                    response_text,
+                    bot,
+                    state,
+                    await kb.ai_response_keyboard_for_topic(snapshot.topic_slug, snapshot.dialogue_id),
+                )
+            if should_start_test:
+                await start_universal_test(
+                    bot,
+                    user_id,
+                    state,
+                    topic_slug=snapshot.topic_slug,
+                    dialogue_id=snapshot.dialogue_id,
+                )
     except Exception:
-        pass
+        if not persisted:
+            release_telegram_message_claim(claim_key)
+        raise
 
-    async with async_session_maker() as session:
-        if response_text:
-            ai_msg_db = DBMessage(
-                user_id=snapshot.user_id,
-                dialogue_id=snapshot.dialogue_id,
-                role='assistant',
-                content=response_text,
-                topic_slug=snapshot.topic_slug,
-            )
-            session.add(ai_msg_db)
-            await session.commit()
 
-    if response_text:
-        await send_ai_response(
-            message.chat.id,
-            response_text,
-            bot,
-            state,
-            await kb.ai_response_keyboard_for_topic(snapshot.topic_slug, snapshot.dialogue_id),
-        )
-    if should_start_test:
-        await start_universal_test(
-            bot,
-            user_id,
-            state,
-            topic_slug=snapshot.topic_slug,
-            dialogue_id=snapshot.dialogue_id,
-        )
+@router.message(UserStates.chatting, ~F.text.startswith('/'))
+async def process_chat(message: Message, state: FSMContext, bot: Bot):
+    if message.text == "❌ Выход":
+        await touch_user_activity(message.from_user.id)
+        await state.clear()
+        await send_main_menu(message, bot=bot)
+        return
+    if not message.text or not message.text.strip():
+        return
+
+    claimed, claim_key = claim_telegram_message_once(
+        bot,
+        message,
+        scope="chat_text",
+        content_fingerprint=message.text,
+    )
+    if not claimed:
+        return
+
+    await _process_chat_messages(
+        message,
+        state,
+        bot,
+        pending_messages=[message.text],
+        claim_key=claim_key,
+    )
 
 
 @router.callback_query(F.data == "ref_create_link")
@@ -4071,7 +4487,14 @@ async def ref_create_link(callback: CallbackQuery, bot: Bot):
 
     async with async_session_maker() as session:
         content = await session.get(Content, "referral_link_text")
-        header_text = content.text_content if content and content.text_content else "Твоя реферальная ссылка"
+        header_text = content.text_content if content and content.text_content else "Твоя ссылка для приглашения"
+        if header_text in {
+            "Ваша бонусная ссылка",
+            "🎁 Получить бонус (Ваша ссылка)",
+            "🎁 Получить бонус (Твоя ссылка)",
+            "Твоя реферальная ссылка",
+        }:
+            header_text = "Твоя ссылка для приглашения"
 
     safe_header = html.escape(header_text)
     safe_link = html.escape(link)
@@ -4832,8 +5255,13 @@ async def admin_menu_button_topic_picker(callback: CallbackQuery):
     if not button or button.section_key != "thematic":
         await callback.answer("Выбор темы доступен только для тематических кнопок.", show_alert=True)
         return
+    visible_topics = [
+        t
+        for t in filter_visible_admin_topics(topics, keep_slug=button.topic_slug)
+        if t.slug != "journal_note" or t.slug == button.topic_slug
+    ]
     builder = InlineKeyboardBuilder()
-    for topic in topics:
+    for topic in visible_topics:
         marker = "✅ " if topic.slug == button.topic_slug else ""
         paid = "платная" if topic.is_paid else "бесплатная"
         builder.button(
@@ -5744,9 +6172,30 @@ TOPIC_ADMIN_SECTION_SLUGS = {
         "motivation_goals",
         "emotional_intelligence",
     ),
-    "journal": ("journal",),
+    "journal": ("journal", "journal_note"),
     "non_ai": ("habits",),
 }
+LEGACY_DUPLICATE_TOPIC_REPLACEMENTS = {
+    "sleep": "sleep_recovery",
+    "motivation": "motivation_goals",
+    "emotions": "emotional_intelligence",
+}
+
+
+def filter_visible_admin_topics(topics, *, keep_slug: str | None = None) -> list:
+    present_slugs = {
+        str(getattr(topic, "slug", "") or "").strip()
+        for topic in topics
+    }
+    keep_norm = str(keep_slug or "").strip()
+    visible = []
+    for topic in topics:
+        slug = str(getattr(topic, "slug", "") or "").strip()
+        replacement = LEGACY_DUPLICATE_TOPIC_REPLACEMENTS.get(slug)
+        if replacement and replacement in present_slugs and slug != keep_norm:
+            continue
+        visible.append(topic)
+    return visible
 
 
 def classify_topic_admin_section(topic) -> str:
@@ -5766,7 +6215,7 @@ def group_topics_for_admin(topics) -> dict[str, list]:
         for section, slugs in TOPIC_ADMIN_SECTION_SLUGS.items()
         for index, slug in enumerate(slugs)
     }
-    for topic in topics:
+    for topic in filter_visible_admin_topics(topics):
         grouped[classify_topic_admin_section(topic)].append(topic)
     for section, topics_in_section in grouped.items():
         topics_in_section.sort(
@@ -5786,10 +6235,48 @@ def topic_admin_button_text(topic, section: str) -> str:
     return f"📝 {topic.name} {paid_icon}"
 
 
+def _build_edit_topic_view(topic: Topic | None, slug: str) -> tuple[str, InlineKeyboardMarkup]:
+    topic_name = topic.name if topic else slug
+    current_prompt = topic.system_prompt if topic and topic.system_prompt else "Стандартный (не задан)"
+    is_paid = topic.is_paid if topic else True
+
+    preview = current_prompt[:200] + "..." if len(current_prompt) > 200 else current_prompt
+    paid_status = "💰 Платная" if is_paid else "🆓 Бесплатная"
+
+    text = (
+        f"⚙️ <b>Настройки темы: {html.escape(topic_name)}</b>\n"
+        f"🆔 <b>ID темы:</b> <code>{html.escape(slug)}</code>\n"
+        f"💳 <b>Доступ:</b> {paid_status}\n\n"
+        f"📝 <b>Текущий системный промпт (начало):</b>\n"
+        f"<i>{html.escape(preview)}</i>\n\n"
+        f"👇 <b>Что можно сделать:</b>\n"
+        f"1. <b>Переименовать тему</b> — изменить отображаемое название в админке.\n"
+        f"2. <b>Изменить промпт</b> — задать новую инструкцию для AI в этом режиме.\n"
+        f"3. <b>Прикрепить файл</b> — выбрать документы из Базы Знаний, которые AI будет использовать для ответов в этой теме.\n"
+        f"4. <b>Скачать</b> — получить текущий промпт файлом.\n"
+        f"5. <b>Переключить платный/бесплатный</b> — сделать тему доступной всем или только по подписке."
+    )
+
+    toggle_text = "🆓 Сделать бесплатной" if is_paid else "💰 Сделать платной"
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✏️ Переименовать тему", callback_data=f"rename_topic_{slug}")
+    builder.button(text="✏️ Изменить промпт", callback_data=f"set_prompt_{slug}")
+    builder.button(text="📥 Скачать текущий промпт (.txt)", callback_data=f"download_prompt_{slug}")
+    builder.button(text="📎 База знаний (привязка)", callback_data=f"attach_kb_{slug}")
+    builder.button(text=toggle_text, callback_data=f"toggle_topic_paid_{slug}")
+    builder.button(text="⚙️ Параметры диалога", callback_data=f"admin_topic_dialogue_cfg_{slug}")
+    builder.button(text="⬅️ Назад", callback_data="admin_topics_list")
+    builder.adjust(1)
+    return text, builder.as_markup()
+
+
 @router.callback_query(F.data == "admin_topics_list")
 @router.callback_query(F.data.startswith("admin_topics_list_"))
 @router.callback_query(F.data.startswith("admin_topics_page_"))
 async def admin_topics_list(event, state: FSMContext | None = None):
+    if hasattr(event, "from_user") and event.from_user:
+        if not await require_permission(event, AdminPermission.CONTENT, state=state):
+            return
     await _clear_admin_navigation_state(state)
     raw_page = str(getattr(event, "data", "") or "")
     try:
@@ -5841,50 +6328,96 @@ async def admin_topics_list(event, state: FSMContext | None = None):
     builder.row(InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_section_ai"))
 
     await send_smart_content(event, "\n".join(text_lines), None, builder.as_markup())
+    if isinstance(event, CallbackQuery):
+        await event.answer()
 
 
 @router.callback_query(F.data.startswith("edit_topic_"))
 async def edit_topic_menu(callback: CallbackQuery, state: FSMContext | None = None):
+    if not await require_permission(callback, AdminPermission.CONTENT, state=state):
+        return
     await _clear_admin_navigation_state(state)
-    slug = callback.data.split("edit_topic_")[1]
+    slug = callback.data.removeprefix("edit_topic_")
 
     async with async_session_maker() as session:
         topic = await session.scalar(select(Topic).where(Topic.slug == slug))
-        topic_name = topic.name if topic else slug
-        current_prompt = topic.system_prompt if topic and topic.system_prompt else "Стандартный (не задан)"
-        is_paid = topic.is_paid if topic else True
 
-    preview = current_prompt[:200] + "..." if len(current_prompt) > 200 else current_prompt
-    paid_status = "💰 Платная" if is_paid else "🆓 Бесплатная"
+    if not topic:
+        await callback.answer("Тема не найдена.", show_alert=True)
+        return
 
-    text = (
-        f"⚙️ <b>Настройки темы: {topic_name}</b>\n\n"
-        f"💳 <b>Доступ:</b> {paid_status}\n\n"
-        f"📝 <b>Текущий системный промпт (начало):</b>\n"
-        f"<i>{html.escape(preview)}</i>\n\n"
-        f"👇 <b>Что можно сделать:</b>\n"
-        f"1. <b>Изменить промпт</b> — задать новую инструкцию для AI в этом режиме.\n"
-        f"2. <b>Прикрепить файл</b> — выбрать документы из Базы Знаний, которые AI будет использовать для ответов в этой теме.\n"
-        f"3. <b>Скачать</b> — получить текущий промпт файлом.\n"
-        f"4. <b>Переключить платный/бесплатный</b> — сделать тему доступной всем или только по подписке."
-    )
+    text, markup = _build_edit_topic_view(topic, slug)
+    await send_smart_content(callback, text, None, markup)
+    await callback.answer()
 
-    toggle_text = "🆓 Сделать бесплатной" if is_paid else "💰 Сделать платной"
+
+@router.callback_query(F.data.startswith("rename_topic_"))
+async def rename_topic_start(callback: CallbackQuery, state: FSMContext):
+    if not await require_permission(callback, AdminPermission.CONTENT, state=state):
+        return
+    slug = callback.data.removeprefix("rename_topic_")
+    async with async_session_maker() as session:
+        topic = await session.scalar(select(Topic).where(Topic.slug == slug))
+    if not topic:
+        await callback.answer("Тема не найдена.", show_alert=True)
+        return
+
+    await state.set_state(AdminStates.edit_topic_name)
+    await state.update_data(slug=slug)
+
     builder = InlineKeyboardBuilder()
-    builder.button(text="✏️ Изменить промпт", callback_data=f"set_prompt_{slug}")
-    builder.button(text="📥 Скачать текущий промпт (.txt)", callback_data=f"download_prompt_{slug}")
-    builder.button(text="📎 База знаний (привязка)", callback_data=f"attach_kb_{slug}")
-    builder.button(text=toggle_text, callback_data=f"toggle_topic_paid_{slug}")
-    builder.button(text="⚙️ Параметры диалога", callback_data=f"admin_topic_dialogue_cfg_{slug}")
-    builder.button(text="⬅️ Назад", callback_data="admin_topics_list")
+    builder.button(text="⬅️ Назад", callback_data=f"edit_topic_{slug}")
     builder.adjust(1)
 
-    await send_smart_content(callback, text, None, builder.as_markup())
+    prompt_text = (
+        f"✏️ <b>Переименование темы</b>\n\n"
+        f"🆔 ID темы: <code>{html.escape(slug)}</code>\n"
+        f"Текущее название: <b>{html.escape(topic.name)}</b>\n\n"
+        f"Отправьте новое название темы (до 120 символов):"
+    )
+    await send_smart_content(callback, prompt_text, None, builder.as_markup())
+    await callback.answer()
+
+
+@router.message(AdminStates.edit_topic_name, F.text, ~F.text.startswith('/'))
+async def save_topic_name(message: Message, state: FSMContext):
+    if not await require_permission(message, AdminPermission.CONTENT, state=state):
+        return
+    data = await state.get_data()
+    slug = data.get("slug")
+    if not slug:
+        await state.clear()
+        return
+
+    new_name = " ".join((message.text or "").splitlines()).strip()
+    cancel_builder = InlineKeyboardBuilder()
+    cancel_builder.button(text="⬅️ Назад", callback_data=f"edit_topic_{slug}")
+    cancel_builder.adjust(1)
+
+    if not new_name:
+        await message.answer("Название не может быть пустым. Отправьте новое название:", reply_markup=cancel_builder.as_markup())
+        return
+    if len(new_name) > 120:
+        await message.answer("Название слишком длинное (максимум 120 символов). Отправьте более короткий вариант:", reply_markup=cancel_builder.as_markup())
+        return
+
+    async with async_session_maker() as session:
+        topic = await session.scalar(select(Topic).where(Topic.slug == slug))
+        if not topic:
+            await state.clear()
+            await message.answer("Тема не найдена.")
+            return
+        topic.name = new_name
+        await session.commit()
+        text, markup = _build_edit_topic_view(topic, slug)
+
+    await state.clear()
+    await message.answer("✅ Название темы обновлено!\n\n" + text, reply_markup=markup, parse_mode="HTML")
 
 
 @router.callback_query(F.data.startswith("download_prompt_"))
 async def download_topic_prompt(callback: CallbackQuery, bot: Bot):
-    slug = callback.data.split("download_prompt_")[1]
+    slug = callback.data.removeprefix("download_prompt_")
 
     async with async_session_maker() as session:
         topic = await session.scalar(select(Topic).where(Topic.slug == slug))
@@ -5894,13 +6427,17 @@ async def download_topic_prompt(callback: CallbackQuery, bot: Bot):
     file_data = content.encode('utf-8')
     input_file = BufferedInputFile(file_data, filename=f"prompt_{slug}.txt")
 
-    await callback.message.answer_document(input_file, caption=f"📄 Промпт для темы: <b>{topic_name}</b>", parse_mode='HTML')
+    await callback.message.answer_document(
+        input_file,
+        caption=f"📄 Промпт для темы: <b>{html.escape(topic_name)}</b>",
+        parse_mode='HTML',
+    )
     await callback.answer()
 
 
 @router.callback_query(F.data.startswith("set_prompt_"))
 async def set_prompt_start(callback: CallbackQuery, state: FSMContext):
-    slug = callback.data.split("set_prompt_")[1]
+    slug = callback.data.removeprefix("set_prompt_")
     await state.set_state(AdminStates.edit_topic_prompt)
     await state.update_data(slug=slug)
 
@@ -5943,7 +6480,7 @@ async def save_topic_prompt(message: Message, state: FSMContext, bot: Bot):
 
 @router.callback_query(F.data.startswith("toggle_topic_paid_"))
 async def toggle_topic_paid(callback: CallbackQuery):
-    slug = callback.data.split("toggle_topic_paid_")[1]
+    slug = callback.data.removeprefix("toggle_topic_paid_")
     async with async_session_maker() as session:
         topic = await session.scalar(select(Topic).where(Topic.slug == slug))
         if topic:
@@ -5955,7 +6492,7 @@ async def toggle_topic_paid(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("attach_kb_"))
 async def attach_kb_list(callback: CallbackQuery):
-    payload = callback.data.split("attach_kb_")[1]
+    payload = callback.data.removeprefix("attach_kb_")
     if "_page_" in payload:
         slug, page_raw = payload.rsplit("_page_", 1)
         page = int(page_raw)
@@ -5990,7 +6527,7 @@ async def attach_kb_list(callback: CallbackQuery):
     builder.row(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"edit_topic_{slug}"))
 
     text = (
-        f"📎 <b>Управление знаниями для: {topic_name}</b>\n\n"
+        f"📎 <b>Управление знаниями для: {html.escape(topic_name)}</b>\n\n"
         f"Здесь вы решаете, какие документы AI должен читать при ответе на вопросы в этой теме.\n\n"
         f"✅ — Файл используется (AI его видит)\n"
         f"⭕️ — Файл отключен (AI его игнорирует)\n\n"
@@ -11415,10 +11952,48 @@ _USER_RESET_LABELS = {
     "balance": "баланс клиента",
     "habits": "привычки и прогресс клиента",
     "remind": "счётчик напоминаний",
-    "landing": "историю переходов и оплат на странице",
+    "landing": "неоплаченные заявки на странице",
     "name": "имя и пол клиента",
-    "full": "все данные клиента",
+    "full": "онбординг и тестовые данные клиента",
 }
+
+
+def _reset_user_id(data: str, kind: str) -> int:
+    prefix = "ureset_confirmed_" if data.startswith("ureset_confirmed_") else "ureset_"
+    return _admin_client_action_user_id(data, f"{prefix}{kind}_")
+
+
+async def _reset_funnel_state(session, user_id: int):
+    await session.execute(
+        update(FunnelState).where(FunnelState.user_id == user_id).values(
+            is_active=False, stage="idle", meditation_id=None, next_followup_at=None,
+            reminder_count=0, last_ai_reply=None, completed_at=None, started_at=None,
+            followup_sequence_anchor=None, stage_timeout_at=None, stage_timeout_sent=False,
+            strategy_origin=None,
+        )
+    )
+
+
+async def _reset_unpaid_landings(session, user_id: int):
+    unpaid = (
+        FunnelLanding.user_id == user_id,
+        FunnelLanding.paid_at.is_(None),
+        FunnelLanding.status != "paid",
+        FunnelLanding.external_payment_id.is_(None),
+    )
+    await session.execute(
+        delete(LandingNotificationClaim).where(
+            LandingNotificationClaim.landing_id.in_(select(FunnelLanding.id).where(*unpaid))
+        )
+    )
+    await session.execute(delete(FunnelLanding).where(*unpaid))
+
+
+def _expire_client_subscription(user):
+    user.subscription_end = None
+    if user.subscription:
+        user.subscription.end_date = min(user.subscription.end_date, msk_now())
+        user.subscription.auto_renewal = False
 
 
 async def _ensure_user_reset_confirmed(
@@ -11481,10 +12056,10 @@ async def admin_user_resets(callback: CallbackQuery, state: FSMContext | None = 
         f"🎗 <b>Привычки</b>\nУдаляет все привычки клиента и их прогресс.\n\n"
         f"🔔 <b>Напоминания</b>\nСбрасывает счётчик отправленных напоминаний. "
         f"Клиент снова получит первое напоминание.\n\n"
-        f"🌐 <b>Страница оплаты</b>\nУдаляет все записи о переходах и оплатах со страницы.\n\n"
+        f"🌐 <b>Страница оплаты</b>\nУдаляет неоплаченные заявки. Оплаченные заявки сохраняются.\n\n"
         f"👤 <b>Имя и пол</b>\nСбрасывает имя для общения и пол. "
         f"Бот заново спросит клиента как его зовут.\n\n"
-        f"⚡️ <b>Полный сброс</b>\nСбрасывает ВСЁ перечисленное выше одной кнопкой."
+        f"⚡️ <b>Полный сброс</b>\nНачинает знакомство с ботом заново и сбрасывает перечисленные данные. Оплаченная подписка и история платежей сохраняются."
     )
 
     builder = InlineKeyboardBuilder()
@@ -11566,10 +12141,7 @@ async def execute_confirmed_user_reset(callback: CallbackQuery, state: FSMContex
     except ValueError:
         await callback.answer("Некорректный клиент.", show_alert=True)
         return
-    confirmed_callback = callback.model_copy(update={
-        "data": f"ureset_confirmed_{kind}_{user_id}{_admin_client_action_suffix(callback.data)}",
-    })
-    await reset_handlers[kind](confirmed_callback, state=state)
+    await reset_handlers[kind](callback, state=state)
 
 
 @router.callback_query(F.data.startswith("ureset_funnel_"))
@@ -11577,20 +12149,11 @@ async def ureset_funnel(callback: CallbackQuery, state: FSMContext | None = None
     if not await is_admin_actor(callback.from_user.id):
         await callback.answer("Недостаточно прав", show_alert=True)
         return
-    user_id = _admin_client_action_user_id(callback.data, "ureset_funnel_")
+    user_id = _reset_user_id(callback.data, "funnel")
     if not await _ensure_user_reset_confirmed(callback, "funnel", user_id, state):
         return
     async with async_session_maker() as session:
-        fs = await session.get(FunnelState, user_id)
-        if fs:
-            fs.is_active = False
-            fs.stage = "idle"
-            fs.meditation_id = None
-            fs.next_followup_at = None
-            fs.reminder_count = 0
-            fs.last_ai_reply = None
-            fs.completed_at = None
-            fs.started_at = None
+        await _reset_funnel_state(session, user_id)
         await session.commit()
     await callback.answer("🌀 Воронка сброшена")
     new_cb = callback.model_copy(update={
@@ -11603,7 +12166,7 @@ async def ureset_funnel(callback: CallbackQuery, state: FSMContext | None = None
 async def ureset_dialog(callback: CallbackQuery, state: FSMContext | None = None):
     if not await require_permission(callback, AdminPermission.SYSTEM):
         return
-    user_id = _admin_client_action_user_id(callback.data, "ureset_dialog_")
+    user_id = _reset_user_id(callback.data, "dialog")
     if not await _ensure_user_reset_confirmed(callback, "dialog", user_id, state):
         return
     async with async_session_maker() as session:
@@ -11662,13 +12225,13 @@ async def ureset_sub(callback: CallbackQuery, state: FSMContext | None = None):
     if not await is_admin_actor(callback.from_user.id):
         await callback.answer("Недостаточно прав", show_alert=True)
         return
-    user_id = _admin_client_action_user_id(callback.data, "ureset_sub_")
+    user_id = _reset_user_id(callback.data, "sub")
     if not await _ensure_user_reset_confirmed(callback, "sub", user_id, state):
         return
     async with async_session_maker() as session:
         user = await session.get(User, user_id)
         if user:
-            user.subscription_end = None
+            _expire_client_subscription(user)
         await session.commit()
     await callback.answer("📅 Подписка сброшена")
     new_cb = callback.model_copy(update={
@@ -11682,7 +12245,7 @@ async def ureset_balance(callback: CallbackQuery, state: FSMContext | None = Non
     if not await is_admin_actor(callback.from_user.id):
         await callback.answer("Недостаточно прав", show_alert=True)
         return
-    user_id = _admin_client_action_user_id(callback.data, "ureset_balance_")
+    user_id = _reset_user_id(callback.data, "balance")
     if not await _ensure_user_reset_confirmed(callback, "balance", user_id, state):
         return
     async with async_session_maker() as session:
@@ -11702,7 +12265,7 @@ async def ureset_balance(callback: CallbackQuery, state: FSMContext | None = Non
 async def ureset_habits(callback: CallbackQuery, state: FSMContext | None = None):
     if not await require_permission(callback, AdminPermission.SYSTEM):
         return
-    user_id = _admin_client_action_user_id(callback.data, "ureset_habits_")
+    user_id = _reset_user_id(callback.data, "habits")
     if not await _ensure_user_reset_confirmed(callback, "habits", user_id, state):
         return
     async with async_session_maker() as session:
@@ -11720,7 +12283,7 @@ async def ureset_remind(callback: CallbackQuery, state: FSMContext | None = None
     if not await is_admin_actor(callback.from_user.id):
         await callback.answer("Недостаточно прав", show_alert=True)
         return
-    user_id = _admin_client_action_user_id(callback.data, "ureset_remind_")
+    user_id = _reset_user_id(callback.data, "remind")
     if not await _ensure_user_reset_confirmed(callback, "remind", user_id, state):
         return
     async with async_session_maker() as session:
@@ -11741,11 +12304,11 @@ async def ureset_landing(callback: CallbackQuery, state: FSMContext | None = Non
     if not await is_admin_actor(callback.from_user.id):
         await callback.answer("Недостаточно прав", show_alert=True)
         return
-    user_id = _admin_client_action_user_id(callback.data, "ureset_landing_")
+    user_id = _reset_user_id(callback.data, "landing")
     if not await _ensure_user_reset_confirmed(callback, "landing", user_id, state):
         return
     async with async_session_maker() as session:
-        await session.execute(delete(FunnelLanding).where(FunnelLanding.user_id == user_id))
+        await _reset_unpaid_landings(session, user_id)
         await session.commit()
     await callback.answer("🌐 Лендинг очищен")
     new_cb = callback.model_copy(update={
@@ -11759,7 +12322,7 @@ async def ureset_name(callback: CallbackQuery, state: FSMContext | None = None):
     if not await is_admin_actor(callback.from_user.id):
         await callback.answer("Недостаточно прав", show_alert=True)
         return
-    user_id = _admin_client_action_user_id(callback.data, "ureset_name_")
+    user_id = _reset_user_id(callback.data, "name")
     if not await _ensure_user_reset_confirmed(callback, "name", user_id, state):
         return
     async with async_session_maker() as session:
@@ -11780,21 +12343,12 @@ async def ureset_full(callback: CallbackQuery, state: FSMContext | None = None):
     if not await is_admin_actor(callback.from_user.id):
         await callback.answer("Недостаточно прав", show_alert=True)
         return
-    user_id = _admin_client_action_user_id(callback.data, "ureset_full_")
+    user_id = _reset_user_id(callback.data, "full")
     if not await _ensure_user_reset_confirmed(callback, "full", user_id, state):
         return
     async with async_session_maker() as session:
         # Воронка
-        fs = await session.get(FunnelState, user_id)
-        if fs:
-            fs.is_active = False
-            fs.stage = "idle"
-            fs.meditation_id = None
-            fs.next_followup_at = None
-            fs.reminder_count = 0
-            fs.last_ai_reply = None
-            fs.completed_at = None
-            fs.started_at = None
+        await _reset_funnel_state(session, user_id)
 
         # V6 dialogue-scoped records cleanup to prevent collisions when resetting counter to 1
         await session.execute(delete(UserTopicSession).where(UserTopicSession.user_id == user_id))
@@ -11813,14 +12367,21 @@ async def ureset_full(callback: CallbackQuery, state: FSMContext | None = None):
         await session.execute(delete(Habit).where(Habit.user_id == user_id))
 
         # Лендинг
-        await session.execute(delete(FunnelLanding).where(FunnelLanding.user_id == user_id))
+        await _reset_unpaid_landings(session, user_id)
 
         # Пользователь
         user = await session.get(User, user_id)
         if user:
             user.name = None
             user.gender = None
-            user.subscription_end = None
+            user.age = None
+            user.welcome_shown_at = None
+            user.ai_disclaimer_shown = False
+            user.ai_disclaimer_accepted_at = None
+            user.ai_disclaimer_version = 0
+            await session.execute(delete(AiDisclaimerClaim).where(AiDisclaimerClaim.user_id == user_id))
+            if user.subscription and user.subscription.payment_provider in {"Trial Welcome", "Trial Promo"}:
+                _expire_client_subscription(user)
             user.balance = 0.0
             user.low_balance_notified = False
             user.main_reminder_count = 0
@@ -11829,6 +12390,9 @@ async def ureset_full(callback: CallbackQuery, state: FSMContext | None = None):
             user.current_topic_slug = None
 
         await session.commit()
+    if state is not None:
+        client_key = StorageKey(bot_id=state.key.bot_id, chat_id=user_id, user_id=user_id)
+        await FSMContext(storage=state.storage, key=client_key).clear()
     await callback.answer("⚡️ Полный сброс выполнен!")
     new_cb = callback.model_copy(update={
         "data": f"admin_user_resets_{user_id}{_admin_client_action_suffix(callback.data)}",

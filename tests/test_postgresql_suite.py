@@ -66,6 +66,12 @@ class PostgreSQLConcurrencyTests(unittest.IsolatedAsyncioTestCase):
     """Concurrency verification under real PostgreSQL 18 MVCC."""
 
     async def asyncSetUp(self):
+        if "followup" in self._testMethodName:
+            noon = (datetime.utcnow() - timedelta(days=1)).replace(hour=12)
+            for clock in ("time_utils.msk_now", "followups.msk_now"):
+                patcher = patch(clock, return_value=noon)
+                patcher.start()
+                self.addCleanup(patcher.stop)
         self.engine = None
         try:
             self.engine = create_async_engine(

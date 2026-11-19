@@ -1374,6 +1374,28 @@ CANONICAL_QUESTIONS = [
 DIAGNOSTIC_AI_SESSION_SET_SLUG = "diagnostics"
 PSYCHOLOGICAL_PROFILE_SET_SLUG = "express_psychological_profile"
 
+JOURNAL_NOTE_DEFAULT_PROMPT = (
+    "Ты — ИИ-ассистент дневника саморефлексии в боте Виталия Наумова (метод ТрансКоучинг). "
+    "Человек сделал короткую оперативную запись и попросил её разобрать.\n\n"
+    "Ответь на «ты», до 500 знаков, без заголовков и списков:\n"
+    "1. Отрази суть записи его же словами — одной фразой (что произошло и что он чувствует).\n"
+    "2. Одно наблюдение-гипотеза: что за этим может стоять (потребность, ценность, повторяющийся сценарий). "
+    "Формулируй мягко: «похоже», «может быть». Не додумывай деталей, которых нет в записи, и не делай выводов о других людях.\n"
+    "3. Один вопрос, который поможет посмотреть глубже. Одно вопросительное предложение.\n"
+    "Без советов «что делать», без диагнозов и клинических слов, без оценок «правильно/неправильно». "
+    "Не продавай и не упоминай сессии.\n"
+    "Если запись — просто заметка или дело («купить подарок», «идея для рассылки»), "
+    "ответь одной тёплой фразой и спроси, хочет ли он что-то с этим разобрать.\n\n"
+    "Если в записи есть признаки риска для жизни (мысли о смерти, нежелание жить, самоповреждение, в том числе косвенно): "
+    "ответь тепло и коротко, до 400 знаков, прямо спроси, в безопасности ли он сейчас, "
+    "предложи написать живому человеку рядом, номера телефонов не называй (бот пришлёт их сам), ничего не предлагай. "
+    "В конце, с новой строки:\n"
+    '<DATA>{"events":["crisis_detected"]}</DATA>\n'
+    "Если вопрос о лекарствах или диагнозах — скажи, что это к врачу, и в конце:\n"
+    '<DATA>{"events":["clinical_detected"]}</DATA>\n'
+    "Блок DATA — служебный, не упоминай его."
+)
+
 
 async def init_db():
     async with engine.begin() as conn:
@@ -1409,6 +1431,7 @@ async def init_db():
             ("diagnostics", "AI Диагностика + сессия", None),
             ("express", "AI Экспресс диагностика", None),
             ("journal", "Дневник саморефлексии", None),
+            ("journal_note", "Разбор оперативной записи", JOURNAL_NOTE_DEFAULT_PROMPT),
             ("habits", "Формировать привычки", None),
             (
                 "funnel_demo",
@@ -1429,7 +1452,7 @@ async def init_db():
                 (
                     "Ты ИИ-ассистент психолога Виталия Наумова. "
                     "Веди мягкий диалог, который помогает человеку понять, нужна ли ему стратегическая сессия. "
-                    "В начале уточни, знаком ли человек с Виталием и методом Транскоучинг. "
+                    "В начале уточни, знаком ли человек с Виталием и методом ТрансКоучинг. "
                     "Задавай по одному вопросу, коротко резюмируй ответы и подводи к осознанной записи на сессию, "
                     "если видишь запрос. Не дави и не обещай чудес."
                 ),
@@ -1515,7 +1538,7 @@ async def init_db():
             ("journal_intro", "📔 Дневник саморефлексии\n\nЗапиши, что сегодня было важным, и заметь изменения.", None),
             ("closed_club_intro", "Текст 'Закрытый клуб'", None),
             ("referral_intro", "Текст 'Реферальная программа'", None),
-            ("referral_link_text", "🎁 Получить бонус (Твоя ссылка)", None),
+            ("referral_link_text", "Твоя ссылка для приглашения", None),
             ("vitaly_intro", "Текст 'Виталий Наумов'", None),
             ("books_intro", "Текст раздела 'Книги'", None),
             ("extended_menu_intro", "Выбери раздел:", None),
@@ -2239,8 +2262,13 @@ async def run_data_migrations(session: AsyncSession):
         choice_intro.text_content = choice_intro.text_content.replace("Выберите практику", "Выбери практику")
 
     ref_link = await session.get(Content, "referral_link_text")
-    if ref_link and ref_link.text_content == "🎁 Получить бонус (Ваша ссылка)":
-        ref_link.text_content = "🎁 Получить бонус (Твоя ссылка)"
+    if ref_link and (not ref_link.text_content or ref_link.text_content in {
+        "Ваша бонусная ссылка",
+        "🎁 Получить бонус (Ваша ссылка)",
+        "🎁 Получить бонус (Твоя ссылка)",
+        "Твоя реферальная ссылка",
+    }):
+        ref_link.text_content = "Твоя ссылка для приглашения"
 
     disc = await session.get(Content, "disclaimer_text")
     if disc and disc.text_content == "<i>Бот не заменяет консультацию специалиста. Если вы в кризисной ситуации, обратитесь к профессионалу.</i>":
@@ -2471,20 +2499,6 @@ async def run_data_migrations(session: AsyncSession):
                 summary_generation_enabled=False if is_diagnostics else is_thematic,
                 summary_prompt=None,
             ))
-        elif is_diagnostics:
-            existing_cfg.test_set_id = diag_set.id
-            if not diag_ready:
-                existing_cfg.pre_dialogue_test_enabled = False
-            existing_cfg.summary_generation_enabled = False
-        elif is_express:
-            if not existing_cfg.test_set_id:
-                existing_cfg.test_set_id = profile_set.id
-                existing_cfg.pre_dialogue_test_enabled = profile_ready
-            else:
-                configured_set = await session.get(TestSet, existing_cfg.test_set_id)
-                configured_ready = scenario_ready(configured_set, "express")
-                if not configured_ready:
-                    existing_cfg.pre_dialogue_test_enabled = False
 
     funnel_topic = await session.scalar(select(Topic).where(Topic.slug == "funnel_demo"))
     if funnel_topic and funnel_topic.system_prompt and "show_offer" not in funnel_topic.system_prompt:
