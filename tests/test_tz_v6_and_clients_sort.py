@@ -302,7 +302,7 @@ class TzV6AndClientsSortTests(IsolatedAsyncioTestCase):
             )
 
         with patch("ai_integration._generate_chat_response", side_effect=fake_llm), \
-             patch("ai_integration.msk_now", return_value=datetime(2026, 11, 19, 20, 0)), \
+             patch("time_utils.msk_now", return_value=datetime(2026, 11, 19, 20, 0)), \
              patch("journal_service.msk_now", return_value=datetime(2026, 11, 19, 20, 0)):
             res = await ai_integration.generate_journal_daily_summary(entry_id, 705001, 705001)
             self.assertEqual(res, "succeeded")
