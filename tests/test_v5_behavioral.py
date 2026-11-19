@@ -1171,8 +1171,8 @@ class BehavioralV5Tests(unittest.IsolatedAsyncioTestCase):
     async def test_refusal_keeps_nurture_campaign_when_enabled(self):
         bot = MockBot()
         user_id = 2007
-        due_time = msk_now() + timedelta(hours=1)
-        anchor_time = msk_now()
+        anchor_time = datetime(2026, 11, 19, 12)
+        due_time = anchor_time + timedelta(hours=1)
 
         async with async_session_maker() as session:
             session.add(User(id=user_id, first_name="TestUser"))
@@ -1227,7 +1227,7 @@ class BehavioralV5Tests(unittest.IsolatedAsyncioTestCase):
     async def test_final_nurture_touch_deactivates_funnel_and_unblocks_main_bot(self):
         bot = MockBot()
         user_id = 2008
-        now = msk_now()
+        now = datetime(2026, 11, 19, 12)
         anchor = now - timedelta(hours=10)
 
         async with async_session_maker() as session:
@@ -1248,7 +1248,8 @@ class BehavioralV5Tests(unittest.IsolatedAsyncioTestCase):
             session.add(st)
             await session.commit()
 
-        await funnel.process_funnel_followups(bot, single_iteration=True)
+        with patch("funnel.msk_now", return_value=now):
+            await funnel.process_funnel_followups(bot, single_iteration=True)
 
         async with async_session_maker() as session:
             st = await session.get(FunnelState, user_id)
@@ -1256,8 +1257,10 @@ class BehavioralV5Tests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(st.next_followup_at)
             self.assertEqual(st.stage, "completed_unconverted")
 
+        self.assertEqual(len([m for m in bot.sent_messages if m.chat.id == user_id]), 1)
         sent_before = len(bot.sent_messages)
-        await funnel.process_funnel_followups(bot, single_iteration=True)
+        with patch("funnel.msk_now", return_value=now):
+            await funnel.process_funnel_followups(bot, single_iteration=True)
         self.assertEqual(len(bot.sent_messages), sent_before)
 
         async with async_session_maker() as session:
