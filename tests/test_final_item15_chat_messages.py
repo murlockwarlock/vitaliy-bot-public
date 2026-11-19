@@ -1022,13 +1022,17 @@ class Item15ChatMessagesE2ETests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(max_in_flight, 1)
         self.assertEqual(len(llm_calls), 2)
+        first_msg = llm_calls[0][-1]["content"]
+        second_msg = llm_calls[1][-1]["content"]
+        self.assertNotEqual(first_msg, second_msg)
+        self.assertTrue({first_msg, second_msg}.issubset({"Первое", "Второе", "Третье"}))
         non_sys_2 = [m for m in llm_calls[1] if m["role"] != "system"]
         self.assertEqual(
             non_sys_2,
             [
-                {"role": "user", "content": "Первое"},
+                {"role": "user", "content": first_msg},
                 {"role": "assistant", "content": "Ответ 1"},
-                {"role": "user", "content": "Второе"},
+                {"role": "user", "content": second_msg},
             ],
         )
 
@@ -1045,9 +1049,9 @@ class Item15ChatMessagesE2ETests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 [(m.role, m.content) for m in db_msgs],
                 [
-                    ("user", "Первое"),
+                    ("user", first_msg),
                     ("assistant", "Ответ 1"),
-                    ("user", "Второе"),
+                    ("user", second_msg),
                     ("assistant", "Ответ 2"),
                 ],
             )
@@ -1130,13 +1134,16 @@ class Item15ChatMessagesE2ETests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(len(strat_calls), 2)
+        first_s = strat_calls[0][-1]["content"]
+        second_s = strat_calls[1][-1]["content"]
+        self.assertEqual({first_s, second_s}, {"Стратегия 1", "Стратегия 2"})
         non_sys_s2 = [m for m in strat_calls[1] if m["role"] != "system"]
         self.assertEqual(
             [(m["role"], m["content"]) for m in non_sys_s2[-3:]],
             [
-                ("user", "Стратегия 1"),
+                ("user", first_s),
                 ("assistant", "Стратегия ответ 1"),
-                ("user", "Стратегия 2"),
+                ("user", second_s),
             ],
         )
 
@@ -1152,9 +1159,9 @@ class Item15ChatMessagesE2ETests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 [(m.role, m.content) for m in strat_db[1:]],
                 [
-                    ("user", "Стратегия 1"),
+                    ("user", first_s),
                     ("assistant", "Стратегия ответ 1"),
-                    ("user", "Стратегия 2"),
+                    ("user", second_s),
                     ("assistant", "Стратегия ответ 2"),
                 ],
             )
@@ -1192,13 +1199,16 @@ class Item15ChatMessagesE2ETests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(len(obj_calls), 2)
+        first_o = obj_calls[0][-1]["content"]
+        second_o = obj_calls[1][-1]["content"]
+        self.assertEqual({first_o, second_o}, {"Возражение 1", "Возражение 2"})
         non_sys_o2 = [m for m in obj_calls[1] if m["role"] != "system"]
         self.assertEqual(
             [(m["role"], m["content"]) for m in non_sys_o2[-3:]],
             [
-                ("user", "Возражение 1"),
+                ("user", first_o),
                 ("assistant", "Возражение ответ 1"),
-                ("user", "Возражение 2"),
+                ("user", second_o),
             ],
         )
 
@@ -1214,9 +1224,9 @@ class Item15ChatMessagesE2ETests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 [(m.role, m.content) for m in obj_db[1:]],
                 [
-                    ("user", "Возражение 1"),
+                    ("user", first_o),
                     ("assistant", "Возражение ответ 1"),
-                    ("user", "Возражение 2"),
+                    ("user", second_o),
                     ("assistant", "Возражение ответ 2"),
                 ],
             )
