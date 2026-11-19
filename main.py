@@ -9,7 +9,7 @@ from config import BOT_TOKEN, OWNER_IDS
 from funnel import router as funnel_router, process_funnel_followups
 from landing_webhook import run_landing_webhook_server
 from logging_config import setup_logging, get_logger
-from handlers import router
+from handlers import router, UserActivityMiddleware
 from journal_handlers import router as journal_router
 from journal_admin_handlers import router as journal_admin_router
 from test_system_handlers import router as test_system_router
@@ -74,6 +74,9 @@ async def main():
     from ai_logs_admin import router as ai_logs_admin_router
     from automation_admin import router as automation_admin_router
     dp = Dispatcher(storage=MemoryStorage())
+    activity_middleware = UserActivityMiddleware()
+    dp.message.outer_middleware(activity_middleware)
+    dp.callback_query.outer_middleware(activity_middleware)
     dp.include_router(funnel_router)
     dp.include_router(test_system_router)
     dp.include_router(topic_admin_router)

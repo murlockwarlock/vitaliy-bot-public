@@ -7,7 +7,24 @@ from pypdf import PdfReader
 from docx import Document
 from datetime import date, datetime, timedelta
 from openai import AsyncOpenAI
-from database import async_session_maker, IndexingQueue, KnowledgeBase, Mailing, User, AIConfig, Habit, PaymentConfig, BotConfig, Content, FunnelState, FunnelLanding, JournalEntry, JournalSettings
+from database import (
+    async_session_maker,
+    IndexingQueue,
+    KnowledgeBase,
+    Mailing,
+    User,
+    AIConfig,
+    Habit,
+    PaymentConfig,
+    BotConfig,
+    Content,
+    FunnelState,
+    FunnelLanding,
+    JournalEntry,
+    JournalSettings,
+    DEFAULT_HABIT_REMINDER_TEXT,
+    DEFAULT_JOURNAL_REMINDER_TEXT,
+)
 from aiogram.exceptions import TelegramRetryAfter, TelegramForbiddenError, TelegramBadRequest
 from aiogram.types import LinkPreviewOptions
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -258,6 +275,16 @@ async def process_mailings(bot):
             await session.commit()
 
 
+def build_habit_reminder_text(habit_name: str | None, custom_template: str | None = None) -> str:
+    safe_name = html.escape(habit_name or "")
+    template = (custom_template or "").strip() or DEFAULT_HABIT_REMINDER_TEXT
+    if "{habit_name}" in template:
+        return template.replace("{habit_name}", safe_name)
+    if safe_name:
+        return f"🎗 <b>{safe_name}</b>\n\n{template}"
+    return template
+
+
 async def _process_habit_reminder(session, bot, habit, now_utc: datetime):
     user = await session.get(User, habit.user_id)
     if not user or user.is_blocked:
@@ -325,18 +352,24 @@ async def _process_habit_reminder(session, bot, habit, now_utc: datetime):
     if not claim.rowcount:
         return
 
-    safe_name = html.escape(habit.name or "")
-    text = (
-        f"🔔 <b>Напоминание о привычке</b>\n\n"
-        f"🎗 <b>{safe_name}</b>\n\n"
-        "Удели время себе. Когда закончишь, нажми «Сделано!»."
+    habit_content = await session.get(Content, "habit_reminder_text")
+    text = build_habit_reminder_text(
+        habit.name,
+        habit_content.text_content if habit_content else None,
     )
-    kb = InlineKeyboardBuilder()
-    kb.button(text="✅ Сделано!", callback_data=f"habit_done_track_{habit.id}")
-    kb.button(text="⚙️ Мои привычки", callback_data="habit_my_list")
-    kb.adjust(1)
+    markup = InlineKeyboardBuilder()
+    markup.button(text="✅ Сделано!", callback_data=f"habit_done_track_{habit.id}")
+    markup.button(text="⚙️ Мои привычки", callback_data="habit_my_list")
+    markup.adjust(1)
+    reply_markup = markup.as_markup()
     try:
-        await bot.send_message(habit.user_id, text, reply_markup=kb.as_markup(), parse_mode="HTML")
+        try:
+            await bot.send_message(habit.user_id, text, reply_markup=reply_markup, parse_mode="HTML")
+        except TelegramBadRequest as exc:
+            if "parse entities" in str(exc).lower() or "entity" in str(exc).lower():
+                await bot.send_message(habit.user_id, text, reply_markup=reply_markup, parse_mode=None)
+            else:
+                raise
     except TelegramRetryAfter as exc:
         values = {"next_reminder_at": utc_naive(now_utc + timedelta(seconds=max(60, exc.retry_after)))}
     except TelegramForbiddenError:
@@ -607,7 +640,13 @@ async def dispatch_journal_reminder_message(
                 await session.commit()
                 return False
         try:
-            await bot.send_message(chat_id=uid, text=reminder_text, reply_markup=kb, parse_mode="HTML")
+            try:
+                await bot.send_message(chat_id=uid, text=reminder_text, reply_markup=kb, parse_mode="HTML")
+            except TelegramBadRequest as exc:
+                if "parse entities" in str(exc).lower() or "entity" in str(exc).lower():
+                    await bot.send_message(chat_id=uid, text=reminder_text, reply_markup=kb, parse_mode=None)
+                else:
+                    raise
         except TelegramRetryAfter as exc:
             if is_snooze:
                 values = {"snooze_claimed_at": None}
@@ -658,6 +697,12 @@ async def process_journal_reminders(bot, now=None):
             select(settings.user_id, User.habit_timezone).join(User, User.id == settings.user_id)
             .where(User.is_blocked == False, regular_due | snooze_due)
         )).all()
+        reminder_content = await session.get(Content, "journal_reminder_text")
+        reminder_text = (
+            (reminder_content.text_content or "").strip()
+            if reminder_content and reminder_content.text_content
+            else DEFAULT_JOURNAL_REMINDER_TEXT
+        )
     for uid, zone in candidates:
         async with async_session_maker() as session:
             pending = update(settings).where(settings.user_id == uid)
@@ -684,7 +729,7 @@ async def process_journal_reminders(bot, now=None):
 
         await dispatch_journal_reminder_message(
             bot, uid,
-            "🔔 <b>Время вечерней рефлексии!</b>\n\nВыдели несколько минут, чтобы подвести итоги дня в Дневнике.",
+            reminder_text,
             journal_reminder_message_keyboard(), is_snooze=True, today=today, claim_time=current, now=now,
         )
 

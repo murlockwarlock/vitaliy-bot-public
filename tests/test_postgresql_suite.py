@@ -88,6 +88,8 @@ class PostgreSQLConcurrencyTests(unittest.IsolatedAsyncioTestCase):
                 await conn.execute(text("ALTER TABLE automation_action_executions ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP WITHOUT TIME ZONE;"))
                 await conn.execute(text("ALTER TABLE automation_action_executions ADD COLUMN IF NOT EXISTS claim_token VARCHAR(64);"))
                 await conn.execute(text("ALTER TABLE followup_deliveries ADD COLUMN IF NOT EXISTS claim_token VARCHAR(64);"))
+                await conn.execute(text("ALTER TABLE bot_config ADD COLUMN IF NOT EXISTS content_em_dash_normalized BOOLEAN NOT NULL DEFAULT FALSE;"))
+                await conn.execute(text("ALTER TABLE funnel_meditations ADD COLUMN IF NOT EXISTS audio_title_synced_for VARCHAR;"))
                 await conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_active_followup_run ON followup_runs (campaign_id, user_id, dialogue_id) WHERE status = 'active';"))
             self.session_maker = async_sessionmaker(
                 bind=self.engine, class_=AsyncSession, expire_on_commit=False
@@ -1804,3 +1806,80 @@ class PostgreSQLJournalConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         # Exactly 1 winner and 19 losers
         self.assertEqual(wins, 1)
         self.assertEqual(loses, 19)
+
+    async def test_v6_clients_sort_crisis_first_and_last_action_postgres(self):
+        """Verify admin_clients_list UNION ALL + crisis_first + null_action_last query on PostgreSQL 18."""
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock, patch
+        from aiogram.fsm.context import FSMContext
+        from aiogram.fsm.storage.base import StorageKey
+        from aiogram.fsm.storage.memory import MemoryStorage
+        import handlers
+        from config import OWNER_IDS
+        from database import Content, normalize_content_em_dashes
+
+        prefix = f"pgv6sort_{uuid.uuid4().hex[:6]}"
+        u_crisis = self._unique_id(4100000)
+        u_recent = self._unique_id(4200000)
+        u_older = self._unique_id(4300000)
+        now = datetime(2026, 11, 19, 12, 0)
+
+        async with self.session_maker() as session:
+            session.add_all([
+                User(
+                    id=u_crisis,
+                    username=f"{prefix}_crisis",
+                    created_at=now - timedelta(days=90),
+                    last_activity_at=now - timedelta(days=30),
+                    crisis_detected_at=now - timedelta(days=30),
+                ),
+                User(
+                    id=u_recent,
+                    username=f"{prefix}_recent",
+                    created_at=now - timedelta(days=60),
+                    last_activity_at=now - timedelta(hours=1),
+                ),
+                User(
+                    id=u_older,
+                    username=f"{prefix}_older",
+                    created_at=now - timedelta(days=10),
+                    last_activity_at=now - timedelta(days=10),
+                ),
+            ])
+            c_key = f"{prefix}_dash"
+            session.add(Content(key=c_key, text_content="Проверка — тире"))
+            await session.flush()
+            await normalize_content_em_dashes(session)
+            await session.commit()
+            self.assertEqual((await session.get(Content, c_key)).text_content, "Проверка – тире")
+
+        admin_id = OWNER_IDS[0]
+        storage = MemoryStorage()
+        state = FSMContext(storage=storage, key=StorageKey(bot_id=1, chat_id=admin_id, user_id=admin_id))
+        await state.update_data(client_search_query=prefix)
+        cb = SimpleNamespace(
+            from_user=SimpleNamespace(id=admin_id),
+            data="admin_clients_list_0",
+            message=SimpleNamespace(chat=SimpleNamespace(id=admin_id), message_id=955),
+            answer=AsyncMock(),
+        )
+        with patch.object(handlers, "async_session_maker", self.session_maker), \
+             patch("handlers.send_smart_content", new_callable=AsyncMock) as mock_render:
+            mock_render.return_value = SimpleNamespace(chat=SimpleNamespace(id=admin_id), message_id=955)
+            await handlers.admin_clients_list(cb, state)
+
+        markup = mock_render.call_args.args[3]
+        labels = [
+            btn.text
+            for row in markup.inline_keyboard
+            for btn in row
+            if btn.callback_data and btn.callback_data.startswith("admin_user_profile_")
+        ]
+        self.assertEqual(
+            labels,
+            [
+                f"🚨 @{prefix}_crisis",
+                f"@{prefix}_recent",
+                f"@{prefix}_older",
+            ],
+        )

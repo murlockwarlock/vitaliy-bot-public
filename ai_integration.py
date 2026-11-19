@@ -1110,6 +1110,32 @@ async def _stop_journal_heartbeat(task: Optional[asyncio.Task]) -> None:
         pass
 
 
+def _format_days_ru(days: int) -> str:
+    n = abs(int(days))
+    rem100 = n % 100
+    rem10 = n % 10
+    if 11 <= rem100 <= 19:
+        form = "дней"
+    elif rem10 == 1:
+        form = "день"
+    elif 2 <= rem10 <= 4:
+        form = "дня"
+    else:
+        form = "дней"
+    return f"{days} {form}"
+
+
+def _build_journal_system_prompt(sys_prompt: str, user: Optional[User]) -> str:
+    from ai_dialogue_service import build_ai_user_profile_context
+
+    profile_context = build_ai_user_profile_context(user)
+    full_system = sys_prompt
+    if profile_context:
+        full_system += f"\n\nПрофиль пользователя:\n{profile_context}"
+    full_system += GLOBAL_TONE_INSTRUCTION
+    return full_system
+
+
 async def generate_journal_daily_summary(
     entry_id: int,
     user_id: int,
@@ -1176,8 +1202,9 @@ async def generate_journal_daily_summary(
             await finalize_journal_ai_operation_failure(session, op.id, op.owner_token)
             return JournalAiResult(JournalAiResult.FAILED)
 
+        user = await session.get(User, user_id)
         messages = [
-            {"role": "system", "content": sys_prompt + GLOBAL_TONE_INSTRUCTION},
+            {"role": "system", "content": _build_journal_system_prompt(sys_prompt, user)},
             {"role": "user", "content": user_prompt},
         ]
 
@@ -1204,7 +1231,6 @@ async def generate_journal_daily_summary(
         request_group_id = uuid.uuid4().hex[:12]
         start_ts = time.monotonic()
 
-        user = await session.get(User, user_id)
         real_username = getattr(user, "username", None)
         effective_name = (getattr(user, "name", None) or getattr(user, "first_name", None) or "пользователь").strip()
 
@@ -1504,7 +1530,8 @@ async def generate_journal_dynamics_analysis(
         # 1. Build/validate context and count completed entries BEFORE billing
         user_prompt, sys_prompt, count = await build_journal_dynamics_context(session, user_id, days)
         if count < 2:
-            return False, f"⚠️ Для анализа динамики за {days} дн. требуется как минимум 2 завершённые записи (сейчас: {count})."
+            days_label = _format_days_ru(days)
+            return False, f"⚠️ Для анализа динамики за {days_label} требуется как минимум 2 завершённые записи (сейчас: {count})."
 
         # 2. Only when count >= 2, create/claim JournalAiOperation and debit tokens
         try:
@@ -1525,8 +1552,9 @@ async def generate_journal_dynamics_analysis(
 
         heartbeat_task = asyncio.create_task(run_lease_heartbeat(op.id, op.owner_token))
 
+        user = await session.get(User, user_id)
         messages = [
-            {"role": "system", "content": sys_prompt + GLOBAL_TONE_INSTRUCTION},
+            {"role": "system", "content": _build_journal_system_prompt(sys_prompt, user)},
             {"role": "user", "content": user_prompt},
         ]
         request_capture = {"period_days": days, "messages": messages}
@@ -1553,7 +1581,6 @@ async def generate_journal_dynamics_analysis(
         request_group_id = uuid.uuid4().hex[:12]
         start_ts = time.monotonic()
 
-        user = await session.get(User, user_id)
         real_username = getattr(user, "username", None)
         effective_name = (getattr(user, "name", None) or getattr(user, "first_name", None) or "пользователь").strip()
 

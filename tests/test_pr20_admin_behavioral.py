@@ -752,6 +752,11 @@ async def test_client_navigation_context_isolated_by_admin_chat_and_message():
         await session.commit()
 
     state = _state(ADMIN_ID)
+    await state.update_data(
+        client_search_query=str(client_id),
+        admin_client_search_reset_callback="admin_clients_list_0",
+        admin_client_search_reset_query=None,
+    )
     list_callback = _callback(ADMIN_ID, "admin_clients_list_0", chat_id=720, message_id=610)
     with patch("handlers.send_smart_content", new_callable=AsyncMock) as list_render:
         await handlers.admin_clients_list(list_callback, state)
